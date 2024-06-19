@@ -201,15 +201,12 @@ def calculate_metrics(Y_test, predictions):
 def plot_movements_specific_scans(filtered_data, session_labels, trial_indices, time_window):
     for session_label in session_labels:
         for trial_index in trial_indices:
-            # Filter the data for the given session and trial
             session_data = filtered_data[(filtered_data['RECORDING_SESSION_LABEL'] == session_label) &
                                          (filtered_data['TRIAL_INDEX'] == trial_index)]
 
-            # Skip if there is no data for this combination
             if session_data.empty:
                 continue
 
-            # Find hit events in the session and trial
             hit_events = session_data[session_data['target'] == True]
 
             for idx, hit_event in hit_events.iterrows():
