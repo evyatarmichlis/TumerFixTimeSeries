@@ -54,6 +54,7 @@ def create_time_series(time_series_df, interval='1s'):
     time_series_df['Cumulative_Time_Update'] = (time_series_df['CURRENT_FIX_COMPONENT_INDEX'] == 1).astype(int)
     time_series_df['Cumulative_Time'] = 0
 
+    # Iterate over each group and calculate cumulative time correctly
     for _, group in time_series_df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']):
         cumulative_time = 0
         cumulative_times = []
@@ -119,16 +120,27 @@ def filter_data_around_hits(data, time_window):
 
     return filtered_data
 
+def split_train_test(time_series_df):
+    groups = list(time_series_df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']).groups.keys())
+    np.random.shuffle(groups)
+    test_size = int(len(groups) * 0.2)
 
+    test_groups = groups[:test_size]
+    train_groups = groups[test_size:]
+
+    train_df = time_series_df[time_series_df.set_index(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']).index.isin(train_groups)].reset_index(drop=True)
+    test_df = time_series_df[time_series_df.set_index(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']).index.isin(test_groups)].reset_index(drop=True)
+
+    return train_df, test_df
 
 def rocket_main(time_series_df):
     intervals = generate_intervals()[::-1]
 
     def objective(params):
-        interval = params['interval']
-        X, Y = create_time_series(time_series_df, interval)
-
-        X_training, X_test, Y_training, Y_test = train_test_split(X, Y, test_size=0.2, random_state=42)
+        interval = '10ms'
+        train_df, test_df = split_train_test(time_series_df)
+        X_train, Y_train = create_time_series(train_df, interval)
+        X_test, Y_test = create_time_series(test_df, interval)
 
         minirocket_transformer = make_pipeline(
             MiniRocketMultivariateVariable(
@@ -137,14 +149,14 @@ def rocket_main(time_series_df):
             StandardScaler(with_mean=False),
         )
 
-        minirocket_transformer.fit(X_training)
-        X_training = minirocket_transformer.transform(X_training)
+        minirocket_transformer.fit(X_train)
+        X_training = minirocket_transformer.transform(X_train)
         X_test = minirocket_transformer.transform(X_test)
 
-        train_dataset = lgb.Dataset(X_training, label=Y_training)
+        train_dataset = lgb.Dataset(X_training, label=Y_train)
         test_dataset = lgb.Dataset(X_test, label=Y_test)
 
-        pos_weight = np.sum(Y_training == 0) / np.sum(Y_training == 1)
+        pos_weight = np.sum(Y_train == 0) / np.sum(Y_train == 1)
 
         lgb_params = {
             'objective': 'binary',
@@ -156,34 +168,22 @@ def rocket_main(time_series_df):
             'scale_pos_weight': pos_weight
         }
 
-        lgb_model = lgb.train(lgb_params, train_dataset, valid_sets=[train_dataset, test_dataset],
-                              early_stopping_rounds=10, verbose_eval=False)
+        lgb_model = lgb.train(lgb_params, train_dataset, valid_sets=[train_dataset, test_dataset])
         lgb_predictions = lgb_model.predict(X_test)
         lgb_binary_predictions = (lgb_predictions > 0.5).astype(int)
 
         lgb_roc_auc = roc_auc_score(Y_test, lgb_binary_predictions)
 
-        ridge_alphas = np.logspace(params['ridge_alpha_min'], params['ridge_alpha_max'], 10)
-        ridge_model = RidgeClassifierCV(alphas=ridge_alphas, class_weight='balanced', scoring='f1')
-        ridge_model.fit(X_training, Y_training)
-        ridge_predictions = ridge_model.predict(X_test)
-        ridge_binary_predictions = (ridge_predictions > 0.5).astype(int)
-
-        ridge_roc_auc = roc_auc_score(Y_test, ridge_binary_predictions)
-
-        return {'loss': -(lgb_roc_auc + ridge_roc_auc) / 2, 'status': STATUS_OK}
+        return {'loss': -lgb_roc_auc, 'status': STATUS_OK}
 
     space = {
-        'interval': hp.choice('interval', intervals),
         'lgb_learning_rate': hp.uniform('lgb_learning_rate', 0.01, 0.3),
         'lgb_num_leaves': hp.quniform('lgb_num_leaves', 20, 150, 1),
         'lgb_min_child_samples': hp.quniform('lgb_min_child_samples', 5, 50, 1),
-        'ridge_alpha_min': hp.uniform('ridge_alpha_min', -3, 0),
-        'ridge_alpha_max': hp.uniform('ridge_alpha_max', 0, 3)
     }
 
     trials = Trials()
-    best = fmin(fn=objective, space=space, algo=tpe.suggest, max_evals=50, trials=trials)
+    best = fmin(fn=objective, space=space, algo=tpe.suggest, max_evals=20, trials=trials)
 
     print("Best parameters: ", best)
 
@@ -319,7 +319,7 @@ if __name__ == '__main__':
     )
 
     ident_sub_rec = IdentSubRec(**categorized_rad_init_kwargs)
-    df = ident_sub_rec.df
+    df = ident_sub_rec.df[:10000]
 
 
     rocket_main(df)

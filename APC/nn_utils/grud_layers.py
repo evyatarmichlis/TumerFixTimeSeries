@@ -9,16 +9,23 @@ from __future__ import absolute_import, division, print_function
 
 from keras import backend as K
 from keras import constraints, initializers, regularizers
-from keras.engine import InputSpec, Layer
-from keras.layers.recurrent import _generate_dropout_mask
-from keras.layers.recurrent import GRU, GRUCell, RNN
-from keras.layers.wrappers import Bidirectional
-from keras.utils.generic_utils import has_arg, serialize_keras_object
+from tensorflow.keras.layers import Layer, InputSpec
+# from keras.layers.recurrent import _generate_dropout_mask
+from tensorflow.keras.layers import GRU, GRUCell, RNN,Bidirectional
+
+# from keras.layers.wrappers import Bidirectional
+from tensorflow.keras.utils import serialize_keras_object
 
 from .activations import get_activation
 
 
 __all__ = ['Bidirectional_for_GRUD', 'GRUDCell', 'GRUD']
+
+import inspect
+
+def has_arg(fn, argname):
+    signature = inspect.signature(fn)
+    return argname in signature.parameters
 
 
 class GRUDCell(GRUCell):

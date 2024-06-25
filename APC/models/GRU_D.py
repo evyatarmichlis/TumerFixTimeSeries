@@ -11,19 +11,24 @@ from __future__ import absolute_import, division, print_function
 
 import keras.backend as K
 from keras.layers import Activation, Dense, Dropout, Input, Masking
-from keras.layers.normalization import BatchNormalization
-from keras.layers.recurrent import GRU
+# from keras.layers.normalization import BatchNormalization
+from tensorflow.keras.layers import BatchNormalization
+from tensorflow.keras.layers import GRU, LSTM, Dense, BatchNormalization, Input
+
+# from keras.layers.recurrent import GRU
 from keras.layers import Lambda
 from keras.layers import Concatenate
 from keras.models import load_model, Model
 from keras.regularizers import l2
-from keras.utils.generic_utils import custom_object_scope
+# from keras.utils.generic_utils import custom_object_scope
+from tensorflow.keras.utils import custom_object_scope
+
 import tensorflow as tf
 import tensorflow.keras
 import numpy as np
 
-from nn_utils.grud_layers import GRUD
-from nn_utils.layers import ExternalMasking
+from APC.nn_utils.grud_layers import GRUD
+from APC.nn_utils.layers import ExternalMasking
 
 
 def create_grud_model(input_dim, aux_dim, hidden_neurons, dropout_rate, recurrent_dropout_rate,

@@ -3,9 +3,10 @@
 from __future__ import absolute_import, division, print_function
 
 import keras.backend as K
-from keras.models import Model, Input
+from tensorflow.keras.layers import Input
+from tensorflow.keras.models import Model
 from keras.layers import Masking
-from keras.layers.merge import add
+from tensorflow.keras.layers import add
 from keras.layers import TimeDistributed
 from keras.layers import Lambda
 from keras.layers import Dense
@@ -13,34 +14,37 @@ from keras.layers import GRU
 from keras import optimizers
 from keras_layer_normalization import LayerNormalization
 from keras.layers import Concatenate
-from nn_utils.grud_layers import GRUD
-from nn_utils.layers import ExternalMasking
+from APC.nn_utils.grud_layers import GRUD
+from APC.nn_utils.layers import ExternalMasking
 import tensorflow as tf
 
 
 ## Encoder Models
 
 def GRU_layers(input_dim, hidden_neurons, aux_dim, dropout_rate, recurrent_dropout_rate, mask=False):
-    
-    # Input
-    input1 = Input(shape=(None, input_dim)) 
+    input1 = Input(shape=(None, input_dim))
     aux_input = Input(shape=(aux_dim,))
     input_list = [input1, aux_input]
-    
+
     x = input1
     if mask:
         x = Masking(mask_value=-1)(x)
-    x = GRU(hidden_neurons, activation='relu', dropout=dropout_rate, recurrent_dropout=recurrent_dropout_rate, return_sequences=True)(x)
+
+
+    x = GRU(hidden_neurons, activation='relu', dropout=dropout_rate, recurrent_dropout=recurrent_dropout_rate,
+            return_sequences=True)(x)
+
     x = LayerNormalization()(x)
-        
+
     def slice_last(x):
         return x[..., -1, :]
-    
-    # get last hidden state, used for classification
-    x_out = Lambda(slice_last)(x)    
-        
+
+    # Get last hidden state, used for classification
+    x_out = Lambda(slice_last)(x)
+
     return input_list, x, x_out
-    
+
+
 def GRUD_layers(input_dim, hidden_neurons, aux_dim, dropout_rate, recurrent_dropout_rate):
     
     #Input
@@ -76,35 +80,39 @@ def GRUD_layers(input_dim, hidden_neurons, aux_dim, dropout_rate, recurrent_drop
     x_out = Lambda(lambda x: slice_last_non_zero_hidden(x[0], x[1]))([x,length])
     
     return input_list, x, x_out
-    
-    
-def create_APC_classifier(config, encoder, stop_APC_grad):   
+
+
+def create_APC_classifier(config, encoder, stop_APC_grad):
     # APC reconstruction 
     # GRU or GRU-D encoder
     if encoder == "GRU":
-        input_list, h, last_h = GRU_layers(config["n_features"], config["n_neurons"], config["aux_dim"], config["dropout_rate"], config["recurrent_dropout_rate"], mask=False)
+        input_list, h, last_h = GRU_layers(config["n_features"], config["n_neurons"], config["aux_dim"],
+                                           config["dropout_rate"], config["recurrent_dropout_rate"], mask=False)
         aux_input = input_list[1]
     elif encoder == "GRUD":
-        input_list, h, last_h = GRUD_layers(config["n_features"], config["n_neurons"], config["aux_dim"], config["dropout_rate"], config["recurrent_dropout_rate"])
+        input_list, h, last_h = GRUD_layers(config["n_features"], config["n_neurons"], config["aux_dim"],
+                                            config["dropout_rate"], config["recurrent_dropout_rate"])
         aux_input = input_list[3]
-    
+
     # if specified, keep APC weights frozen
     if stop_APC_grad:
-        h = Lambda(lambda x: K.stop_gradient(x))(h)
-    
+        h = Lambda(lambda x: tf.stop_gradient(x), output_shape=lambda s: s)(h)  # Use tf.stop_gradient
+
     # APC reconstruction output
-    output_1 = TimeDistributed(Dense(config["n_features"]))(h)
-    
-    # classification 
+    output_1 = TimeDistributed(Dense(config["n_features"]), name='output_reconstruction')(h)
+
+    # classification
     classifier_input = Concatenate(axis=1)([last_h, aux_input])
     # classifier output
-    output_2 = Dense(config["n_classes"], activation="softmax")(classifier_input)
-    
+    output_2 = Dense(config["n_classes"], activation="softmax", name='output_classification')(classifier_input)
+
     output_list = [output_1, output_2]
-     
+
     model = Model(inputs=input_list, outputs=output_list)
- 
-    adam_optim = optimizers.Adam(lr=config["learning_rate"])
-    model.compile(loss=[config["l1_type"], config["l2_type"]], loss_weights = [config["l1"], config["l2"]], optimizer=adam_optim, metrics={'dense_3': config["evaluation_metric"]})
-    
+
+    adam_optim = optimizers.Adam(learning_rate=config["learning_rate"])
+    model.compile(loss=[config["l1_type"], config["l2_type"]], loss_weights=[config["l1"], config["l2"]],
+                  optimizer=adam_optim,
+                  metrics={'output_reconstruction': config["evaluation_metric"]})
+
     return model

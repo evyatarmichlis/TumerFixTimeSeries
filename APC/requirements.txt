@@ -1,11 +1,10 @@
 numpy
 scipy
-pandas==1.1.1
+pandas
 matplotlib
-sklearn
 tqdm
 seaborn
 scikit-learn
-tensorflow==2.2.0
-keras==2.3.0
+tensorflow
+keras
 keras_layer_normalization

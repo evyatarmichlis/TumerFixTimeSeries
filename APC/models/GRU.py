@@ -1,4 +1,7 @@
-from keras.models import Model, Input
+# from keras.models import Model, Input
+# from keras.models import Model, Input
+from tensorflow.python.keras.models import Input,Model
+
 from keras.models import Sequential
 from keras.layers import GRU
 from keras.layers import Dense
@@ -7,7 +10,7 @@ from keras import optimizers
 from keras_layer_normalization import LayerNormalization
 
 #general
-def GRU_model(x_length, n_features, n_aux, n_classes, n_neurons, learning_rate, dropout_rate, recurrent_dropout, loss_type):
+def GRU_model(x_length , n_features, n_aux, n_classes, n_neurons, learning_rate, dropout_rate, recurrent_dropout, loss_type):
     
     input1 = Input(shape=(x_length, n_features)) 
     x = GRU(n_neurons, activation='relu', dropout=dropout_rate, recurrent_dropout=recurrent_dropout, return_sequences=False)(input1)

@@ -27,7 +27,10 @@ from tfd_utils.data_utils import get_df_for_training
 from tfd_utils.logger_utils import print_and_log
 from tfd_utils.model_stats_utils import model_stats_per_training_size, model_stats_per_weight_classes, \
     model_stats_per_learning_rate, model_stats_per_num_leaves, model_stats_per_min_child_samples
-from tfd_utils.visualization_utils import visualize_data, save_plot_func, visualize_model, compare_old_to_new_data
+from tfd_utils.visualization_utils import save_plot_func, visualize_data, visualize_model, compare_old_to_new_data
+
+
+# from tfd_utils.visualization_utils import visualize_data, save_plot_func, visualize_model, compare_old_to_new_data
 
 
 class SmoteType:
@@ -349,8 +352,7 @@ class IdentSubRec:
                              from_unsupervised=unsupervised_model,
                              # batch_size=4096, virtual_batch_size=512)
                              batch_size=65536, virtual_batch_size=8192)
-                # batch_size=262144, virtual_batch_size=32768)
-                # batch_size=524288, virtual_batch_size=65536)
+
                 now = datetime.now()
                 datetime_string = now.strftime('D%y%m%dT%H%M')
                 models_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'models')
@@ -367,38 +369,7 @@ class IdentSubRec:
             f1 = f1_score(y_true=y_test, y_pred=y_pred, average='binary')
             roc_auc_score_res = roc_auc_score(y_true=y_test, y_score=y_pred)
         elif not cross_validate:
-            # Old way, need to split randomly with groups of fixations.
-            # x_train, x_test, y_train, y_test = train_test_split(self.df[input_data_points],
-            #                                                     self.df['target'],
-            #                                                     test_size=test_size,
-            #                                                     random_state=random_state)
-
-            # Group by the three keys and split by them - RECORDING_SESSION_LABEL, TRIAL_INDEX, CURRENT_FIX_INDEX:
-            print_and_log('Splitting train / test data by RECORDING_SESSION_LABEL, TRIAL_INDEX, CURRENT_FIX_INDEX')
-            self.df['group'] = self.df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_INDEX']].apply(
-                lambda row: '_'.join(row.values.astype(str)), axis=1)
-            gss = GroupShuffleSplit(n_splits=1,
-                                    test_size=test_size,
-                                    random_state=random_state)
-            split_indices = list(gss.split(X=self.df[input_data_points],
-                                           y=self.df['target'],
-                                           groups=self.df['group']))[0]
-            train_index, test_index = split_indices
-            x_train, x_test = self.df[input_data_points].iloc[train_index], self.df[input_data_points].iloc[
-                test_index]
-            y_train, y_test = self.df['target'].iloc[train_index], self.df['target'].iloc[test_index]
-
-            if smote_type is not None:
-                x_train, y_train = apply_smote_and_related(x=x_train, y=y_train, smote_type=smote_type)
-
-            self.clf.fit(x_train, y_train)
-            y_pred = self.clf.predict(x_test)
-
-            acc = accuracy_score(y_true=y_test, y_pred=y_pred)
-            precision = precision_score(y_true=y_test, y_pred=y_pred, average='binary')
-            recall = recall_score(y_true=y_test, y_pred=y_pred, average='binary')
-            f1 = f1_score(y_true=y_test, y_pred=y_pred, average='binary')
-            roc_auc_score_res = roc_auc_score(y_true=y_test, y_score=y_pred)
+            pass
         else:
             print_and_log(f'Running cross-validation with n_splits = {cross_validation_n_splits}')
             if split_by_participants:
@@ -554,3 +525,76 @@ class IdentSubRec:
             print_and_log(f'The full classification report is:\n{classification_report(y_true=y_test, y_pred=y_pred)}')
         return acc, precision, recall, f1, roc_auc_score_res
 
+if __name__ == '__main__':
+
+    new_rad_s1_s9_csv_file_path = 'data/NewRad_Fixations_S1_S9_Data.csv'
+    expert_rad_e1_e3_csv_file_path = 'data/ExpertRad_Fixations_E1_E3.csv'
+    rad_s1_s18_file_path = 'data/Rad_Fixations_S1_S18_Data.csv'
+    formatted_rad_s1_s18_file_path = 'data/Formatted_Fixations_ML.csv'
+    categorized_rad_s1_s18_file_path = 'data/Categorized_Fixation_Data_1_18.csv'
+
+    raw_participants_file_paths = ['1_Formatted_Sample.csv', '2_Formatted_Sample.csv', '3_Formatted_Sample.csv',
+                                   '4_Formatted_Sample.csv', '6_Formatted_Sample.csv', '7_Formatted_Sample.csv',
+                                   '8_Formatted_Sample.csv', '9_Formatted_Sample.csv', '19_Formatted_Sample.csv',
+                                   '23_Formatted_Sample.csv', '24_Formatted_Sample.csv', '25_Formatted_Sample.csv',
+                                   '30_Formatted_Sample.csv', '33_Formatted_Sample.csv', '34_Formatted_Sample.csv',
+                                   '35_Formatted_Sample.csv', '36_Formatted_Sample.csv', '37_Formatted_Sample.csv']
+    raw_participants_folder_path = '/media/y/2TB/1_THESIS_FILES/Data_D231110/'
+    for i in range(len(raw_participants_file_paths)):
+        raw_participants_file_paths[i] = os.path.join(raw_participants_folder_path, raw_participants_file_paths[i])
+    raw_participant_1 = '/media/y/2TB/1_THESIS_FILES/Data_D231110/1_Formatted_Sample.csv'
+
+    rad_init_kwargs = dict(data_file_path=rad_s1_s18_file_path,
+                           test_data_file_path=None,
+                           augment=False,
+                           join_train_and_test_data=False,
+                           normalize=True)
+    raw_participant_1_init_kwargs = dict(data_file_path=raw_participant_1,
+                                         test_data_file_path=None,
+                                         augment=False,
+                                         join_train_and_test_data=False,
+                                         normalize=True)
+    raw_participants_init_kwargs = dict(data_file_path=raw_participants_file_paths,
+                                        test_data_file_path=None,
+                                        augment=False,
+                                        join_train_and_test_data=False,
+                                        normalize=True,
+                                        take_every_x_rows=2)
+    experts_init_kwargs = dict(data_file_path=expert_rad_e1_e3_csv_file_path,
+                               test_data_file_path=None,
+                               augment=False,
+                               join_train_and_test_data=False,
+                               normalize=True)
+    experts_and_rad_init_kwargs = dict(data_file_path=[rad_s1_s18_file_path, expert_rad_e1_e3_csv_file_path],
+                                       test_data_file_path=None,
+                                       augment=False,
+                                       join_train_and_test_data=False,
+                                       normalize=True)
+
+    # Hit in the categorized data are 1 for nodule and 0 for non-nodule.
+    formatted_rad_init_kwargs = dict(data_file_path=formatted_rad_s1_s18_file_path,
+                                     test_data_file_path=None,
+                                     augment=False,
+                                     join_train_and_test_data=False,
+                                     normalize=True,
+                                     remove_surrounding_to_hits=0,
+                                     update_surrounding_to_hits=0)
+
+    # Hit in the categorized data are 2 for nodule, 1 for surrounding and 0 for non-nodule.
+    categorized_rad_init_kwargs = dict(
+        data_file_path=categorized_rad_s1_s18_file_path,
+        test_data_file_path=None,
+        augment=False,
+        join_train_and_test_data=False,
+        normalize=True,
+        remove_surrounding_to_hits=0,
+        update_surrounding_to_hits=0,
+        approach_num=8,
+    )
+
+    ident_sub_rec = IdentSubRec(**categorized_rad_init_kwargs)
+    train_kwargs = dict(test_size=0.2, num_leaves=300, learning_rate=0.1, min_child_samples=44, print_stats=True,
+                        plot_confusion_matrix=False, save_plot=False, cross_validate=True, cross_validation_n_splits=10,
+                        split_by_participants=False, completely_random_data_split=False, smote_type=SmoteType.none,
+                        save_models=False, save_predicted_as_true_data_rows=True)
+    ident_sub_rec.train(**train_kwargs)

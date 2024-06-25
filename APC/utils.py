@@ -4,13 +4,13 @@ from numpy import ma
 import pandas as pd
 import seaborn as sns
 import tensorflow as tf
-import keras.backend as K
 import matplotlib.pyplot as plt
 from collections import Counter
 from sklearn import metrics
 from sklearn.metrics import average_precision_score, roc_auc_score, f1_score
 from sklearn.utils import shuffle
 from collections import defaultdict
+import tensorflow.keras.backend as K
 
 def make_classes_balanced(data):
     # let's make sure the classes are balanced
@@ -89,19 +89,48 @@ def plot_confusion_matrix(cnf_matrix, model_type, class_names, dataset):
     plt.savefig('plots/confusion_matrix_{}_{}.png'.format(model_type, dataset), bbox_inches='tight')
     plt.show()
     plt.close()
-    
+
+
+from sklearn.metrics import average_precision_score
+
+
 def auprc(y_true, y_pred):
-    ytrue = tf.math.argmax(y_true, 1)
-    return tf.py_function(average_precision_score, (ytrue, y_pred[:,1]), tf.double)
+    y_true = tf.argmax(y_true, axis=1)
+    y_pred = tf.nn.softmax(y_pred, axis=1)
+
+    def compute_auprc(y_true_np, y_pred_np):
+        return average_precision_score(y_true_np, y_pred_np[:, 1])
+
+    # Flatten the tensors correctly
+    y_true_flat = tf.reshape(y_true, [-1])
+    y_pred_flat = tf.reshape(y_pred, [-1, y_pred.shape[-1]])
+
+    # Ensure that y_true_flat and y_pred_flat have consistent shapes
+    result = tf.numpy_function(compute_auprc, [y_true_flat, y_pred_flat], tf.float32)
+    result = tf.ensure_shape(result, [])
+
+    return result
 
 def masked_mse(y_true, y_pred):
-    y_true_val = y_true[:,:,::2]
-    y_true_mask = 1 - y_true[:,:,1::2]
-    y_pred_val = y_pred[:,:,::2]
+    y_true_val = y_true[:, :, ::2]
+    y_pred_val = y_pred[:, :, ::2]
+
+    y_true_mask = K.cast(K.not_equal(y_true[:, :, ::2], 0), K.floatx())
+
     abs_loss = K.square(y_pred_val - y_true_val) * y_true_mask
-    final_loss = K.sum(abs_loss) / K.sum(y_true_mask) #(batch_size,)   
-    
+    final_loss = K.sum(abs_loss) / K.sum(y_true_mask)  # (batch_size,)
+
     return final_loss
+
+
+# def masked_mse(y_true, y_pred):
+#     y_true_val = y_true[:, :, ::2]
+#     y_true_mask = 1 - y_true[:, :, 1::2]
+#     y_pred_val = y_pred[:, :, ::2]
+#     abs_loss = K.square(y_pred_val - y_true_val) * y_true_mask
+#     final_loss = K.sum(abs_loss) / K.sum(y_true_mask)  # (batch_size,)
+#
+#     return final_loss
 
 def get_results_df(y_test, y_pred, y_test_p, y_pred_p, model, n_classes):
     results_dict = defaultdict()
@@ -207,32 +236,64 @@ def batch_generator_GRUD(data, batch_size):
 
             yield (inputs, [y_batch])
 
+
+def pad_sequences(sequences, maxlen, dtype='float32', padding='post', value=0.0):
+    nb_samples = len(sequences)
+    sample_shape = sequences[0].shape[1:] if len(sequences) > 0 else ()
+
+    x = (np.ones((nb_samples, maxlen) + sample_shape) * value).astype(dtype)
+    for idx, s in enumerate(sequences):
+        trunc = s[:maxlen]
+        if padding == 'post':
+            x[idx, :len(trunc)] = trunc
+        elif padding == 'pre':
+            x[idx, -len(trunc):] = trunc
+    return x
+
+
+def pad_batch(batch, expected_batch_size):
+    if len(batch) < expected_batch_size:
+        padding_size = expected_batch_size - len(batch)
+        padding = np.zeros((padding_size,) + batch.shape[1:], dtype=batch.dtype)
+        batch = np.concatenate([batch, padding], axis=0)
+    return batch
+
 def APC_batch_generator(data, time_shift, batch_size):
     if (data["X"].shape[0] != data["y"].shape[0]) or (data["X"].shape[0] != data["X_aux"].shape[0]):
-        raise ValueError('Args `X`, `x_aux` and `y` must have the same length.')
-    if len(.shape) != 2:
+        raise ValueError('Args `X`, `X_aux`, and `y` must have the same length.')
+
+    if len(data["y"].shape) != 2:
         raise ValueError(
             'Arg `y` must have a shape of (num_samples, num_classes). ' +
             'You can use `keras.utils.to_categorical` to convert a class vector ' +
             'to a binary class matrix.'
         )
+
     if batch_size < 1:
         raise ValueError('Arg `batch_size` must be a positive integer.')
-    while True:    
+
+    maxlen = data["X"].shape[1]  # Assuming all sequences are the same length
+    while True:
         num_batches = int(np.ceil(data["X"].shape[0] / batch_size))
         for batch_idx in range(num_batches):
-            start_idx = batch_idx*batch_size
-            end_idx = (batch_idx+1)*batch_size
+            start_idx = batch_idx * batch_size
+            end_idx = (batch_idx + 1) * batch_size
             x_batch = data["X"][start_idx:end_idx]
-            if time_shift == 0:
-                x_batch = x_batch
-                y_1_batch = x_batch
-            else:
-                x_batch = x_batch[:, :-time_shift, :]
-                y_1_batch = x_batch[:, time_shift:, :]
             x_aux_batch = data["X_aux"][start_idx:end_idx]
             y_batch = data["y"][start_idx:end_idx]
+
+            if time_shift == 0:
+                y_1_batch = x_batch
+            else:
+                y_1_batch = np.zeros_like(x_batch)
+                y_1_batch[:, :-time_shift, :] = x_batch[:, time_shift:, :]
+            x_batch = pad_batch(x_batch, batch_size)
+            y_1_batch = pad_batch(y_1_batch, batch_size)
+            x_aux_batch = pad_batch(x_aux_batch, batch_size)
+            y_batch = pad_batch(y_batch, batch_size)
+
             yield ([x_batch, x_aux_batch], [y_1_batch, y_batch])
+
             
 def APC_GRUD_batch_generator(data, time_shift, batch_size):
     while True:
@@ -241,7 +302,6 @@ def APC_GRUD_batch_generator(data, time_shift, batch_size):
             start_idx = batch_idx*batch_size
             end_idx = (batch_idx+1)*batch_size
             x_values_ = data["X"][start_idx:end_idx]
-            x_mask = data["M"][start_idx:end_idx]
             x_times = data["GRU_times"][start_idx:end_idx]
             x_lengths = data["GRU_lengths"][start_idx:end_idx]
             x_aux_batch = data["X_aux"][start_idx:end_idx]
