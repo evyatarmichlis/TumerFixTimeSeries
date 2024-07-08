@@ -357,7 +357,7 @@ def main(df,window_size= 5):
     model.compile(
         optimizer="adam",
         # loss="sparse_categorical_crossentropy",
-        loss=focal_loss(gamma=2., alpha=0.25),  # Using focal loss
+        loss=focal_loss(gamma=2., alpha = class_weights[1]),  # Using focal loss
 
         metrics=["sparse_categorical_accuracy"]
     )
@@ -457,14 +457,18 @@ if __name__ == '__main__':
         normalize=True,
         remove_surrounding_to_hits=0,
         update_surrounding_to_hits=0,
-        approach_num=6,
+        approach_num=7,
     )
 
     ident_sub_rec = IdentSubRec(**categorized_rad_init_kwargs)
     df = ident_sub_rec.df
     # df['target'] = df['SLICE_TYPE'].apply(lambda x: 1 if x == 'NODULE_SLICE' else 0)
     window = 15
-    main(df,window_size=window)
+    labels = list(df['RECORDING_SESSION_LABEL'].unique())
+
+
+    for label in labels[1:]:
+        main(df[df['RECORDING_SESSION_LABEL'] == label],window_size=window)
 
 
     #first results without adding class balance to the model:
@@ -664,3 +668,192 @@ if __name__ == '__main__':
 # Recall 18.26%
 # F1 score 28.78%
 # ROC AUC score 91.66%
+
+
+#user 2
+# Weighted Precision: 0.9909197761651057
+# Weighted Recall: 0.9908390758005675
+# Weighted F1-score: 0.9908794243397132
+# Macro Precision: 0.4977194982896237
+# Macro Recall: 0.4976789640850232
+# Macro F1-score: 0.4976992303620149
+# Micro Precision: 0.9908390758005675
+# Micro Recall: 0.9908390758005675
+# Micro F1-score: 0.9908390758005675
+
+#user 3
+# Weighted Precision: 0.9633614124058109
+# Weighted Recall: 0.9714675501851491
+# Weighted F1-score: 0.9648468696963706
+# Macro Precision: 0.7628923062788775
+# Macro Recall: 0.5957052749186286
+# Macro F1-score: 0.6373809578979077
+# Micro Precision: 0.9714675501851491
+# Micro Recall: 0.9714675501851491
+# Micro F1-score: 0.9714675501851491
+
+#user 4
+# Weighted Precision: 0.9593232876398184
+# Weighted Recall: 0.9694824349691606
+# Weighted F1-score: 0.959324713815874
+# Macro Precision: 0.7716582775126993
+# Macro Recall: 0.5533719510463696
+# Macro F1-score: 0.5840473836812327
+# Micro Precision: 0.9694824349691606
+# Micro Recall: 0.9694824349691606
+# Micro F1-score: 0.9694824349691606
+
+#user 5
+#Weighted Precision: 0.9766725487187357
+# Weighted Recall: 0.9825456498388829
+# Weighted F1-score: 0.976898061452974
+# Macro Precision: 0.7777628032345013
+# Macro Recall: 0.5588811479926047
+# Macro F1-score: 0.5943538670112128
+# Micro Precision: 0.9825456498388829
+# Micro Recall: 0.9825456498388829
+# Micro F1-score: 0.9825456498388829
+
+#user 6
+# Weighted Precision: 0.9722393888975919
+# Weighted Recall: 0.97487851838269
+# Weighted F1-score: 0.973382066584111
+# Macro Precision: 0.7445045070793364
+# Macro Recall: 0.6924313158536901
+# Macro F1-score: 0.7151194270126737
+# Micro Precision: 0.97487851838269
+# Micro Recall: 0.97487851838269
+# Micro F1-score: 0.97487851838269
+
+
+
+#user 7
+# Weighted Precision: 0.9473027581194606
+# Weighted Recall: 0.9369603565128586
+# Weighted F1-score: 0.9420344416340997
+# Macro Precision: 0.5202792901590643
+# Macro Recall: 0.5280703376365936
+# Macro F1-score: 0.5230305182483728
+# Micro Precision: 0.9369603565128586
+# Micro Recall: 0.9369603565128586
+# Micro F1-score: 0.9369603565128586
+
+#user 8
+
+# Weighted Precision: 0.9802749981120723
+# Weighted Recall: 0.9833019755409219
+# Weighted F1-score: 0.9817861536884338
+# Macro Precision: 0.49502723182571634
+# Macro Recall: 0.49655581947743466
+# Macro F1-score: 0.495790347444563
+# Micro Precision: 0.9833019755409219
+# Micro Recall: 0.9833019755409219
+# Micro F1-score: 0.9833019755409219
+
+#user 8
+
+
+# Weighted Precision: 0.9751918211850816
+# Weighted Recall: 0.9787880747591023
+# Weighted F1-score: 0.9766547142275266
+# Macro Precision: 0.7234710344638877
+# Macro Recall: 0.6485804651973551
+# Macro F1-score: 0.6780043658496697
+# Micro Precision: 0.9787880747591023
+# Micro Recall: 0.9787880747591023
+# Micro F1-score: 0.9787880747591023
+
+#user 9
+
+#Weighted Precision: 0.9599226630345505
+# Weighted Recall: 0.9769384324437907
+# Weighted F1-score: 0.9678485069471099
+# Macro Precision: 0.5228810138135608
+# Macro Recall: 0.5026231487443658
+# Macro F1-score: 0.5009079960809877
+# Micro Precision: 0.9769384324437907
+# Micro Recall: 0.9769384324437907
+# Micro F1-score: 0.9769384324437907
+
+#user 9
+
+# Weighted Precision: 0.9694422721653925
+# Weighted Recall: 0.9828784539752501
+# Weighted F1-score: 0.9757234941781425
+# Macro Precision: 0.5233141656764556
+# Macro Recall: 0.5020135796360438
+# Macro F1-score: 0.5005842453260374
+# Micro Precision: 0.9828784539752501
+# Micro Recall: 0.9828784539752501
+# Micro F1-score: 0.9828784539752501
+# #user 10
+# Weighted Precision: 0.9645959438055145
+# Weighted Recall: 0.9711950970377937
+# Weighted F1-score: 0.9593334518661358
+# Macro Precision: 0.8513022720826899
+# Macro Recall: 0.5319443489274396
+# Macro F1-score: 0.5520541277258567
+# Micro Precision: 0.9711950970377937
+# Micro Recall: 0.9711950970377937
+# Micro F1-score: 0.9711950970377937
+# #user 11
+# Weighted Precision: 0.9697953014600845
+# Weighted Recall: 0.9845283707352673
+# Weighted F1-score: 0.9771063019675429
+# Macro Precision: 0.4923899554712023
+# Macro Recall: 0.4998703127315844
+# Macro F1-score: 0.4961019379987497
+# Micro Precision: 0.9845283707352673
+# Micro Recall: 0.9845283707352673
+# Micro F1-score: 0.9845283707352673
+# #user 12
+# Weighted Precision: 0.9650149077287252
+# Weighted Recall: 0.9817597059499196
+# Weighted F1-score: 0.9733152932981813
+# Macro Precision: 0.49117322545053327
+# Macro Recall: 0.4996959917683925
+# Macro F1-score: 0.49539795516194096
+# Micro Precision: 0.9817597059499196
+# Micro Recall: 0.9817597059499196
+# Micro F1-score: 0.9817597059499196
+# #user 13
+# Weighted Precision: 0.9791840708008908
+# Weighted Recall: 0.9800760582010583
+# Weighted F1-score: 0.9796296804123911
+# Macro Precision: 0.4990515802199067
+# Macro Recall: 0.49913293067458386
+# Macro F1-score: 0.4990837010128003
+# Micro Precision: 0.9800760582010583
+# Micro Recall: 0.9800760582010583
+# Micro F1-score: 0.9800760582010583
+# #user 14
+# Weighted Precision: 0.9600174636469071
+# Weighted Recall: 0.9601696279993558
+# Weighted F1-score: 0.9600934197781064
+# Macro Precision: 0.6250847033632061
+# Macro Recall: 0.6241310443267765
+# Macro F1-score: 0.6246057777833783
+# Micro Precision: 0.9601696279993558
+# Micro Recall: 0.9601696279993558
+# Micro F1-score: 0.9601696279993558
+# #user 15
+#
+# Weighted Precision: 0.9782813755977632
+# Weighted Recall: 0.9810993507071066
+# Weighted F1-score: 0.9768449300319639
+# Macro Precision: 0.8903983442722577
+# Macro Recall: 0.647417281897683
+# Macro F1-score: 0.7114831926441989
+# Micro Precision: 0.9810993507071066
+# Micro Recall: 0.9810993507071066
+# Micro F1-score: 0.9810993507071066
+# #user 16
+# Weighted Precision: 0.9805802274714833
+# Weighted Recall: 0.9801840822956145
+# Weighted F1-score: 0.9750285925147875
+# Macro Precision: 0.9900043696744593
+# Macro Recall: 0.6534090909090909
+# Macro F1-score: 0.7297343328335832
+# Micro Precision: 0.9801840822956145
+# Micro Recall: 0.9801840822956145
+# Micro F1-score: 0.9801840822956145
