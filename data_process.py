@@ -114,7 +114,7 @@ class IdentSubRec:
         )
 
         # # DEBUG! DEBUG! DEBUG!!! For testing - keep only one participant to test on.
-        self.df = self.df[self.df['RECORDING_SESSION_LABEL'] == 1]
+        # self.df = self.df[self.df['RECORDING_SESSION_LABEL'] == 1]
 
         # Only used if a test data file path is provided:
         self.test_df = None if test_data_file_path is None else self.get_df_for_training(self.test_data_file_path,
@@ -589,7 +589,7 @@ if __name__ == '__main__':
         normalize=True,
         remove_surrounding_to_hits=0,
         update_surrounding_to_hits=0,
-        approach_num=8,
+        approach_num=7,
     )
 
     ident_sub_rec = IdentSubRec(**categorized_rad_init_kwargs)

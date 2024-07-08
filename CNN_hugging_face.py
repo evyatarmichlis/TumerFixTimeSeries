@@ -13,7 +13,9 @@ from numpy.lib.stride_tricks import sliding_window_view
 from sklearn.utils import class_weight
 
 from data_process import IdentSubRec
+from tensorflow.keras import backend as K
 
+from sklearn.model_selection import GroupShuffleSplit
 
 
 
@@ -37,6 +39,30 @@ input_data_points = [
 ]
 feature_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X', 'CURRENT_FIX_IA_Y',
                    'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT']
+
+
+
+
+
+def focal_loss(gamma=2., alpha=0.25):
+    def focal_loss_fixed(y_true, y_pred):
+        # Convert y_true to one-hot encoding if necessary
+        y_true = tf.one_hot(tf.cast(y_true, tf.int32), depth=y_pred.shape[-1])
+
+        # Compute cross entropy
+        cross_entropy = -y_true * K.log(y_pred)
+
+        # Compute focal loss
+        loss = alpha * K.pow(1 - y_pred, gamma) * cross_entropy
+        return K.sum(loss, axis=-1)
+    return focal_loss_fixed
+
+
+
+
+
+
+
 
 @keras.saving.register_keras_serializable()
 class F1Metric(keras.metrics.Metric):
@@ -132,15 +158,42 @@ def create_windows(X, Y, window_size):
 
     return np.array(X_windows), np.array(Y_windows)
 def split_train_test(time_series_df):
-    groups = list(time_series_df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']).groups.keys())
-    np.random.shuffle(groups)
-    test_size = int(len(groups) * 0.2)
+    df =time_series_df
+    df['group'] = df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_INDEX']].apply(
+        lambda row: '_'.join(row.values.astype(str)), axis=1)
+    gss = GroupShuffleSplit(n_splits=1,
+                            test_size=0.2,
+                            random_state=42)
 
-    test_groups = groups[:test_size]
-    train_groups = groups[test_size:]
-
-    train_df = time_series_df[time_series_df.set_index(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']).index.isin(train_groups)].reset_index(drop=True)
-    test_df = time_series_df[time_series_df.set_index(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']).index.isin(test_groups)].reset_index(drop=True)
+    input_data_points = [
+        'RECORDING_SESSION_LABEL',
+        'TRIAL_INDEX',
+        'CURRENT_FIX_INDEX',
+        'Pupil_Size',
+        'CURRENT_FIX_DURATION',
+        'CURRENT_FIX_IA_X',
+        'CURRENT_FIX_IA_Y',
+        'CURRENT_FIX_COMPONENT_COUNT',
+        'CURRENT_FIX_COMPONENT_INDEX',
+        'CURRENT_FIX_COMPONENT_DURATION',
+    ]
+    split_indices = list(gss.split(X=df[input_data_points],
+                                   y=df['target'],
+                                   groups=df['group']))[0]
+    train_index, test_index = split_indices
+    x_train, x_test = df[input_data_points].iloc[train_index], df[input_data_points].iloc[test_index]
+    y_train, y_test = df['target'].iloc[train_index], df['target'].iloc[test_index]
+    train_df = pd.concat([x_train, y_train], axis=1)
+    test_df = pd.concat([x_test, y_test], axis=1)
+    #
+    # groups = list(time_series_df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']).groups.keys())
+    # np.random.shuffle(groups)
+    # test_size = int(len(groups) * 0.2)
+    # test_groups = groups[:test_size]
+    # train_groups = groups[test_size:]
+    #
+    # train_df = time_series_df[time_series_df.set_index(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']).index.isin(train_groups)].reset_index(drop=True)
+    # test_df = time_series_df[time_series_df.set_index(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']).index.isin(test_groups)].reset_index(drop=True)
 
     return train_df, test_df
 
@@ -303,7 +356,9 @@ def main(df,window_size= 5):
 
     model.compile(
         optimizer="adam",
-        loss="sparse_categorical_crossentropy",
+        # loss="sparse_categorical_crossentropy",
+        loss=focal_loss(gamma=2., alpha=0.25),  # Using focal loss
+
         metrics=["sparse_categorical_accuracy"]
     )
     epochs = 500
@@ -330,25 +385,24 @@ def main(df,window_size= 5):
             keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10, min_lr=0.00001)
         ]
 
-        history = model.fit(
-            balanced_train_dataset,
-            epochs=epochs,
-            steps_per_epoch=steps_per_epoch,  # Define steps per epoch based on balanced dataset size
-            validation_data=(X_test, Y_test),  # Use the original distribution for validation
-            callbacks=callbacks,
-            verbose=1
-        )
-        #normal use
         # history = model.fit(
-        #     X_train,
-        #     Y_train,
-        #     batch_size=batch_size,
+        #     balanced_train_dataset,
         #     epochs=epochs,
+        #     steps_per_epoch=steps_per_epoch,  # Define steps per epoch based on balanced dataset size
+        #     validation_data=(X_test, Y_test),  # Use the original distribution for validation
         #     callbacks=callbacks,
-        #     validation_split=0.2,
-        #     verbose=1,
-        #     class_weight = class_weights_dict
+        #     verbose=1
         # )
+        # normal use
+        history = model.fit(
+            X_train,
+            Y_train,
+            batch_size=batch_size,
+            epochs=epochs,
+            callbacks=callbacks,
+            validation_split=0.2,
+            verbose=1,
+        )
 
     y_pred = model.predict(X_test)
     y_pred_classes = np.argmax(y_pred, axis=1)
@@ -403,12 +457,12 @@ if __name__ == '__main__':
         normalize=True,
         remove_surrounding_to_hits=0,
         update_surrounding_to_hits=0,
-        approach_num=8,
+        approach_num=6,
     )
 
     ident_sub_rec = IdentSubRec(**categorized_rad_init_kwargs)
     df = ident_sub_rec.df
-    df['target'] = df['SLICE_TYPE'].apply(lambda x: 1 if x == 'NODULE_SLICE' else 0)
+    # df['target'] = df['SLICE_TYPE'].apply(lambda x: 1 if x == 'NODULE_SLICE' else 0)
     window = 15
     main(df,window_size=window)
 
@@ -543,3 +597,70 @@ if __name__ == '__main__':
 # Micro Precision: 0.9691575935491064
 # Micro Recall: 0.9691575935491064
 # Micro F1-score: 0.9691575935491064
+
+
+#focal loss and weights
+# Weighted Precision: 0.9085334141025153
+# Weighted Recall: 0.8455248990578735
+# Weighted F1-score: 0.8750696577995345
+# Macro Precision: 0.4998451559689207
+# Macro Recall: 0.49964821516441565
+# Macro F1-score: 0.49180095265541873
+# Micro Precision: 0.8455248990578735
+# Micro Recall: 0.8455248990578735
+# Micro F1-score: 0.8455248990578735
+
+
+#focal loss without weights
+
+# Weighted Precision: 0.9708910123654156
+# Weighted Recall: 0.9794111591517397
+# Weighted F1-score: 0.9751324750780583
+# Macro Precision: 0.49264705882352944
+# Macro Recall: 0.4969703301295445
+# Macro F1-score: 0.4947992510921573
+# Micro Precision: 0.9794111591517397
+# Micro Recall: 0.9794111591517397
+# Micro F1-score: 0.9794111591517397
+
+
+
+#compre to yakir- with his test train split. - method 7
+# Weighted Precision: 0.9885544302005926
+# Weighted Recall: 0.9884785252512321
+# Weighted F1-score: 0.988516303496793
+# Macro Precision: 0.6977815454381543
+# Macro Recall: 0.7003927271160516
+# Macro F1-score: 0.6990782751323477
+# Micro Precision: 0.9884785252512321
+# Micro Recall: 0.9884785252512321
+# Micro F1-score: 0.9884785252512321
+
+
+#compre to yakir- with his test train split. - method 6
+# Weighted Precision: 0.9390139439640396
+# Weighted Recall: 0.9347520874898396
+# Weighted F1-score: 0.9042669516644848
+# Macro Precision: 0.9673410511521249
+# Macro Recall: 0.5080779944289694
+# Macro F1-score: 0.49901833975280024
+# Micro Precision: 0.9347520874898396
+# Micro Recall: 0.9347520874898396
+# Micro F1-score: 0.9347520874898396
+
+
+
+#yakir result- mthod 7
+# max results are:
+# Accuracy 97.51%
+# Precision 52.68%
+# Recall 33.52%
+# F1 score 40.97%
+# ROC AUC score 95.73%
+
+#yakir result- mthod 6
+# Accuracy 98.35%
+# Precision 67.80%
+# Recall 18.26%
+# F1 score 28.78%
+# ROC AUC score 91.66%
