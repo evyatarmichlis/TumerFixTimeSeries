@@ -38,6 +38,7 @@ input_data_points = [
 ]
 
 
+
 def generate_intervals():
     intervals = []
     # Generate intervals from 10ms to 990ms with a step of 10ms
@@ -72,7 +73,10 @@ def create_time_series(time_series_df, interval='1s'):
     all_targets = []
 
     grouped = time_series_df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX'])
-    feature_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X', 'CURRENT_FIX_IA_Y']
+
+    feature_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X', 'CURRENT_FIX_IA_Y',
+                       'CURRENT_FIX_INDEX',
+                       'CURRENT_FIX_COMPONENT_COUNT']
     samples = []
 
     for name, group in grouped:
@@ -135,58 +139,45 @@ def split_train_test(time_series_df):
 
 def rocket_main(time_series_df):
     intervals = generate_intervals()[::-1]
+    interval = '30ms'
+    train_df, test_df = split_train_test(time_series_df)
+    X_train, Y_train = create_time_series(train_df, interval)
+    X_test, Y_test = create_time_series(test_df, interval)
 
-    def objective(params):
-        interval = '10ms'
-        train_df, test_df = split_train_test(time_series_df)
-        X_train, Y_train = create_time_series(train_df, interval)
-        X_test, Y_test = create_time_series(test_df, interval)
+    minirocket_transformer = make_pipeline(
+        MiniRocketMultivariateVariable(
+            pad_value_short_series=-10.0, random_state=42, max_dilations_per_kernel=16
+        ),
+        StandardScaler(with_mean=False),
+    )
 
-        minirocket_transformer = make_pipeline(
-            MiniRocketMultivariateVariable(
-                pad_value_short_series=-10.0, random_state=42, max_dilations_per_kernel=16
-            ),
-            StandardScaler(with_mean=False),
-        )
+    minirocket_transformer.fit(X_train)
+    X_training = minirocket_transformer.transform(X_train)
+    X_test = minirocket_transformer.transform(X_test)
 
-        minirocket_transformer.fit(X_train)
-        X_training = minirocket_transformer.transform(X_train)
-        X_test = minirocket_transformer.transform(X_test)
+    train_dataset = lgb.Dataset(X_training, label=Y_train)
+    test_dataset = lgb.Dataset(X_test, label=Y_test)
 
-        train_dataset = lgb.Dataset(X_training, label=Y_train)
-        test_dataset = lgb.Dataset(X_test, label=Y_test)
+    pos_weight = np.sum(Y_train == 0) / np.sum(Y_train == 1)
 
-        pos_weight = np.sum(Y_train == 0) / np.sum(Y_train == 1)
-
-        lgb_params = {
-            'objective': 'binary',
-            'metric': 'binary_logloss',
-            'boosting_type': 'gbdt',
-            'learning_rate': params['lgb_learning_rate'],
-            'num_leaves': int(params['lgb_num_leaves']),
-            'min_child_samples': int(params['lgb_min_child_samples']),
-            'scale_pos_weight': pos_weight
-        }
-
-        lgb_model = lgb.train(lgb_params, train_dataset, valid_sets=[train_dataset, test_dataset])
-        lgb_predictions = lgb_model.predict(X_test)
-        lgb_binary_predictions = (lgb_predictions > 0.5).astype(int)
-
-        lgb_roc_auc = roc_auc_score(Y_test, lgb_binary_predictions)
-
-        return {'loss': -lgb_roc_auc, 'status': STATUS_OK}
-
-    space = {
-        'lgb_learning_rate': hp.uniform('lgb_learning_rate', 0.01, 0.3),
-        'lgb_num_leaves': hp.quniform('lgb_num_leaves', 20, 150, 1),
-        'lgb_min_child_samples': hp.quniform('lgb_min_child_samples', 5, 50, 1),
+    lgb_params = {
+        'objective': 'binary',
+        'metric': 'binary_logloss',
+        'boosting_type': 'gbdt',
+        'learning_rate': 0.01,
+        'num_leaves': 150,
+        'min_child_samples': 50,
+        'scale_pos_weight': pos_weight,
+        'class_weight' : 'balanced'
     }
 
-    trials = Trials()
-    best = fmin(fn=objective, space=space, algo=tpe.suggest, max_evals=20, trials=trials)
+    lgb_model = lgb.train(lgb_params, train_dataset, valid_sets=[train_dataset, test_dataset])
+    lgb_predictions = lgb_model.predict(X_test)
+    lgb_binary_predictions = (lgb_predictions > 0.5).astype(int)
 
-    print("Best parameters: ", best)
+    lgb_roc_auc = roc_auc_score(Y_test, lgb_binary_predictions)
 
+    print(lgb_roc_auc)
 
 
 

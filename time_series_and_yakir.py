@@ -10,7 +10,9 @@ import seaborn as sns
 from lightgbm import LGBMClassifier, Dataset
 from datetime import datetime
 from tqdm import tqdm
+from scipy import sparse
 
+import gc
 
 import os
 
@@ -36,6 +38,8 @@ from sktime.transformations.panel.rocket import (
 
 def generate_intervals():
     intervals = []
+    for i in np.arange(1, 5, 2):
+        intervals.append(f'{i}ms')
     for i in np.arange(10, 110, 10):
         intervals.append(f'{i}ms')
     for i in np.arange(1.0, 5.5, 0.5):
@@ -127,8 +131,14 @@ def rocket_main(time_series_df):
 
 
 
-def train_and_evaluate(df, test_size=0.2, num_leaves=31, learning_rate=0.1, min_child_samples=20, random_state=42, cross_validate=True, cross_validation_n_splits=10, split_by_participants=False,plot_confusion_matrix=False):
-    interval = '30ms'  # Choose one interval for this example
+def downcast_dtypes(df):
+    # Downcast numeric columns to save memory
+    float_cols = [c for c in df if df[c].dtype == "float64"]
+    int_cols = [c for c in df if df[c].dtype == "int64"]
+    df[float_cols] = df[float_cols].astype(np.float32)
+    df[int_cols] = df[int_cols].astype(np.int32)
+    return df
+def train_and_evaluate(df,interval, test_size=0.2, num_leaves=31, learning_rate=0.1, min_child_samples=20, random_state=42, cross_validate=True, cross_validation_n_splits=5, split_by_participants=False,plot_confusion_matrix=False):
     class_weight = 'balanced'
     clf = LGBMClassifier(
         n_estimators=100,
@@ -151,6 +161,7 @@ def train_and_evaluate(df, test_size=0.2, num_leaves=31, learning_rate=0.1, min_
     y_tests = []
 
     confusion_matrix_res = np.array([])
+    df = downcast_dtypes(df)  # Downcast data types to save memory
 
     if cross_validate:
         print('Running cross-validation')
@@ -201,6 +212,8 @@ def train_and_evaluate(df, test_size=0.2, num_leaves=31, learning_rate=0.1, min_
             confusion_matrices.append(confusion_matrix(Y_test, y_pred))
             y_preds.append(y_pred)
             y_tests.append(Y_test)
+            del train_df, test_df, X_train, X_test
+            gc.collect()
 
         confusion_matrix_res = np.mean(confusion_matrices, axis=0).round().astype(int)
         y_pred = np.concatenate(y_preds)
@@ -307,5 +320,7 @@ if __name__ == '__main__':
 
     ident_sub_rec = IdentSubRec(**categorized_rad_init_kwargs)
     df = ident_sub_rec.df
-
-    acc, precision, recall, f1, roc_auc_score_res = train_and_evaluate(df, cross_validate=True, cross_validation_n_splits=10, split_by_participants=False)
+    intervals = generate_intervals()[2:]
+    for interval in intervals:
+        print(interval)
+        acc, precision, recall, f1, roc_auc_score_res = train_and_evaluate(df, interval=interval,cross_validate=True, cross_validation_n_splits=5, split_by_participants=False)

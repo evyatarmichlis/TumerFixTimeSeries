@@ -161,9 +161,9 @@ class APCExperiment:
                 sample_weights = np.array([class_weights[class_id] for class_id in np.argmax(y_batch, axis=1)])
                 yield (x_batch, x_aux_batch), (y_1_batch, y_batch), sample_weights
 
-        input_shape = (48, 37)
+        input_shape = (48, 74)
         aux_shape = (9,)
-        output_shape = (48, 37)
+        output_shape = (48, 74)
         num_classes = 2
         output_signature = (
             (
@@ -206,6 +206,7 @@ class APCExperiment:
             # pretraining step
             model.save(save_model_path)
             return print("done training.")
+
 
         else:  # step 2 or 3
             # load best weights
@@ -252,7 +253,7 @@ class APCExperiment:
 
 # Assuming utility functions and models are correctly imported from their respective modules
 if __name__ == "__main__":
-    dataset_path = 'datasets/physionet2012_1.pickle'
+    dataset_path = 'datasets/physionet2012.pickle'
     save_model_path = 'saved_models/apc_model.weights.h5'
     model_name = 'APC_model_example'
 
@@ -266,7 +267,7 @@ if __name__ == "__main__":
     # Experiment configurations
     config_apc = {
         "x_length": 48,
-        "n_features": 37,
+        "n_features": 74,
         "n_aux": 9,
         "n_classes": 2,
         "n_neurons": 64,
@@ -291,14 +292,20 @@ if __name__ == "__main__":
         'pre_trained_weights':0,
 
     }
-    time_shift_factor = 0
-    config_apc["time_shift"] = time_shift_factor
 
+
+
+    time_shift_factor = 1
+
+    config_apc["time_shift"] = time_shift_factor
+    data_handler.data["train"]["X"] =     data_handler.data["train"]["X_train"]
+    data_handler.data["val"]["X"] =     data_handler.data["val"]["X_val"]
+    data_handler.data["test"]["X"] =     data_handler.data["test"]["X_test"]
     # Run APC experiment
-    # experiment_apc = APCExperiment(data_handler.data, class_balance, config_apc, save_model_path, "APC",encoder="GRU")
-    # results_apc = experiment_apc.run(method="class_weights", class_weights=class_weights)
-    # print("APC Experiment Results:")
-    # print(results_apc)
+    experiment_apc = APCExperiment(data_handler.data, class_balance, config_apc, save_model_path, "APC",encoder="GRU")
+    results_apc = experiment_apc.run(method="class_weights", class_weights=class_weights)
+    print("APC Experiment Results:")
+    print(results_apc)
 
     config_apc["l1"] = 0
     config_apc["l2"] = 1
