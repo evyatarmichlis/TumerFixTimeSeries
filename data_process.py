@@ -114,7 +114,7 @@ class IdentSubRec:
         )
 
         # # DEBUG! DEBUG! DEBUG!!! For testing - keep only one participant to test on.
-        # self.df = self.df[self.df['RECORDING_SESSION_LABEL'] == 2]
+        self.df = self.df[self.df['RECORDING_SESSION_LABEL'] == 1]
 
         # Only used if a test data file path is provided:
         self.test_df = None if test_data_file_path is None else self.get_df_for_training(self.test_data_file_path,
@@ -392,7 +392,7 @@ class IdentSubRec:
 
                 print_and_log('Splitting train / test data by 80% of each participants data')
                 unique_participants = self.df['RECORDING_SESSION_LABEL'].unique()
-                self.df['group'] = self.df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_INDEX']].apply(
+                self.df['group'] = self.df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']].apply(
                     lambda row: '_'.join(row.values.astype(str)), axis=1)
                 if completely_random_data_split:
                     gss = ShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)

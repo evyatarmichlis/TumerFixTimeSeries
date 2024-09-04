@@ -4,30 +4,41 @@ import keras
 import numpy as np
 import matplotlib.pyplot as plt
 import tensorflow as tf
+import torch
 
-from sklearn.metrics import classification_report, f1_score, precision_score, recall_score
+from sklearn.metrics import classification_report, f1_score, precision_score, recall_score,confusion_matrix
 import pandas as pd
 from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from numpy.lib.stride_tricks import sliding_window_view
 from sklearn.utils import class_weight
 
 from data_process import IdentSubRec
-from tensorflow.keras import backend as K
 
 from sklearn.model_selection import GroupShuffleSplit
 
+import seaborn as sns
 
+from sklearn.utils.class_weight import compute_class_weight
 
-
-
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
 
 TRAIN = True
 
 
 
 
+
+feature_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X', 'CURRENT_FIX_IA_Y',
+                   'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT']
+
 input_data_points = [
+    'RECORDING_SESSION_LABEL',
+    'TRIAL_INDEX',
     'CURRENT_FIX_INDEX',
     'Pupil_Size',
     'CURRENT_FIX_DURATION',
@@ -37,146 +48,15 @@ input_data_points = [
     'CURRENT_FIX_COMPONENT_INDEX',
     'CURRENT_FIX_COMPONENT_DURATION',
 ]
-feature_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X', 'CURRENT_FIX_IA_Y',
-                   'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT']
 
-
-
-
-
-def focal_loss(gamma=2., alpha=0.25):
-    def focal_loss_fixed(y_true, y_pred):
-        # Convert y_true to one-hot encoding if necessary
-        y_true = tf.one_hot(tf.cast(y_true, tf.int32), depth=y_pred.shape[-1])
-
-        # Compute cross entropy
-        cross_entropy = -y_true * K.log(y_pred)
-
-        # Compute focal loss
-        loss = alpha * K.pow(1 - y_pred, gamma) * cross_entropy
-        return K.sum(loss, axis=-1)
-    return focal_loss_fixed
-
-
-
-
-
-
-
-
-@keras.saving.register_keras_serializable()
-class F1Metric(keras.metrics.Metric):
-    def __init__(self, name='f1_metric', **kwargs):
-        super(F1Metric, self).__init__(name=name, **kwargs)
-        self.tp = self.add_weight(name='tp', initializer='zeros')
-        self.fp = self.add_weight(name='fp', initializer='zeros')
-        self.fn = self.add_weight(name='fn', initializer='zeros')
-
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        y_pred = tf.argmax(y_pred, axis=1, output_type=tf.int32)
-        y_true = tf.cast(y_true, tf.int32)
-
-        tp = tf.reduce_sum(tf.cast(y_true * y_pred, tf.float32))
-        fp = tf.reduce_sum(tf.cast((1 - y_true) * y_pred, tf.float32))
-        fn = tf.reduce_sum(tf.cast(y_true * (1 - y_pred), tf.float32))
-
-        self.tp.assign_add(tp)
-        self.fp.assign_add(fp)
-        self.fn.assign_add(fn)
-
-    def result(self):
-        p = self.tp / (self.tp + self.fp + keras.backend.epsilon())
-        r = self.tp / (self.tp + self.fn + keras.backend.epsilon())
-        f1 = 2 * p * r / (p + r + keras.backend.epsilon())
-        return f1
-
-    def reset_states(self):
-        self.tp.assign(0)
-        self.fp.assign(0)
-        self.fn.assign(0)
-
-def make_model_conv_lstm(input_shape, num_classes):
-    input_layer = keras.layers.Input(input_shape)
-
-    # Convolutional layers with Dropout and L2 Regularization
-    conv1 = keras.layers.Conv1D(filters=64, kernel_size=3, padding="same", kernel_regularizer=keras.regularizers.l2(0.001))(input_layer)
-    conv1 = keras.layers.BatchNormalization()(conv1)
-    conv1 = keras.layers.ReLU()(conv1)
-    conv1 = keras.layers.Dropout(0.3)(conv1)
-
-    conv2 = keras.layers.Conv1D(filters=64, kernel_size=3, padding="same", kernel_regularizer=keras.regularizers.l2(0.001))(conv1)
-    conv2 = keras.layers.BatchNormalization()(conv2)
-    conv2 = keras.layers.ReLU()(conv2)
-    conv2 = keras.layers.Dropout(0.3)(conv2)
-
-    conv3 = keras.layers.Conv1D(filters=64, kernel_size=3, padding="same", kernel_regularizer=keras.regularizers.l2(0.001))(conv2)
-    conv3 = keras.layers.BatchNormalization()(conv3)
-    conv3 = keras.layers.ReLU()(conv3)
-    conv3 = keras.layers.Dropout(0.3)(conv3)
-
-    # LSTM layers
-    lstm_out = keras.layers.LSTM(units=64, return_sequences=True)(conv3)
-    lstm_out = keras.layers.LSTM(units=64)(lstm_out)
-    lstm_out = keras.layers.Dropout(0.3)(lstm_out)
-
-    # Fully connected layer with L2 Regularization
-    dense = keras.layers.Dense(100, activation='relu', kernel_regularizer=keras.regularizers.l2(0.001))(lstm_out)
-    dense = keras.layers.Dropout(0.3)(dense)
-    output_layer = keras.layers.Dense(num_classes, activation="softmax")(dense)
-
-    return keras.models.Model(inputs=input_layer, outputs=output_layer)
-
-def make_model(input_shape, num_classes):
-    input_layer = keras.layers.Input(input_shape)
-
-    conv1 = keras.layers.Conv1D(filters=64, kernel_size=3, padding="same")(input_layer)
-    conv1 = keras.layers.BatchNormalization()(conv1)
-    conv1 = keras.layers.ReLU()(conv1)
-
-    conv2 = keras.layers.Conv1D(filters=64, kernel_size=3, padding="same")(conv1)
-    conv2 = keras.layers.BatchNormalization()(conv2)
-    conv2 = keras.layers.ReLU()(conv2)
-
-    conv3 = keras.layers.Conv1D(filters=64, kernel_size=3, padding="same")(conv2)
-    conv3 = keras.layers.BatchNormalization()(conv3)
-    conv3 = keras.layers.ReLU()(conv3)
-
-    gap = keras.layers.GlobalAveragePooling1D()(conv3)
-
-    output_layer = keras.layers.Dense(num_classes, activation="softmax")(gap)
-
-    return keras.models.Model(inputs=input_layer, outputs=output_layer)
-def create_windows(X, Y, window_size):
-    X_windows = []
-    Y_windows = []
-
-    for i in range(len(X) - window_size + 1):
-        X_window = X[i:i + window_size]
-        Y_window = Y[i + window_size - 1]  # Use the last target in the window as the target for the window
-        X_windows.append(X_window)
-        Y_windows.append(Y_window)
-
-    return np.array(X_windows), np.array(Y_windows)
 def split_train_test(time_series_df):
     df =time_series_df
-    df['group'] = df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_INDEX']].apply(
+    df['group'] = df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']].apply(
         lambda row: '_'.join(row.values.astype(str)), axis=1)
     gss = GroupShuffleSplit(n_splits=1,
                             test_size=0.2,
                             random_state=42)
 
-    input_data_points = [
-        'RECORDING_SESSION_LABEL',
-        'TRIAL_INDEX',
-        'CURRENT_FIX_INDEX',
-        'Pupil_Size',
-        'CURRENT_FIX_DURATION',
-        'CURRENT_FIX_IA_X',
-        'CURRENT_FIX_IA_Y',
-        'CURRENT_FIX_COMPONENT_COUNT',
-        'CURRENT_FIX_COMPONENT_INDEX',
-        'CURRENT_FIX_COMPONENT_DURATION',
-    ]
     split_indices = list(gss.split(X=df[input_data_points],
                                    y=df['target'],
                                    groups=df['group']))[0]
@@ -185,19 +65,77 @@ def split_train_test(time_series_df):
     y_train, y_test = df['target'].iloc[train_index], df['target'].iloc[test_index]
     train_df = pd.concat([x_train, y_train], axis=1)
     test_df = pd.concat([x_test, y_test], axis=1)
-    #
-    # groups = list(time_series_df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']).groups.keys())
-    # np.random.shuffle(groups)
-    # test_size = int(len(groups) * 0.2)
-    # test_groups = groups[:test_size]
-    # train_groups = groups[test_size:]
-    #
-    # train_df = time_series_df[time_series_df.set_index(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']).index.isin(train_groups)].reset_index(drop=True)
-    # test_df = time_series_df[time_series_df.set_index(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']).index.isin(test_groups)].reset_index(drop=True)
 
     return train_df, test_df
 
-def create_time_series(time_series_df, interval='1s',  window_size = 5 ):
+def create_windows(grouped,window_size):
+    max_possible_time_length = 0
+
+    for name, group in grouped:
+        group = group.sort_values(by='Cumulative_Time')
+        for start in range(0, len(group) - window_size + 1):
+            window = group.iloc[start:start + window_size]
+            time_length = window['Cumulative_Time'].max() - window['Cumulative_Time'].min()
+            time_length_seconds = time_length.total_seconds()
+            if time_length_seconds > max_possible_time_length:
+                max_possible_time_length = time_length_seconds
+
+    samples = []
+    labels = []
+    weights = []
+
+    for name, group in grouped:
+        group = group.sort_values(by='Cumulative_Time')
+        for start in range(0, len(group) - window_size + 1):
+            window = group.iloc[start:start + window_size]
+            features = window[feature_columns].values
+            samples.append(features)
+
+            # Calculate the label
+            label = window['target'].max()
+            labels.append(label)
+
+            # Calculate the time length of the window
+            time_length_seconds = window['Cumulative_Time'].max().total_seconds() - window[
+                'Cumulative_Time'].min().total_seconds()
+
+            # Normalize the weight
+            normalized_weight = time_length_seconds / max_possible_time_length
+            weights.append(normalized_weight)
+
+    samples = np.array(samples)
+    labels = np.array(labels)
+    weights = np.array(weights)
+    return samples,labels,weights
+def resample_func(time_series_df,interval):
+    resampled_data = []
+
+    for (session, trial), group in time_series_df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']):
+        group = group.set_index('Cumulative_Time')
+
+        # Resample features to a fixed interval (e.g., 1 second)
+        resampled_features = group[feature_columns].resample(interval).mean()
+
+        # Resample the target column using the max function
+        resampled_target = group['target'].resample(interval).max()
+
+        resampled_group = resampled_features.merge(resampled_target, on='Cumulative_Time', how='left')
+
+        resampled_group.ffill(inplace=True)
+        resampled_group.bfill(inplace=True)
+
+        # Add 'RECORDING_SESSION_LABEL' and 'TRIAL_INDEX' back to the resampled group
+        resampled_group['RECORDING_SESSION_LABEL'] = session
+        resampled_group['TRIAL_INDEX'] = trial
+
+        # Append the resampled group to the list
+        resampled_data.append(resampled_group)
+
+    # Concatenate all resampled groups into a single DataFrame
+    time_series_df = pd.concat(resampled_data).reset_index()
+
+    return time_series_df
+def create_time_series(time_series_df, interval='30ms',  window_size = 5 ,resample= False):
     time_series_df = time_series_df.copy()
 
     time_series_df['Cumulative_Time_Update'] = (time_series_df['CURRENT_FIX_COMPONENT_INDEX'] == 1).astype(int)
@@ -219,205 +157,155 @@ def create_time_series(time_series_df, interval='1s',  window_size = 5 ):
     # Set 'Cumulative_Time' as a timedelta for easier resampling
     time_series_df['Cumulative_Time'] = pd.to_timedelta(time_series_df['Cumulative_Time'], unit='s')
 
+    if resample :
+        time_series_df = resample_func(time_series_df,interval)
 
-    resampled_data = []
-
-    # Process each group separately
-    for (session, trial), group in time_series_df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']):
-        # Set 'Cumulative_Time' as the index for resampling
-        group = group.set_index('Cumulative_Time')
-
-        # Resample features to a fixed interval (e.g., 1 second)
-        resampled_features = group[feature_columns].resample(interval).mean()
-
-        # Resample the target column using the max function
-        resampled_target = group['target'].resample(interval).max()
-
-        # Combine the resampled features and target
-        resampled_group = resampled_features.merge(resampled_target, on='Cumulative_Time', how='left')
-
-        # Fill missing values using forward fill and backward fill
-        resampled_group.ffill(inplace=True)
-        resampled_group.bfill(inplace=True)
-
-        # Add 'RECORDING_SESSION_LABEL' and 'TRIAL_INDEX' back to the resampled group
-        resampled_group['RECORDING_SESSION_LABEL'] = session
-        resampled_group['TRIAL_INDEX'] = trial
-
-        # Append the resampled group to the list
-        resampled_data.append(resampled_group)
-
-    # Concatenate all resampled groups into a single DataFrame
-    resampled_df = pd.concat(resampled_data).reset_index()
-
-    # Group by 'RECORDING_SESSION_LABEL' and 'TRIAL_INDEX'
-    grouped = resampled_df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX'])
-
-
-    samples = []
-    labels = []
-
-    for name, group in grouped:
-        group = group.sort_values(by='Cumulative_Time')
-
-        for start in range(0, len(group) - window_size + 1):
-            window = group.iloc[start:start + window_size]
-            features = window[feature_columns].values
-            samples.append(features)
-            # Append the target value, using the max value within the window
-            labels.append(window['target'].max())
-
-    # Convert lists to numpy arrays
-    samples = np.array(samples)
-    labels = np.array(labels)
-    return samples,labels
+    grouped = time_series_df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX'])
 
 
 
-def balanced_batch_generator(samples_class_0, labels_class_0, samples_class_1, labels_class_1, batch_size):
-    half_batch_size = batch_size // 2
-
-    # Ensure both datasets are repeated and shuffled
-    dataset_class_0 = tf.data.Dataset.from_tensor_slices((samples_class_0, labels_class_0)).shuffle(len(samples_class_0)).repeat()
-    dataset_class_1 = tf.data.Dataset.from_tensor_slices((samples_class_1, labels_class_1)).shuffle(len(samples_class_1)).repeat()
-
-    # Batch the datasets
-    dataset_class_0 = dataset_class_0.batch(half_batch_size)
-    dataset_class_1 = dataset_class_1.batch(half_batch_size)
-
-    # Zip the datasets together
-    balanced_dataset = tf.data.Dataset.zip((dataset_class_0, dataset_class_1))
-
-    # Function to interleave the datasets and ensure the shape is correct
-    def interleave_fn(ds_0, ds_1):
-        combined_samples = tf.concat([ds_0[0], ds_1[0]], axis=0)
-        combined_labels = tf.concat([ds_0[1], ds_1[1]], axis=0)
-        return combined_samples, combined_labels
-
-    # Interleave, shuffle, and batch the dataset
-    balanced_dataset = balanced_dataset.map(interleave_fn).unbatch().batch(batch_size).shuffle(buffer_size=1000).prefetch(tf.data.AUTOTUNE)
-
-    return balanced_dataset
+    return create_windows(grouped,window_size)
 
 
 
-def oversample_generator(samples_class_0, labels_class_0, samples_class_1, labels_class_1, batch_size):
-    half_batch_size = batch_size // 2
-
-    # Function to sample from the majority class to balance with the minority class
-    def generator():
-        while True:
-            # Randomly sample from the majority class
-            indices_majority = np.random.choice(len(samples_class_1), size=len(samples_class_0), replace=True)
-            sampled_majority_samples = samples_class_1[indices_majority]
-            sampled_majority_labels = labels_class_1[indices_majority]
-
-            # Combine the minority class samples with the sampled majority class samples
-            combined_samples = np.vstack((samples_class_0, sampled_majority_samples))
-            combined_labels = np.hstack((labels_class_0, sampled_majority_labels))
-
-            # Shuffle the combined dataset
-            shuffled_indices = np.random.permutation(len(combined_labels))
-            combined_samples = combined_samples[shuffled_indices]
-            combined_labels = combined_labels[shuffled_indices]
-
-            # Yield batches of the specified size
-            for start in range(0, len(combined_labels), batch_size):
-                end = start + batch_size
-                yield combined_samples[start:end], combined_labels[start:end]
-
-    # Create a TensorFlow dataset from the generator
-    dataset = tf.data.Dataset.from_generator(
-        generator,
-        output_signature=(
-            tf.TensorSpec(shape=(None, samples_class_0.shape[1], samples_class_0.shape[2]), dtype=tf.float32),
-            tf.TensorSpec(shape=(None,), dtype=tf.int32)
-        )
-    ).prefetch(tf.data.AUTOTUNE)
-
-    return dataset
 
 
-def main(df,window_size= 5):
+class DilatedConv1DModel(nn.Module):
+    def __init__(self, input_shape, num_classes, dilation_rates=[1, 2, 4]):
+        super(DilatedConv1DModel, self).__init__()
+        self.conv1 = nn.Conv1d(in_channels=input_shape[1], out_channels=64, kernel_size=3, padding=1,
+                               dilation=dilation_rates[0])
+        self.bn1 = nn.BatchNorm1d(64)
+        self.dropout1 = nn.Dropout(0.3)
 
-    interval='10ms'
-    train_df, test_df = split_train_test(df)
-    X_train, Y_train = create_time_series(train_df, interval,window_size=window_size)
-    X_test, Y_test = create_time_series(test_df, interval,window_size=window_size)
-    input_shape = (window_size, 6)
-    num_classes = 2
+        self.conv2 = nn.Conv1d(in_channels=64, out_channels=64, kernel_size=3, padding=2, dilation=dilation_rates[1])
+        self.bn2 = nn.BatchNorm1d(64)
+        self.dropout2 = nn.Dropout(0.3)
 
-    class_weights = class_weight.compute_class_weight('balanced', classes=np.unique(Y_train), y=Y_train)
+        self.conv3 = nn.Conv1d(in_channels=64, out_channels=64, kernel_size=3, padding=4, dilation=dilation_rates[2])
+        self.bn3 = nn.BatchNorm1d(64)
+        self.dropout3 = nn.Dropout(0.3)
 
-    # Convert to a dictionary format required by Keras
-    class_weights_dict = {i: class_weights[i] for i in range(len(class_weights))}
-    print(class_weights_dict)
-    model = make_model(input_shape=input_shape, num_classes=num_classes)
+        self.gap = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(64, num_classes)
 
-    model.compile(
-        optimizer="adam",
-        # loss="sparse_categorical_crossentropy",
-        loss=focal_loss(gamma=2., alpha = class_weights[1]),  # Using focal loss
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.dropout1(x)
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.dropout2(x)
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.dropout3(x)
+        x = self.gap(x).squeeze(-1)
+        x = self.fc(x)
+        return x
+class Conv1DModel(nn.Module):
+    def __init__(self, input_shape, num_classes):
+        super(Conv1DModel, self).__init__()
+        self.conv1 = nn.Conv1d(in_channels=input_shape[1], out_channels=64, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.dropout1 = nn.Dropout(0.3)
 
-        metrics=["sparse_categorical_accuracy"]
+        self.conv2 = nn.Conv1d(in_channels=64, out_channels=64, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm1d(64)
+        self.dropout2 = nn.Dropout(0.3)
+
+        self.conv3 = nn.Conv1d(in_channels=64, out_channels=64, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm1d(64)
+        self.dropout3 = nn.Dropout(0.3)
+
+        self.gap = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(64, num_classes)
+
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.dropout1(x)
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.dropout2(x)
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.dropout3(x)
+        x = self.gap(x).squeeze(-1)
+        x = self.fc(x)
+        return x
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2., alpha=0.25):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(self, inputs, targets):
+        BCE_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-BCE_loss)
+        F_loss = self.alpha * (1 - pt) ** self.gamma * BCE_loss
+        return F_loss.mean()
+
+
+
+def get_class_weights(Y_train):
+    """Compute class weights for imbalanced datasets."""
+    class_weights = compute_class_weight('balanced', classes=np.unique(Y_train), y=Y_train)
+    return {i: class_weights[i] for i in range(len(class_weights))}
+
+def initialize_model(input_shape, num_classes, class_weights):
+    """Initialize the model, criterion, and optimizer."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    model = DilatedConv1DModel(input_shape=input_shape, num_classes=num_classes).to(device)
+    criterion = FocalLoss(gamma=2., alpha=class_weights[1]).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+
+    return device, model, criterion, optimizer
+
+
+def prepare_data_loaders(X_train, Y_train, window_weight_train, batch_size, device):
+    """Prepare training and validation data loaders."""
+    X_train, X_val, Y_train, Y_val, window_weight_train, window_weight_val = train_test_split(
+        X_train, Y_train, window_weight_train, test_size=0.2, random_state=42
     )
-    epochs = 500
 
-    if TRAIN:
+    # Convert datasets to torch tensors
+    X_train_tensor = torch.tensor(X_train, dtype=torch.float32).permute(0, 2, 1).to(device)
+    Y_train_tensor = torch.tensor(Y_train, dtype=torch.long).to(device)
+    X_val_tensor = torch.tensor(X_val, dtype=torch.float32).permute(0, 2, 1).to(device)
+    Y_val_tensor = torch.tensor(Y_val, dtype=torch.long).to(device)
 
-        #test with imbalance oversampling
-        class_0_indices = np.where(Y_train == 0)[0]
-        class_1_indices = np.where(Y_train == 1)[0]
+    # Compute sample weights
+    class_sample_count = np.array([len(np.where(Y_train_tensor.cpu() == t)[0]) for t in np.unique(Y_train_tensor.cpu())])
+    weight = 1. / class_sample_count
+    samples_weight = np.array([weight[t] for t in Y_train_tensor.cpu()])
+    samples_weight = torch.from_numpy(samples_weight).to(device)
+    window_weight_train = torch.tensor(window_weight_train, dtype=torch.float32).to(device)
+    combined_weights = samples_weight * window_weight_train
 
-        samples_class_0 = X_train[class_0_indices]
-        labels_class_0 = Y_train[class_0_indices]
+    sampler = WeightedRandomSampler(combined_weights, len(combined_weights))
 
-        samples_class_1 = X_train[class_1_indices]
-        labels_class_1 = Y_train[class_1_indices]
-        batch_size = 32
-        balanced_train_dataset = oversample_generator(samples_class_0, labels_class_0, samples_class_1,
-                                                          labels_class_1, batch_size)
+    # Create data loaders
+    train_dataset = torch.utils.data.TensorDataset(X_train_tensor, Y_train_tensor)
+    val_dataset = torch.utils.data.TensorDataset(X_val_tensor, Y_val_tensor)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-        steps_per_epoch = max(len(samples_class_0), len(samples_class_1)) * 2 // batch_size
+    return train_loader, val_loader
 
-        callbacks = [
-            keras.callbacks.EarlyStopping(monitor='val_loss', patience=50, restore_best_weights=True),
-            keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10, min_lr=0.00001)
-        ]
+def validate_model(model, val_loader, criterion, epoch, running_loss, train_loader, device):
+    """Validate the model during training."""
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for inputs, labels in val_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            val_loss += criterion(outputs, labels).item()
 
-        # history = model.fit(
-        #     balanced_train_dataset,
-        #     epochs=epochs,
-        #     steps_per_epoch=steps_per_epoch,  # Define steps per epoch based on balanced dataset size
-        #     validation_data=(X_test, Y_test),  # Use the original distribution for validation
-        #     callbacks=callbacks,
-        #     verbose=1
-        # )
-        # normal use
-        history = model.fit(
-            X_train,
-            Y_train,
-            batch_size=batch_size,
-            epochs=epochs,
-            callbacks=callbacks,
-            validation_split=0.2,
-            verbose=1,
-        )
+    print(f"Epoch {epoch + 1}, Loss: {running_loss / len(train_loader)}, Val Loss: {val_loss / len(val_loader)}")
 
-    y_pred = model.predict(X_test)
-    y_pred_classes = np.argmax(y_pred, axis=1)
-    precision_weighted = precision_score(Y_test, y_pred_classes, average='weighted')
-    recall_weighted = recall_score(Y_test, y_pred_classes, average='weighted')
-    f1_weighted = f1_score(Y_test, y_pred_classes, average='weighted')
 
-    precision_macro = precision_score(Y_test, y_pred_classes, average='macro')
-    recall_macro = recall_score(Y_test, y_pred_classes, average='macro')
-    f1_macro = f1_score(Y_test, y_pred_classes, average='macro')
 
-    precision_micro = precision_score(Y_test, y_pred_classes, average='micro')
-    recall_micro = recall_score(Y_test, y_pred_classes, average='micro')
-    f1_micro = f1_score(Y_test, y_pred_classes, average='micro')
-
+def print_metrics(precision_weighted, recall_weighted, f1_weighted, precision_macro, recall_macro, f1_macro):
+    """Print evaluation metrics."""
     print(f"Weighted Precision: {precision_weighted}")
     print(f"Weighted Recall: {recall_weighted}")
     print(f"Weighted F1-score: {f1_weighted}")
@@ -426,9 +314,95 @@ def main(df,window_size= 5):
     print(f"Macro Recall: {recall_macro}")
     print(f"Macro F1-score: {f1_macro}")
 
-    print(f"Micro Precision: {precision_micro}")
-    print(f"Micro Recall: {recall_micro}")
-    print(f"Micro F1-score: {f1_micro}")
+def evaluate_and_save_model(model, X_test, Y_test, device, method):
+    """Evaluate the model and save results."""
+    model.eval()
+    with torch.no_grad():
+        X_test = torch.tensor(X_test, dtype=torch.float32).permute(0, 2, 1).to(device)
+        outputs = model(X_test)
+        _, y_pred_classes = torch.max(outputs, 1)
+
+    # Save the model
+    torch.save(model.state_dict(), f'{method}_model.pth')
+
+    # Evaluate metrics
+    precision_weighted = precision_score(Y_test.cpu(), y_pred_classes.cpu(), average='weighted')
+    recall_weighted = recall_score(Y_test.cpu(), y_pred_classes.cpu(), average='weighted')
+    f1_weighted = f1_score(Y_test.cpu(), y_pred_classes.cpu(), average='weighted')
+
+    precision_macro = precision_score(Y_test.cpu(), y_pred_classes.cpu(), average='macro')
+    recall_macro = recall_score(Y_test.cpu(), y_pred_classes.cpu(), average='macro')
+    f1_macro = f1_score(Y_test.cpu(), y_pred_classes.cpu(), average='macro')
+
+    print_metrics(precision_weighted, recall_weighted, f1_weighted, precision_macro, recall_macro, f1_macro)
+
+    plot_confusion_matrix(Y_test.cpu(), y_pred_classes.cpu())
+
+
+def train_model(model, train_loader, val_loader, criterion, optimizer, epochs, device):
+    """Train the model and evaluate on the validation set."""
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+
+        if epoch % 10 == 0:
+            validate_model(model, val_loader, criterion, epoch, running_loss, train_loader, device)
+
+
+def plot_confusion_matrix(y_true, y_pred):
+    """Plots and saves the confusion matrix."""
+    # Compute confusion matrix
+    confusion_matrix_res = confusion_matrix(y_true, y_pred)
+
+    # Create a figure for the confusion matrix
+    plt.figure(figsize=(10, 7))
+    sns.heatmap(confusion_matrix_res, annot=True, fmt='d', cmap='Blues', cbar=False,
+                xticklabels=['Predicted 0', 'Predicted 1'],
+                yticklabels=['Actual 0', 'Actual 1'])
+
+    # Add labels and title
+    plt.title('Confusion Matrix')
+    plt.xlabel('Predicted Label')
+    plt.ylabel('True Label')
+
+    # Save and show the confusion matrix
+    plt.savefig(f'confusion_matrix.png')
+    plt.show()
+def main(df, window_size=5, method='', resample=False,epochs=200,batch_size=32):
+    interval = '10ms'
+
+    # Step 1: Split the dataset
+    train_df, test_df = split_train_test(df)
+
+    # Step 2: Create time series data for training and testing
+    X_train, Y_train, window_weight_train = create_time_series(train_df, interval, window_size=window_size, resample=resample)
+    X_test, Y_test, window_weights_test = create_time_series(test_df, interval, window_size=window_size, resample=resample)
+
+    # Step 3: Compute class weights for handling class imbalance
+    class_weights_dict = get_class_weights(Y_train)
+    print(class_weights_dict)
+
+    # Step 4: Initialize model, loss, optimizer, and device
+    device, model, criterion, optimizer = initialize_model(input_shape=(window_size, len(feature_columns)),
+                                                           num_classes=2,
+                                                           class_weights=class_weights_dict)
+
+    # Step 5: Prepare data loaders
+    train_loader, val_loader = prepare_data_loaders(X_train, Y_train, window_weight_train, batch_size=batch_size, device=device)
+
+    # Step 6: Train the model
+    train_model(model, train_loader, val_loader, criterion, optimizer, epochs=epochs, device=device)
+
+    # Step 7: Save and evaluate the model
+    evaluate_and_save_model(model, X_test, Y_test, device, method)
 
 
 
@@ -457,18 +431,20 @@ if __name__ == '__main__':
         normalize=True,
         remove_surrounding_to_hits=0,
         update_surrounding_to_hits=0,
-        approach_num=7,
+        approach_num=6,
     )
 
     ident_sub_rec = IdentSubRec(**categorized_rad_init_kwargs)
     df = ident_sub_rec.df
-    # df['target'] = df['SLICE_TYPE'].apply(lambda x: 1 if x == 'NODULE_SLICE' else 0)
-    window = 15
-    labels = list(df['RECORDING_SESSION_LABEL'].unique())
+    window = 500
 
-
-    for label in labels[1:]:
-        main(df[df['RECORDING_SESSION_LABEL'] == label],window_size=window)
+    main(df, window_size=window, method=f'new train_test')
+    # main(df,window_size=window,method='add weighted random sampler and dialconv')
+    # labels = list(df['RECORDING_SESSION_LABEL'].unique())
+    #
+    #
+    # for label in labels[1:]:
+    #     print(label)
 
 
     #first results without adding class balance to the model:
@@ -857,3 +833,209 @@ if __name__ == '__main__':
 # Micro Precision: 0.9801840822956145
 # Micro Recall: 0.9801840822956145
 # Micro F1-score: 0.9801840822956145
+
+
+# yakir results:
+# mean results are:
+# Accuracy 97.51%
+# Precision 52.68%
+# Recall 33.52%
+# F1 score 40.97%
+# ROC AUC score 95.73%
+#
+#
+# max results are:
+# Accuracy 97.51%
+# Precision 52.68%
+# Recall 33.52%
+# F1 score 40.97%
+# ROC AUC score 95.73%
+#
+#
+# min results are:
+# Accuracy 97.51%
+# Precision 52.68%
+# Recall 33.52%
+# F1 score 40.97%
+# ROC AUC score 95.73%
+#
+#
+# std results are:
+# Accuracy 0.00%
+# Precision 0.00%
+# Recall 0.00%
+# F1 score 0.00%
+# ROC AUC score 0.00%
+#
+#
+# The full classification report is:
+#               precision    recall  f1-score   support
+#
+#        False       0.98      0.99      0.99     66460
+#         True       0.53      0.34      0.41      1760
+#
+#     accuracy                           0.98     68220
+#    macro avg       0.75      0.66      0.70     68220
+# weighted avg       0.97      0.98      0.97     68220
+
+
+# #test with pytorch:
+# Weighted Precision: 0.9878409670266913
+# Weighted Recall: 0.9873903859694041
+# Weighted F1-score: 0.9876111436841231
+# Macro Precision: 0.6740112606261313
+# Macro Recall: 0.6866393071802495
+# Macro F1-score: 0.6800956470807735
+# Micro Precision: 0.9873903859694041
+# Micro Recall: 0.9873903859694041
+# Micro F1-score: 0.9873903859694041
+# Recall for class 0: 0.9932786143604989
+# Recall for class 1: 0.38
+
+
+#test with dropouts: - better results
+
+# Weighted Precision: 0.9878975191754963
+# Weighted Recall: 0.9836139025795302
+# Weighted F1-score: 0.9855436267132802
+# Macro Precision: 0.638759981409608
+# Macro Recall: 0.724344988043689
+# Macro F1-score: 0.6709780639318811
+# Micro Precision: 0.9836139025795302
+# Micro Recall: 0.9836139025795302
+# Micro F1-score: 0.9836139025795302
+# Recall for class 0: 0.988689976087378
+# Recall for class 1: 0.46
+
+
+
+#test with dropouts and resampling minorty group: - better results
+
+# Weighted Precision: 0.9880684520071987
+# Weighted Recall: 0.9822057223324585
+# Weighted F1-score: 0.9848008966714127
+# Macro Precision: 0.6315819170625804
+# Macro Recall: 0.740139167151382
+# Macro F1-score: 0.6691988617841594
+# Micro Precision: 0.9822057223324585
+# Micro Recall: 0.9822057223324585
+# Micro F1-score: 0.9822057223324585
+# Recall for class 0: 0.9869450009694306
+# Recall for class 1: 0.49333333333333335
+
+
+# #test with dropouts and resampling minorty group and dialted: - better results
+# Weighted Precision: 0.9878313866875356
+# Weighted Recall: 0.9555783140241951
+# Weighted F1-score: 0.969793044744182
+# Macro Precision: 0.5617849794285998
+# Macro Recall: 0.7894157564790281
+# Macro F1-score: 0.5942545640159748
+# Micro Precision: 0.9555783140241951
+# Micro Recall: 0.9555783140241951
+# Micro F1-score: 0.9555783140241951
+# Recall for class 0: 0.958831512958056
+# Recall for class 1: 0.62
+
+#this is results for window = 1
+# Weighted Precision: 0.9736260298152839
+# Weighted Recall: 0.8276873167384117
+# Weighted F1-score: 0.8914465079756182
+# Macro Precision: 0.515944042303774
+# Macro Recall: 0.6402926539487005
+# Macro F1-score: 0.49153297232315535
+# Micro Precision: 0.8276873167384117
+# Micro Recall: 0.8276873167384117
+# Micro F1-score: 0.8276873167384117
+# Recall for class 0: 0.8340204224012178
+# Recall for class 1: 0.44656488549618323
+
+# without resampling window = 5
+# Weighted Precision: 0.9713464397980148
+# Weighted Recall: 0.9017106842737095
+# Weighted F1-score: 0.9323700232128818
+# Macro Precision: 0.5435075656458045
+# Macro Recall: 0.6992725131247933
+# Macro F1-score: 0.5556308909891186
+# Micro Precision: 0.9017106842737095
+# Micro Recall: 0.9017106842737095
+# Micro F1-score: 0.9017106842737095
+# Recall for class 0: 0.9099954079289759
+# Recall for class 1: 0.48854961832061067
+# without resampling window = 1
+# Weighted Precision: 0.9551875052842871
+# Weighted Recall: 0.7303799325216371
+# Weighted F1-score: 0.8196768912274685
+# Macro Precision: 0.5211952686964636
+# Macro Recall: 0.6477648481184828
+# Macro F1-score: 0.4749003665491774
+# Micro Precision: 0.7303799325216371
+# Micro Recall: 0.7303799325216371
+# Micro F1-score: 0.7303799325216371
+# Recall for class 0: 0.7355296962369654
+# Recall for class 1: 0.56
+
+# without resampling as sampling
+# Weighted Precision: 0.9440531537924188
+# Weighted Recall: 0.9662608185418806
+# Weighted F1-score: 0.9545024835388698
+# Macro Precision: 0.5148164528969482
+# Macro Recall: 0.5025819857941665
+# Macro F1-score: 0.49996491899476975
+# Micro Precision: 0.9662608185418806
+# Micro Recall: 0.9662608185418806
+# Micro F1-score: 0.9662608185418806
+# Recall for class 0: 0.995163971588333
+# Recall for class 1: 0.01
+
+# window = 500 test on other trails
+# Weighted Precision: 0.8820272614327759
+# Weighted Recall: 0.8492540636829214
+# Weighted F1-score: 0.8648230658817501
+# Macro Precision: 0.5170274762072542
+# Macro Recall: 0.5259477147963576
+# Macro F1-score: 0.5180346626186998
+# Micro Precision: 0.8492540636829214
+# Micro Recall: 0.8492540636829214
+# Micro F1-score: 0.8492540636829214
+# Recall for class 0: 0.8984384312790559
+# Recall for class 1: 0.15345699831365936
+
+
+
+
+
+
+
+
+
+
+
+#approch 6, without resmapling, test on diffrent scans. window = 10
+
+# Weighted Precision: 0.977229036852502
+# Weighted Recall: 0.8772401433691757
+# Weighted F1-score: 0.9233732061858959
+# Macro Precision: 0.5068201935916077
+# Macro Recall: 0.5571464749061269
+# Macro F1-score: 0.48929698112367226
+# Micro Precision: 0.8772401433691757
+# Micro Recall: 0.8772401433691757
+# Micro F1-score: 0.8772401433691757
+# Recall for class 0: 0.8853772871616513
+# Recall for class 1: 0.2289156626506024
+
+#approch 6, without resmapling - wieghted window size, test on diffrent scans. window = 10
+
+#
+# Weighted Precision: 0.9773218041392566
+# Weighted Recall: 0.9177120669056152
+# Weighted F1-score: 0.9458014902939317
+# Macro Precision: 0.5105932859909619
+# Macro Recall: 0.5597909557479882
+# Macro F1-score: 0.5059359393929573
+# Micro Precision: 0.9177120669056152
+# Micro Recall: 0.9177120669056152
+# Micro F1-score: 0.9177120669056152
+# Recall for class 0: 0.926810827158627
+# Recall for class 1: 0.1927710843373494
