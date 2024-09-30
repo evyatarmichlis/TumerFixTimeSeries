@@ -168,8 +168,6 @@ def create_time_series(time_series_df, interval='30ms',  window_size = 5 ,resamp
 
 
 
-
-
 class DilatedConv1DModel(nn.Module):
     def __init__(self, input_shape, num_classes, dilation_rates=[1, 2, 4]):
         super(DilatedConv1DModel, self).__init__()
@@ -326,17 +324,17 @@ def evaluate_and_save_model(model, X_test, Y_test, device, method):
     torch.save(model.state_dict(), f'{method}_model.pth')
 
     # Evaluate metrics
-    precision_weighted = precision_score(Y_test.cpu(), y_pred_classes.cpu(), average='weighted')
-    recall_weighted = recall_score(Y_test.cpu(), y_pred_classes.cpu(), average='weighted')
-    f1_weighted = f1_score(Y_test.cpu(), y_pred_classes.cpu(), average='weighted')
+    precision_weighted = precision_score(Y_test, y_pred_classes, average='weighted')
+    recall_weighted = recall_score(Y_test, y_pred_classes, average='weighted')
+    f1_weighted = f1_score(Y_test, y_pred_classes, average='weighted')
 
-    precision_macro = precision_score(Y_test.cpu(), y_pred_classes.cpu(), average='macro')
-    recall_macro = recall_score(Y_test.cpu(), y_pred_classes.cpu(), average='macro')
-    f1_macro = f1_score(Y_test.cpu(), y_pred_classes.cpu(), average='macro')
+    precision_macro = precision_score(Y_test, y_pred_classes, average='macro')
+    recall_macro = recall_score(Y_test, y_pred_classes, average='macro')
+    f1_macro = f1_score(Y_test, y_pred_classes, average='macro')
 
     print_metrics(precision_weighted, recall_weighted, f1_weighted, precision_macro, recall_macro, f1_macro)
 
-    plot_confusion_matrix(Y_test.cpu(), y_pred_classes.cpu())
+    plot_confusion_matrix(Y_test, y_pred_classes)
 
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, epochs, device):
@@ -436,9 +434,9 @@ if __name__ == '__main__':
 
     ident_sub_rec = IdentSubRec(**categorized_rad_init_kwargs)
     df = ident_sub_rec.df
-    window = 500
-
-    main(df, window_size=window, method=f'new train_test')
+    for window in [5,10,20,50,100,500]:
+        print(window)
+        main(df, window_size=window, method=f'new train_test')
     # main(df,window_size=window,method='add weighted random sampler and dialconv')
     # labels = list(df['RECORDING_SESSION_LABEL'].unique())
     #
@@ -962,6 +960,7 @@ if __name__ == '__main__':
 # Micro F1-score: 0.9017106842737095
 # Recall for class 0: 0.9099954079289759
 # Recall for class 1: 0.48854961832061067
+
 # without resampling window = 1
 # Weighted Precision: 0.9551875052842871
 # Weighted Recall: 0.7303799325216371
@@ -988,6 +987,7 @@ if __name__ == '__main__':
 # Recall for class 0: 0.995163971588333
 # Recall for class 1: 0.01
 
+#change the train - test
 # window = 500 test on other trails
 # Weighted Precision: 0.8820272614327759
 # Weighted Recall: 0.8492540636829214
@@ -1000,10 +1000,6 @@ if __name__ == '__main__':
 # Micro F1-score: 0.8492540636829214
 # Recall for class 0: 0.8984384312790559
 # Recall for class 1: 0.15345699831365936
-
-
-
-
 
 
 
