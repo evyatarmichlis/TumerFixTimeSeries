@@ -22,7 +22,7 @@ import seaborn as sns
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
-
+TRAIN = False
 def initialize_weights(m):
     if isinstance(m, nn.Conv1d) or isinstance(m, nn.ConvTranspose1d):
         nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
@@ -228,7 +228,12 @@ class InceptionAutoencoder(nn.Module):
         return decoded
 # Function to train the autoencoder
 
-def train_autoencoder_with_input_masking(model, train_loader, val_loader, criterion, optimizer, epochs, device,scheduler, mask_probability=0.1):
+def train_autoencoder_with_input_masking(model, train_loader, val_loader, criterion, optimizer, epochs, device, scheduler, mask_probability=0.1, early_stopping_patience=100):
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    train_losses = []
+    val_losses = []
+
     for epoch in range(epochs):
         model.train()
         running_loss = 0.0
@@ -236,28 +241,45 @@ def train_autoencoder_with_input_masking(model, train_loader, val_loader, criter
             inputs = inputs.to(device)
             optimizer.zero_grad()
 
-            # Apply masking to the input
             z = apply_input_masking(inputs, mask_probability)
-
-            # # Forward pass
-            # def add_noise(z, noise_factor=0.1):
-            #     noisy_inputs = z + noise_factor * torch.randn_like(inputs)
-            #     return torch.clamp(noisy_inputs, 0., 1.)  # Ensure inputs are within valid range
-            #
-            # z = add_noise(z, noise_factor=0.1)
 
             outputs = model(z)
 
-            # Compute loss between outputs and original inputs
             loss = criterion(outputs, inputs)
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
 
         # Validation and logging
-        if epoch % 10 == 0:
-            val_loss=validate_autoencoder(model, val_loader, criterion, epoch, running_loss, train_loader, device,mask_probability=mask_probability)
-            scheduler.step(val_loss)
+        avg_train_loss = running_loss / len(train_loader)
+        val_loss = validate_autoencoder(model, val_loader, criterion, epoch, running_loss, train_loader, device, mask_probability=mask_probability)
+        scheduler.step(val_loss)
+
+        train_losses.append(avg_train_loss)
+        val_losses.append(val_loss)
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            # Save the best model
+            torch.save(model.state_dict(), 'best_autoencoder.pth')
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= early_stopping_patience:
+                print(f'Early stopping after {epoch + 1} epochs')
+                # Load the best model weights
+                model.load_state_dict(torch.load('best_autoencoder.pth'))
+                break
+
+    # Plot the training and validation loss curves
+    plt.figure(figsize=(10, 5))
+    plt.plot(range(1, len(train_losses) + 1), train_losses, label='Training Loss')
+    plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Autoencoder Training and Validation Loss')
+    plt.legend()
+    plt.show()
+
 
 def train_autoencoder(model, train_loader, val_loader, criterion, optimizer, epochs, device,scheduler):
     for epoch in range(epochs):
@@ -346,9 +368,8 @@ def evaluate_classifier(model, val_loader, device):
     plt.show()
 
 # Main function integrating everything
-def main_with_autoencoder(df, window_size=5, method='', resample=True, epochs=200, batch_size=32, ae_epochs=200):
+def main_with_autoencoder(df, window_size=5, method='', resample=True, epochs=200, batch_size=32, ae_epochs=100):
     interval = '30ms'
-    scaler = StandardScaler()
     # Step 1: Split the dataset
     train_df, test_df = split_train_test(df)
     scaler = StandardScaler()
@@ -357,8 +378,6 @@ def main_with_autoencoder(df, window_size=5, method='', resample=True, epochs=20
     X_train, Y_train, window_weight_train = create_time_series(train_df, interval, window_size=window_size, resample=resample)
     X_test, Y_test, window_weights_test = create_time_series(test_df, interval, window_size=window_size, resample=resample)
 
-    # Step 3: Normalize the data
-    scaler = StandardScaler()
     num_samples, seq_len, num_features = X_train.shape
     X_train_reshaped = X_train.reshape(-1, num_features)
     X_train_scaled = scaler.fit_transform(X_train_reshaped).reshape(num_samples, seq_len, num_features)
@@ -383,7 +402,6 @@ def main_with_autoencoder(df, window_size=5, method='', resample=True, epochs=20
     class_sample_counts = np.array([np.sum(class_indices == i) for i in range(len(classes))])
     weights = 1. / class_sample_counts
 
-    # Assign weights using class_indices
     samples_weight = weights[class_indices]
     samples_weight = torch.from_numpy(samples_weight).float()
 
@@ -396,7 +414,7 @@ def main_with_autoencoder(df, window_size=5, method='', resample=True, epochs=20
     # Step 5: Initialize and train the autoencoder
     in_channels = len(feature_columns)
     input_length = X_train_tensor.shape[2]  # Get the sequence length from the input tensor
-    autoencoder = InceptionAutoencoder(in_channels=in_channels, input_length=input_length, num_filters=32, depth=3).to(
+    autoencoder = InceptionAutoencoder(in_channels=in_channels, input_length=input_length, num_filters=32, depth=4).to(
         device)
     autoencoder.apply(initialize_weights)
 
@@ -406,14 +424,16 @@ def main_with_autoencoder(df, window_size=5, method='', resample=True, epochs=20
 
     # train_autoencoder(autoencoder, train_loader_ae, test_loader_ae, criterion_ae, optimizer_ae, epochs=ae_epochs,
     #                   device=device,scheduler=scheduler)
-    train_autoencoder_with_input_masking(autoencoder, train_loader_ae, test_loader_ae, criterion_ae, optimizer_ae,
-                                         epochs=ae_epochs, device=device,scheduler=scheduler, mask_probability=0.3)
+    if TRAIN:
 
-    # Step 6: Extract features from the encoder part of the autoencoder
+        train_autoencoder_with_input_masking(autoencoder, train_loader_ae, test_loader_ae, criterion_ae, optimizer_ae,
+                                             epochs=ae_epochs, device=device,scheduler=scheduler, mask_probability=0.4)
+    torch.save(autoencoder.state_dict(), 'best_autoencoder.pth')
+    autoencoder.load_state_dict(torch.load('best_autoencoder.pth'))
+
     encoded_features_train, train_labels = extract_encoded_features(autoencoder, train_loader_ae, device)
     encoded_features_test, test_labels = extract_encoded_features(autoencoder, test_loader_ae, device)
 
-    # Step 7: Visualize encoded features using PCA and t-SNE
     print("Visualizing encoded features using PCA and t-SNE...")
     plot_pca_tsne(encoded_features_train, train_labels, method='Autoencoder - Train Data')
     plot_pca_tsne(encoded_features_test, test_labels, method='Autoencoder - Test Data')
@@ -453,7 +473,6 @@ if __name__ == '__main__':
 
     ident_sub_rec = IdentSubRec(**categorized_rad_init_kwargs)
     df = ident_sub_rec.df
-    window = 10
-    scaler = StandardScaler()
+    window = 100
 
     main_with_autoencoder(df, window_size=window, method='autoencoder_classification')
