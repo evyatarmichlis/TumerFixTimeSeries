@@ -228,7 +228,8 @@ def get_df_for_training(
         df['Zones'] = df['Zones'].replace(to_replace=str(invalid_value), value=invalid_ia_str_value)
         df['Zones'] = df['Zones'].replace(to_replace=invalid_value, value=invalid_ia_str_value)
         df['Zones'] = df['Zones'].str.split(',\s*')  # Split the 'Zones' column on comma with arbitrary number of spaces
-        df['Zones'] = df['Zones'].apply(lambda x: x[0] if isinstance(x, list) and len(x) > 0 else None)
+        # df['Zones'] = df['Zones'].apply(lambda x: x[0] if isinstance(x, list) and len(x) > 0 else None)
+        df = df.explode('Zones')
         # Create two new columns
         # df['Zones_X'] = df['Zones'].apply(lambda x: letter_to_num(x[0]))
         # df['Zones_Y'] = df['Zones'].apply(lambda x: int(x[1:]))

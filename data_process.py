@@ -594,7 +594,7 @@ if __name__ == '__main__':
 
     ident_sub_rec = IdentSubRec(**categorized_rad_init_kwargs)
     train_kwargs = dict(test_size=0.2, num_leaves=300, learning_rate=0.1, min_child_samples=44, print_stats=True,
-                        plot_confusion_matrix=False, save_plot=False, cross_validate=True, cross_validation_n_splits=10,
+                        plot_confusion_matrix=True, save_plot=False, cross_validate=True, cross_validation_n_splits=10,
                         split_by_participants=False, completely_random_data_split=False, smote_type=SmoteType.none,
                         save_models=False, save_predicted_as_true_data_rows=True)
 

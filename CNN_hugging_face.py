@@ -355,7 +355,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, epochs, d
             validate_model(model, val_loader, criterion, epoch, running_loss, train_loader, device)
 
 
-def plot_confusion_matrix(y_true, y_pred):
+def plot_confusion_matrix(y_true, y_pred,save_path=''):
     """Plots and saves the confusion matrix."""
     # Compute confusion matrix
     confusion_matrix_res = confusion_matrix(y_true, y_pred)
@@ -372,7 +372,7 @@ def plot_confusion_matrix(y_true, y_pred):
     plt.ylabel('True Label')
 
     # Save and show the confusion matrix
-    plt.savefig(f'confusion_matrix.png')
+    plt.savefig(f'{save_path}/confusion_matrix.png')
     plt.show()
 def main(df, window_size=5, method='', resample=False,epochs=200,batch_size=32):
     interval = '10ms'
