@@ -30,8 +30,19 @@ import torch
 from torchsampler import ImbalancedDatasetSampler
 
 
-TRAIN = False
+TRAIN = True
 
+def split_train_test(df, input_data_points, test_size=0.2, random_state=0):
+    df['group'] = df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']].apply(
+        lambda row: '_'.join(row.values.astype(str)), axis=1)
+    gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+    split_indices = list(gss.split(X=df[input_data_points], y=df['target'], groups=df['group']))[0]
+    train_index, test_index = split_indices
+    x_train = df.iloc[train_index]
+    x_test = df.iloc[test_index]
+    y_train = df['target'].iloc[train_index]
+    y_test = df['target'].iloc[test_index]
+    return x_train, x_test, y_train, y_test
 
 def seed_everything(seed):
     random.seed(seed)  # Python random module.
@@ -62,8 +73,9 @@ def apply_input_masking(inputs, mask_probability):
     # Apply the mask to the inputs
     masked_inputs = inputs * mask
     return masked_inputs
+
 # Function to split the dataset
-def split_train_test(time_series_df):
+def split_train_test_old(time_series_df):
     df = time_series_df.copy()
     df['group'] = df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']].apply(
         lambda row: '_'.join(row.values.astype(str)), axis=1)
@@ -376,7 +388,7 @@ class ComplexCNNClassifier(nn.Module):
     def __init__(self, input_dim, num_classes):
         super(ComplexCNNClassifier, self).__init__()
         # Ensure in_channels=1
-        self.initial_conv = nn.Conv1d(1, 64, kernel_size=7, padding=3)
+        self.initial_conv = nn.Conv1d(128, 64, kernel_size=7, padding=3)
         self.initial_bn = nn.BatchNorm1d(64)
         self.relu = nn.ReLU(inplace=True)
 
@@ -397,18 +409,14 @@ class ComplexCNNClassifier(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        x = x.unsqueeze(1)  # (batch_size, 1, input_dim)
         x = self.relu(self.initial_bn(self.initial_conv(x)))
-
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
-
         x = self.gap(x).squeeze(-1)
         x = self.fc(x)
         return x
-
 
 
 
@@ -558,79 +566,6 @@ def evaluate_classifier(model, val_loader, device):
     sns.heatmap(cm, annot=True, fmt='d')
     plt.show()
 
-def train_evaluate_knn(encoded_features_train, Y_train, encoded_features_test, Y_test):
-    from sklearn.neighbors import KNeighborsClassifier
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.metrics import classification_report
-
-    # Standardize the features
-    scaler = StandardScaler()
-    encoded_features_train_scaled = scaler.fit_transform(encoded_features_train)
-    encoded_features_test_scaled = scaler.transform(encoded_features_test)
-
-    # Initialize and train KNN classifier
-    knn_classifier = KNeighborsClassifier(n_neighbors=5)
-    knn_classifier.fit(encoded_features_train_scaled, Y_train)
-
-    # Make predictions on the test set
-    knn_predictions = knn_classifier.predict(encoded_features_test_scaled)
-
-    # Evaluate the classifier
-    print("KNN Classification Report:")
-    print(classification_report(Y_test, knn_predictions))
-
-    return knn_classifier
-
-def train_evaluate_svm(encoded_features_train, Y_train, encoded_features_test, Y_test, class_weights_dict):
-    from sklearn.svm import SVC
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.metrics import classification_report
-
-    # Standardize the features
-    scaler = StandardScaler()
-    encoded_features_train_scaled = scaler.fit_transform(encoded_features_train)
-    encoded_features_test_scaled = scaler.transform(encoded_features_test)
-
-    # Initialize and train SVM classifier
-    svm_classifier = SVC(kernel='rbf', class_weight='balanced', probability=True, random_state=42)
-    svm_classifier.fit(encoded_features_train_scaled, Y_train)
-
-    # Make predictions on the test set
-    svm_predictions = svm_classifier.predict(encoded_features_test_scaled)
-
-    # Evaluate the classifier
-    print("SVM Classification Report:")
-    print(classification_report(Y_test, svm_predictions))
-
-    return svm_classifier
-
-
-def train_evaluate_xgboost(encoded_features_train, Y_train, encoded_features_test, Y_test, class_weights_dict):
-    from xgboost import XGBClassifier
-    from sklearn.metrics import classification_report
-
-    # Calculate scale_pos_weight
-    scale_pos_weight = class_weights_dict[1] / class_weights_dict[0]
-
-    # Initialize and train XGBoost classifier
-    xgb_classifier = XGBClassifier(
-        scale_pos_weight=scale_pos_weight,
-        use_label_encoder=False,
-        eval_metric='logloss',
-        random_state=42
-    )
-    xgb_classifier.fit(encoded_features_train, Y_train)
-
-    # Make predictions on the test set
-    xgb_predictions = xgb_classifier.predict(encoded_features_test)
-
-    # Evaluate the classifier
-    print("XGBoost Classification Report:")
-    print(classification_report(Y_test, xgb_predictions))
-
-    return xgb_classifier
-
-
 
 def train_cnn(model, train_loader, val_loader, criterion, optimizer, epochs, device, early_stopping_patience=10,save_path =''):
     best_val_loss = float('inf')
@@ -681,12 +616,95 @@ def evaluate_model(model, test_loader, device,save_path=''):
     # Compute metrics
     print("Classification Report:")
     print(classification_report(all_labels, all_preds))
-    plot_confusion_matrix(all_labels, all_preds,save_path)
+    plot_confusion_matrix(all_labels, all_preds)
+
+def train_combined_model(model, train_loader, val_loader, criterion, optimizer, epochs, device, scheduler,
+                         save_path, early_stopping_patience):
+    best_val_loss = float('inf')
+    patience_counter = 0
+
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+
+        for inputs, labels in train_loader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+
+            optimizer.zero_grad()
+
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item() * inputs.size(0)
+
+        epoch_loss = running_loss / len(train_loader.dataset)
+
+        # Validation Phase
+        model.eval()
+        val_running_loss = 0.0
+        correct = 0
+
+        with torch.no_grad():
+            for val_inputs, val_labels in val_loader:
+                val_inputs = val_inputs.to(device)
+                val_labels = val_labels.to(device)
+
+                val_outputs = model(val_inputs)
+                val_loss = criterion(val_outputs, val_labels)
+
+                val_running_loss += val_loss.item() * val_inputs.size(0)
+
+                _, preds = torch.max(val_outputs, 1)
+                correct += torch.sum(preds == val_labels.data)
+
+        val_epoch_loss = val_running_loss / len(val_loader.dataset)
+        val_accuracy = correct.double() / len(val_loader.dataset)
+
+        print(f'Epoch {epoch+1}/{epochs}, '
+              f'Train Loss: {epoch_loss:.4f}, '
+              f'Val Loss: {val_epoch_loss:.4f}, '
+              f'Val Acc: {val_accuracy:.4f}')
+
+        scheduler.step(val_epoch_loss)
+
+        # Early Stopping
+        if val_epoch_loss < best_val_loss:
+            best_val_loss = val_epoch_loss
+            patience_counter = 0
+            # Save the best model
+            torch.save(model.state_dict(), os.path.join(save_path, 'best_combined_model.pth'))
+        else:
+            patience_counter += 1
+            if patience_counter >= early_stopping_patience:
+                print("Early stopping triggered.")
+                break
 
 
-# Main function integrating everything
-def main_with_autoencoder(df, window_size=5, method='', resample=True, epochs=20, batch_size=32, ae_epochs=100,depth = 4,num_filters = 32,lr =0.001,mask_probability=0.4,
-                          early_stopping_patience  = 30):
+def extract_encoded_features_from_combined_model(model, data_loader, device):
+    model.eval()
+    encoded_features = []
+    labels = []
+    with torch.no_grad():
+        for inputs, lbls in data_loader:
+            inputs = inputs.to(device)
+            lbls = lbls.numpy()
+            # Pass inputs through the encoder part of the model
+            encoded = model.encoder(inputs)
+            # Flatten the encoded features if necessary
+            encoded = encoded.view(encoded.size(0), -1)
+            encoded_features.append(encoded.cpu().numpy())
+            labels.append(lbls)
+    encoded_features = np.concatenate(encoded_features, axis=0)
+    labels = np.concatenate(labels, axis=0)
+    return encoded_features, labels
+
+
+def main_with_autoencoder(df, window_size=5, method='', resample=False, epochs=20, batch_size=32, ae_epochs=100,
+                          depth=4, num_filters=32, lr=0.001, mask_probability=0.4, early_stopping_patience=30):
     seed_everything(0)
     interval = '30ms'
 
@@ -703,7 +721,7 @@ def main_with_autoencoder(df, window_size=5, method='', resample=True, epochs=20
         'in_channels': len(feature_columns),
         'num_filters': num_filters,
         'depth': depth,
-        'learning_rate':lr,
+        'learning_rate': lr,
         'weight_decay': 1e-4,
         'optimizer': 'AdamW',
         'scheduler': 'ReduceLROnPlateau',
@@ -719,13 +737,21 @@ def main_with_autoencoder(df, window_size=5, method='', resample=True, epochs=20
             f.write(f"{key}: {value}\n")
 
     # 1. Split the DataFrame into Training and Test DataFrames
-    train_df, test_df = split_train_test(df)
-
+    train_df, test_df = CNN_hugging_face.split_train_test(
+        time_series_df=df,
+        input_data_points=feature_columns,
+        test_size=0.2,
+        random_state=0
+    )
+    print("Number of True and False in y_test:")
+    print(test_df["target"].value_counts())
     # 2. Create Time Series Data for Training and Testing
     X_train_full, Y_train_full, window_weight_train_full = create_time_series(
         train_df, interval, window_size=window_size, resample=resample)
     X_test, Y_test, window_weight_test = create_time_series(
         test_df, interval, window_size=window_size, resample=resample)
+    print("Number of True and False after time series creation y_test:")
+    print(pd.Series(Y_test).value_counts())
 
     # 3. Split the Training Data into Training and Validation Sets
     from sklearn.model_selection import train_test_split
@@ -755,41 +781,40 @@ def main_with_autoencoder(df, window_size=5, method='', resample=True, epochs=20
     X_val_scaled = scaler.transform(X_val_reshaped).reshape(num_samples_val, seq_len_val, num_features)
     X_test_scaled = scaler.transform(X_test_reshaped).reshape(num_samples_test, seq_len_test, num_features)
 
-    # 5. Prepare Data Loaders for the Autoencoder
+    # 5. Prepare Data Loaders for Training
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Convert scaled data to tensors and permute dimensions
-    X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32).permute(0, 2, 1).to(device)
-    X_val_tensor = torch.tensor(X_val_scaled, dtype=torch.float32).permute(0, 2, 1).to(device)
-    X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32).permute(0, 2, 1).to(device)
+    X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32).permute(0, 2, 1)
+    X_val_tensor = torch.tensor(X_val_scaled, dtype=torch.float32).permute(0, 2, 1)
+    X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32).permute(0, 2, 1)
 
     # Convert labels to tensors
-    Y_train_tensor = torch.tensor(Y_train, dtype=torch.long).to(device)
-    Y_val_tensor = torch.tensor(Y_val, dtype=torch.long).to(device)
-    Y_test_tensor = torch.tensor(Y_test, dtype=torch.long).to(device)
+    Y_train_tensor = torch.tensor(Y_train, dtype=torch.long)
+    Y_val_tensor = torch.tensor(Y_val, dtype=torch.long)
+    Y_test_tensor = torch.tensor(Y_test, dtype=torch.long)
 
     # Create TensorDatasets
-    train_dataset_ae = torch.utils.data.TensorDataset(X_train_tensor, Y_train_tensor)
-    val_dataset_ae = torch.utils.data.TensorDataset(X_val_tensor, Y_val_tensor)
-    test_dataset_ae = torch.utils.data.TensorDataset(X_test_tensor, Y_test_tensor)
+    train_dataset = torch.utils.data.TensorDataset(X_train_tensor, Y_train_tensor)
+    val_dataset = torch.utils.data.TensorDataset(X_val_tensor, Y_val_tensor)
+    test_dataset = torch.utils.data.TensorDataset(X_test_tensor, Y_test_tensor)
 
     # Compute Sample Weights for the Training Data
-    train_labels_numpy = Y_train  # Ensure Y_train is a NumPy array
+    train_labels_numpy = Y_train
     classes, class_indices = np.unique(train_labels_numpy, return_inverse=True)
     class_sample_counts = np.array([np.sum(class_indices == i) for i in range(len(classes))])
     weights = 1. / class_sample_counts
 
     samples_weight = weights[class_indices]
-    samples_weight = torch.from_numpy(samples_weight).float().to(device)
-
+    samples_weight = torch.from_numpy(samples_weight).float()
     sampler = WeightedRandomSampler(samples_weight, len(samples_weight))
 
     # Create DataLoaders
-    train_loader_ae = torch.utils.data.DataLoader(train_dataset_ae, batch_size=batch_size, sampler=sampler)
-    val_loader_ae = torch.utils.data.DataLoader(val_dataset_ae, batch_size=batch_size, shuffle=False)
-    test_loader_ae = torch.utils.data.DataLoader(test_dataset_ae, batch_size=batch_size, shuffle=False)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-    # Step 5: Initialize and train the autoencoder
+    # Step 6: Initialize and train the autoencoder
     in_channels = len(feature_columns)
     input_length = X_train_tensor.shape[2]  # Get the sequence length from the input tensor
     autoencoder = InceptionAutoencoder(in_channels=in_channels, input_length=input_length, num_filters=32, depth=4).to(
@@ -798,90 +823,87 @@ def main_with_autoencoder(df, window_size=5, method='', resample=True, epochs=20
 
     criterion_ae = nn.MSELoss()
     optimizer_ae = optim.AdamW(autoencoder.parameters(), lr=0.001, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_ae, mode='min', factor=0.5,patience=20)
+    scheduler_ae = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_ae, mode='min', factor=0.5, patience=20)
 
-    # train_autoencoder(autoencoder, train_loader_ae, test_loader_ae, criterion_ae, optimizer_ae, epochs=ae_epochs,
-    #                   device=device,scheduler=scheduler)
     if TRAIN:
         train_autoencoder_with_input_masking(
             autoencoder,
-            train_loader_ae,
-            val_loader_ae,
+            train_loader,
+            val_loader,
             criterion_ae,
             optimizer_ae,
             epochs=ae_epochs,
             device=device,
-            scheduler=scheduler,
+            scheduler=scheduler_ae,
             mask_probability=0.4,
             save_path=method_dir,
             early_stopping_patience=early_stopping_patience
         )
-    torch.save(autoencoder.state_dict(), f'representation_models/best_autoencoder_{method}.pth')
+        torch.save(autoencoder.state_dict(), f'representation_models/best_autoencoder_{method}.pth')
+
     autoencoder.load_state_dict(torch.load(f'representation_models/best_autoencoder_{method}.pth'))
 
-    encoded_features_train, train_labels = extract_encoded_features(autoencoder, train_loader_ae, device)
-    encoded_features_val, val_labels = extract_encoded_features(autoencoder, val_loader_ae, device)
-    encoded_features_test, test_labels = extract_encoded_features(autoencoder, test_loader_ae, device)
+    # 7. Combine Encoder and Classifier
+    class CombinedModel(nn.Module):
+        def __init__(self, encoder, num_classes):
+            super(CombinedModel, self).__init__()
+            self.encoder = encoder.encoder  # Use the encoder part of the autoencoder
+            self.classifier = ComplexCNNClassifier(input_dim=128,num_classes=num_classes)
 
-    print("Visualizing encoded features using PCA and t-SNE...")
-    plot_pca_tsne(encoded_features_train, train_labels, method='Autoencoder_Train', save_path=method_dir)
-    plot_pca_tsne(encoded_features_val, val_labels, method='Autoencoder_val', save_path=method_dir)
-    plot_pca_tsne(encoded_features_test, test_labels, method='Autoencoder_Test', save_path=method_dir)
+        def forward(self, x):
+            x = self.encoder(x)
+            x = self.classifier(x)
+            return x
 
+    num_classes = 2
+    model = CombinedModel(autoencoder, num_classes).to(device)
 
+    # 8. Set Different Learning Rates
+    encoder_params = list(model.encoder.parameters())
+    classifier_params = list(model.classifier.parameters())
 
-    encoded_features_train_tensor = torch.tensor(encoded_features_train, dtype=torch.float32).to(device)
-    train_labels_tensor = torch.tensor(train_labels, dtype=torch.long).to(device)
+    optimizer = optim.AdamW([
+        {'params': encoder_params, 'lr': lr * 0.1},
+        {'params': classifier_params, 'lr': lr}
+    ], weight_decay=1e-4)
 
-    encoded_features_val_tensor = torch.tensor(encoded_features_val, dtype=torch.float32).to(device)
-    val_labels_tensor = torch.tensor(val_labels, dtype=torch.long).to(device)
-
-    encoded_features_test_tensor = torch.tensor(encoded_features_test, dtype=torch.float32).to(device)
-    test_labels_tensor = torch.tensor(test_labels, dtype=torch.long).to(device)
-
-    # Create TensorDatasets with correct labels
-    train_dataset = torch.utils.data.TensorDataset(encoded_features_train_tensor, train_labels_tensor)
-    val_dataset = torch.utils.data.TensorDataset(encoded_features_val_tensor, val_labels_tensor)  # Fixed label tensor
-    test_dataset = torch.utils.data.TensorDataset(encoded_features_test_tensor, test_labels_tensor)
-
-    batch_size = 64
-
-    train_labels_numpy = train_labels  # Use train_labels instead of Y_train
-    classes, class_indices = np.unique(train_labels_numpy, return_inverse=True)
-    class_sample_counts = np.array([np.sum(class_indices == i) for i in range(len(classes))])
-    weights = 1. / class_sample_counts
-
-    samples_weight = weights[class_indices]
-    samples_weight = torch.from_numpy(samples_weight).float().to(device)  # Move to device
-
-    sampler = WeightedRandomSampler(samples_weight, len(samples_weight))
-
-    # Create DataLoaders with the sampler
-    train_loader_cls = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
-    val_loader_cls = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader_cls = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-    # Compute class weights
+    # 9. Define Criterion and Scheduler
     from sklearn.utils.class_weight import compute_class_weight
 
     # Compute class weights for training data
-    train_labels_numpy = train_labels_tensor.cpu().numpy()
+    train_labels_numpy = Y_train_tensor.numpy()
     class_weights = compute_class_weight('balanced', classes=np.unique(train_labels_numpy), y=train_labels_numpy)
     class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
 
-    # Initialize the CNN classifier
-    input_dim = encoded_features_train_tensor.shape[1]
-    num_classes = 2
-    model = ComplexCNNClassifier(input_dim=input_dim, num_classes=num_classes).to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
 
-    # Train the classifier with validation DataLoader
-    train_cnn(model, train_loader_cls, val_loader_cls, criterion, optimizer, epochs, device)
+    # 10. Train the Combined Model
+    train_combined_model(
+        model,
+        train_loader,
+        val_loader,
+        criterion,
+        optimizer,
+        epochs,
+        device,
+        scheduler,
+        save_path=method_dir,
+        early_stopping_patience=early_stopping_patience
+    )
 
-    # Evaluate the classifier on the test set
-    evaluate_model(model, test_loader_cls, device, save_path=method_dir)
+    # 11. Evaluate the Model on the Test Set
+    evaluate_model(model, test_loader, device, save_path=method_dir)
 
+    encoded_features_train, train_labels = extract_encoded_features_from_combined_model(model, train_loader, device)
+    encoded_features_val, val_labels = extract_encoded_features_from_combined_model(model, val_loader, device)
+    encoded_features_test, test_labels = extract_encoded_features_from_combined_model(model, test_loader, device)
+
+    # 13. Visualize Encoded Features using PCA and t-SNE
+    print("Visualizing encoded features using PCA and t-SNE...")
+    plot_pca_tsne(encoded_features_train, train_labels, method='CombinedModel_Train', save_path=method_dir)
+    plot_pca_tsne(encoded_features_val, val_labels, method='CombinedModel_Val', save_path=method_dir)
+    plot_pca_tsne(encoded_features_test, test_labels, method='CombinedModel_Test', save_path=method_dir)
 
 if __name__ == '__main__':
     # Load your dataset
@@ -900,15 +922,40 @@ if __name__ == '__main__':
 
     ident_sub_rec = IdentSubRec(**categorized_rad_init_kwargs)
     df = ident_sub_rec.df
-    window = 100
-    epochs = 100
+    window = 50
+    epochs = 20
     batch_size = 32
-    ae_epochs = 200
+    ae_epochs = 100
     depth = 4
     num_filters = 32
     lr = 0.001
     mask_probability = 0.4
-
+    print(epochs)
     method = f" new classifer auto encoder representation without sampling ,non independent Inception Auto encoder, approach_num ={approach_num},depth = {depth},lr={lr},ae_epochs = {ae_epochs},mask_prob ={mask_probability}" \
              f"num_filters = {num_filters}"
     main_with_autoencoder(df, window_size=window, method=method,epochs=epochs,batch_size=batch_size,ae_epochs=ae_epochs,depth=depth,num_filters=num_filters,lr=lr,mask_probability=mask_probability)
+
+
+# test = 13466
+
+# Classification Report: 10 epochs ae
+# {'window_size': 100, 'method': ' new classifer auto encoder representation without sampling ,non independent Inception Auto encoder, approach_num =6,depth = 4,lr=0.001,ae_epochs = 200,mask_prob =0.4num_filters = 32', 'resample': True, 'epochs': 10, 'batch_size': 32, 'ae_epochs': 200, 'in_channels': 6, 'num_filters': 32, 'depth': 4, 'learning_rate': 0.001, 'weight_decay': 0.0001, 'optimizer': 'AdamW', 'scheduler': 'ReduceLROnPlateau', 'mask_probability': 0.4, 'early_stopping_patience': 30, 'approach_num': 6}
+#               precision    recall  f1-score   support
+#
+#            0       0.89      0.33      0.48      9019
+#            1       0.07      0.53      0.12       799
+#
+#     accuracy                           0.34      9818
+#    macro avg       0.48      0.43      0.30      9818
+# weighted avg       0.82      0.34      0.45      9818
+
+# Yakirs
+# The full classification report is:
+#               precision    recall  f1-score   support
+#
+#        False       0.99      1.00      1.00     13253
+#         True       0.00      0.00      0.00        82
+#
+#     accuracy                           0.99     13335
+#    macro avg       0.50      0.50      0.50     13335
+# weighted avg       0.99      0.99      0.99     13335

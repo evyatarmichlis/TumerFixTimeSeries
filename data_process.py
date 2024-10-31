@@ -1,8 +1,10 @@
 import os
+import random
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union, List
-
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -29,9 +31,25 @@ from tfd_utils.model_stats_utils import model_stats_per_training_size, model_sta
     model_stats_per_learning_rate, model_stats_per_num_leaves, model_stats_per_min_child_samples
 from tfd_utils.visualization_utils import save_plot_func, visualize_data, visualize_model, compare_old_to_new_data
 
-
+def split_train_test(df, input_data_points, test_size=0.2, random_state=0):
+    df['group'] = df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']].apply(
+        lambda row: '_'.join(row.values.astype(str)), axis=1)
+    gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+    split_indices = list(gss.split(X=df[input_data_points], y=df['target'], groups=df['group']))[0]
+    train_index, test_index = split_indices
+    x_train = df[input_data_points].iloc[train_index]
+    x_test = df[input_data_points].iloc[test_index]
+    y_train = df['target'].iloc[train_index]
+    y_test = df['target'].iloc[test_index]
+    return x_train, x_test, y_train, y_test
 # from tfd_utils.visualization_utils import visualize_data, save_plot_func, visualize_model, compare_old_to_new_data
-
+def seed_everything(seed):
+    random.seed(seed)  # Python random module.
+    np.random.seed(seed)  # Numpy module.
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
 class SmoteType:
     none = None
@@ -202,7 +220,7 @@ class IdentSubRec:
               print_stats: bool = True,
               plot_confusion_matrix: bool = True,
               save_plot: bool = False,
-              random_state: int = 666,
+              random_state: int = 0,
               cross_validate: bool = True,
               cross_validation_n_splits: int = 10,
               split_by_participants: bool = False,
@@ -423,10 +441,14 @@ class IdentSubRec:
             for split_ind, (train_index, test_index) in tqdm(iterable=enumerate(split_indices),
                                                              desc='Iterating over different data splits',
                                                              total=len(split_indices)):
-                x_train, x_test = (self.df[input_data_points].iloc[train_index],
-                                   self.df[input_data_points].iloc[test_index])
-                y_train, y_test = (self.df['target'].iloc[train_index],
-                                   self.df['target'].iloc[test_index])
+                x_train, x_test, y_train, y_test = split_train_test(
+                    df=self.df,
+                    input_data_points=input_data_points,
+                    test_size=0.2,
+                    random_state=0
+                )
+                print("Number of True and False in y_test:")
+                print(y_test.value_counts())
 
                 if smote_type is not None:
                     x_train, y_train = apply_smote_and_related(x=x_train, y=y_train, smote_type=smote_type)
@@ -526,7 +548,7 @@ class IdentSubRec:
         return acc, precision, recall, f1, roc_auc_score_res
 
 if __name__ == '__main__':
-
+    seed_everything(0)
     new_rad_s1_s9_csv_file_path = 'data/NewRad_Fixations_S1_S9_Data.csv'
     expert_rad_e1_e3_csv_file_path = 'data/ExpertRad_Fixations_E1_E3.csv'
     rad_s1_s18_file_path = 'data/Rad_Fixations_S1_S18_Data.csv'
@@ -594,7 +616,7 @@ if __name__ == '__main__':
 
     ident_sub_rec = IdentSubRec(**categorized_rad_init_kwargs)
     train_kwargs = dict(test_size=0.2, num_leaves=300, learning_rate=0.1, min_child_samples=44, print_stats=True,
-                        plot_confusion_matrix=True, save_plot=False, cross_validate=True, cross_validation_n_splits=10,
+                        plot_confusion_matrix=True, save_plot=False, cross_validate=True, cross_validation_n_splits=1,
                         split_by_participants=False, completely_random_data_split=False, smote_type=SmoteType.none,
                         save_models=False, save_predicted_as_true_data_rows=True)
 

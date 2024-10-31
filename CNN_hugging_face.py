@@ -27,9 +27,29 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
-TRAIN = True
+TRAIN = False
 
 
+def split_train_test(time_series_df, input_data_points, test_size=0.2, random_state=0):
+    df = time_series_df
+    df['group'] = df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']].apply(
+        lambda row: '_'.join(row.values.astype(str)), axis=1
+    )
+    gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+    split_indices = list(gss.split(X=df[input_data_points], y=df['target'], groups=df['group']))[0]
+
+    train_index, test_index = split_indices
+
+    x_train = df.iloc[train_index].drop(columns='target', errors='ignore')
+    x_test = df.iloc[test_index].drop(columns='target', errors='ignore')
+
+    y_train = df['target'].iloc[train_index]
+    y_test = df['target'].iloc[test_index]
+
+    train_df = pd.concat([x_train, y_train], axis=1)
+    test_df = pd.concat([x_test, y_test], axis=1)
+
+    return train_df, test_df
 
 
 
@@ -49,24 +69,26 @@ input_data_points = [
     'CURRENT_FIX_COMPONENT_DURATION',
 ]
 
-def split_train_test(time_series_df):
-    df =time_series_df
-    df['group'] = df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']].apply(
-        lambda row: '_'.join(row.values.astype(str)), axis=1)
-    gss = GroupShuffleSplit(n_splits=1,
-                            test_size=0.2,
-                            random_state=42)
-
-    split_indices = list(gss.split(X=df[input_data_points],
-                                   y=df['target'],
-                                   groups=df['group']))[0]
-    train_index, test_index = split_indices
-    x_train, x_test = df[input_data_points].iloc[train_index], df[input_data_points].iloc[test_index]
-    y_train, y_test = df['target'].iloc[train_index], df['target'].iloc[test_index]
-    train_df = pd.concat([x_train, y_train], axis=1)
-    test_df = pd.concat([x_test, y_test], axis=1)
-
-    return train_df, test_df
+# def split_train_test(time_series_df):
+#     df =time_series_df
+#     df['group'] = df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']].apply(
+#         lambda row: '_'.join(row.values.astype(str)), axis=1)
+#     gss = GroupShuffleSplit(n_splits=1,
+#                             test_size=0.2,
+#                             random_state=0)
+#
+#     split_indices = list(gss.split(X=df[input_data_points],
+#                                    y=df['target'],
+#                                    groups=df['group']))[0]
+#
+#
+#     train_index, test_index = split_indices
+#     x_train, x_test = df[input_data_points].iloc[train_index], df[input_data_points].iloc[test_index]
+#     y_train, y_test = df['target'].iloc[train_index], df['target'].iloc[test_index]
+#     train_df = pd.concat([x_train, y_train], axis=1)
+#     test_df = pd.concat([x_test, y_test], axis=1)
+#
+#     return train_df, test_df
 
 def create_windows(grouped,window_size):
     max_possible_time_length = 0
@@ -107,6 +129,8 @@ def create_windows(grouped,window_size):
     labels = np.array(labels)
     weights = np.array(weights)
     return samples,labels,weights
+
+
 def resample_func(time_series_df,interval):
     resampled_data = []
 
@@ -321,20 +345,20 @@ def evaluate_and_save_model(model, X_test, Y_test, device, method):
         _, y_pred_classes = torch.max(outputs, 1)
 
     # Save the model
-    torch.save(model.state_dict(), f'{method}_model.pth')
 
     # Evaluate metrics
-    precision_weighted = precision_score(Y_test, y_pred_classes, average='weighted')
-    recall_weighted = recall_score(Y_test, y_pred_classes, average='weighted')
-    f1_weighted = f1_score(Y_test, y_pred_classes, average='weighted')
+    precision_weighted = precision_score(Y_test,  y_pred_classes.cpu(), average='weighted')
+    recall_weighted = recall_score(Y_test,  y_pred_classes.cpu(), average='weighted')
+    f1_weighted = f1_score(Y_test,  y_pred_classes.cpu(), average='weighted')
 
-    precision_macro = precision_score(Y_test, y_pred_classes, average='macro')
-    recall_macro = recall_score(Y_test, y_pred_classes, average='macro')
-    f1_macro = f1_score(Y_test, y_pred_classes, average='macro')
+    precision_macro = precision_score(Y_test,  y_pred_classes.cpu(), average='macro')
+    recall_macro = recall_score(Y_test,  y_pred_classes.cpu(), average='macro')
+    f1_macro = f1_score(Y_test,  y_pred_classes.cpu(), average='macro')
 
     print_metrics(precision_weighted, recall_weighted, f1_weighted, precision_macro, recall_macro, f1_macro)
+    print(classification_report(Y_test, y_pred_classes.cpu()))
 
-    plot_confusion_matrix(Y_test, y_pred_classes)
+    plot_confusion_matrix(Y_test,  y_pred_classes.cpu())
 
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, epochs, device):
@@ -357,33 +381,31 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, epochs, d
 
 def plot_confusion_matrix(y_true, y_pred,save_path=''):
     """Plots and saves the confusion matrix."""
-    # Compute confusion matrix
-    confusion_matrix_res = confusion_matrix(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred)
 
-    # Create a figure for the confusion matrix
-    plt.figure(figsize=(10, 7))
-    sns.heatmap(confusion_matrix_res, annot=True, fmt='d', cmap='Blues', cbar=False,
-                xticklabels=['Predicted 0', 'Predicted 1'],
-                yticklabels=['Actual 0', 'Actual 1'])
+    # Print the confusion matrix in a readable format
+    print("Confusion Matrix:")
+    print("   Predicted 0  Predicted 1")
+    print(f"Actual 0   {cm[0, 0]:<10} {cm[0, 1]:<10}")
+    print(f"Actual 1   {cm[1, 0]:<10} {cm[1, 1]:<10}")
 
-    # Add labels and title
-    plt.title('Confusion Matrix')
-    plt.xlabel('Predicted Label')
-    plt.ylabel('True Label')
-
-    # Save and show the confusion matrix
-    plt.savefig(f'{save_path}/confusion_matrix.png')
-    plt.show()
-def main(df, window_size=5, method='', resample=False,epochs=200,batch_size=32):
+def main(df, window_size=5, method='', resample=False,epochs=100,batch_size=32):
     interval = '10ms'
 
     # Step 1: Split the dataset
-    train_df, test_df = split_train_test(df)
-
+    train_df, test_df = split_train_test(
+        time_series_df=df,
+        input_data_points=feature_columns,
+        test_size=0.2,
+        random_state=0
+    )
+    print("Number of True and False in y_test:")
+    print(test_df.value_counts())
     # Step 2: Create time series data for training and testing
     X_train, Y_train, window_weight_train = create_time_series(train_df, interval, window_size=window_size, resample=resample)
     X_test, Y_test, window_weights_test = create_time_series(test_df, interval, window_size=window_size, resample=resample)
-
+    print("Number of True and False in y_test:")
+    print(pd.Series(Y_test).value_counts())
     # Step 3: Compute class weights for handling class imbalance
     class_weights_dict = get_class_weights(Y_train)
     print(class_weights_dict)
@@ -397,9 +419,13 @@ def main(df, window_size=5, method='', resample=False,epochs=200,batch_size=32):
     train_loader, val_loader = prepare_data_loaders(X_train, Y_train, window_weight_train, batch_size=batch_size, device=device)
 
     # Step 6: Train the model
-    train_model(model, train_loader, val_loader, criterion, optimizer, epochs=epochs, device=device)
+    if TRAIN:
+        train_model(model, train_loader, val_loader, criterion, optimizer, epochs=epochs, device=device)
+        torch.save(model.state_dict(), f'cnn_model/best_cnn_{method}.pth')
 
     # Step 7: Save and evaluate the model
+    model.load_state_dict(torch.load(f'cnn_model/best_cnn_{method}.pth'))
+
     evaluate_and_save_model(model, X_test, Y_test, device, method)
 
 
@@ -434,9 +460,8 @@ if __name__ == '__main__':
 
     ident_sub_rec = IdentSubRec(**categorized_rad_init_kwargs)
     df = ident_sub_rec.df
-    for window in [5,10,20,50,100,500]:
-        print(window)
-        main(df, window_size=window, method=f'new train_test')
+
+    main(df, window_size=50, method=f'cnn_window_size=50')
     # main(df,window_size=window,method='add weighted random sampler and dialconv')
     # labels = list(df['RECORDING_SESSION_LABEL'].unique())
     #
@@ -1035,3 +1060,28 @@ if __name__ == '__main__':
 # Micro F1-score: 0.9177120669056152
 # Recall for class 0: 0.926810827158627
 # Recall for class 1: 0.1927710843373494
+
+
+# Using device: cuda
+# Weighted Precision: 0.7459107391643217
+# Weighted Recall: 0.7939470365699874
+# Weighted F1-score: 0.768660717124122
+# Macro Precision: 0.4531196824103248
+# Macro Recall: 0.4717359487354733
+# Macro F1-score: 0.4604101402967375
+# Weighted Precision: 0.7459107391643217
+# Weighted Recall: 0.7939470365699874
+# Weighted F1-score: 0.768660717124122
+# Macro Precision: 0.4531196824103248
+# Macro Recall: 0.4717359487354733
+# Macro F1-score: 0.4604101402967375
+#               precision    recall  f1-score   support
+#        False       0.86      0.92      0.88     10269
+#         True       0.05      0.03      0.04      1626
+#     accuracy                           0.79     11895
+#    macro avg       0.45      0.47      0.46     11895
+# weighted avg       0.75      0.79      0.77     11895
+# Confusion Matrix:
+#    Predicted 0  Predicted 1
+# Actual 0   9398       871
+# Actual 1   1580       46
