@@ -27,7 +27,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
-TRAIN = False
+TRAIN = True
 
 
 def split_train_test(time_series_df, input_data_points, test_size=0.2, random_state=0):

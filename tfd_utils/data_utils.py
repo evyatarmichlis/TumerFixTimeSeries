@@ -1,11 +1,19 @@
+import json
 from typing import Union, List
 
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler, Normalizer, StandardScaler
+from sklearn.utils import resample
 from tqdm import tqdm
 
 from tfd_utils.logger_utils import print_and_log
+
+
+def load_config_file(config_file_path):
+    with open(config_file_path, 'r') as config_file:
+        kwargs = json.load(config_file)
+    return kwargs
 
 
 def dtype_range(dtype):
@@ -57,7 +65,10 @@ def features_scaler(df, features_to_scale, scaler_type='minmax'):
 
     for feature in features_to_scale:
         # Apply scaling per trial ('RECORDING_SESSION_LABEL' & 'TRIAL_INDEX'):
-        df[feature] = df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX'])[feature].transform(scale_column)
+        groupby_features = ['RECORDING_SESSION_LABEL']
+        if 'TRIAL_INDEX' in df.keys():
+            groupby_features.append('TRIAL_INDEX')
+        df[feature] = df.groupby(groupby_features)[feature].transform(scale_column)
         # df[feature] = df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX',
         #                           'CURRENT_FIX_INDEX'])[feature].transform(scale_column)
         # df[feature] = scale_column(df[feature])  # Apply scaling to the whole feature column
@@ -101,6 +112,25 @@ def mark_surrounding_rows(row, df, ia_x: str = 'CURRENT_FIX_IA_X', ia_y: str = '
         df.loc[surrounding_mask, 'to_update'] = True
 
 
+def stratified_group_split_independent_unique(df, target_col, group_col, test_size, n_splits):
+    unique_groups = df[group_col].unique()
+    group_targets = df.groupby(group_col)[target_col].first()
+
+    test_groups = []
+    for _ in range(n_splits):
+        # Stratified sampling without replacement for each split
+        sampled_groups = resample(
+            unique_groups,
+            n_samples=test_size,
+            stratify=group_targets,
+            replace=False,  # No replacement within each split
+            random_state=None  # Different sample each time
+        )
+        test_groups.append(sampled_groups)
+
+    return np.array(test_groups)
+
+
 def get_df_for_training(
         data_file_path: Union[str, List[str]],
         augment: bool = False,
@@ -112,6 +142,7 @@ def get_df_for_training(
         remove_surrounding_to_hits: int = 0,
         update_surrounding_to_hits: int = 0,
         approach_num: int = 0,
+        match_non_targets_to_targets: bool = False,
 ):
     nrows = None  # Read all the rows
     # Original keys for the processed data:
@@ -133,6 +164,13 @@ def get_df_for_training(
     orig_raw_data_keys = ['RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_INDEX', 'SAMPLE_INDEX',
                           'SAMPLE_START_TIME', 'IN_BLINK', 'IN_SACCADE', 'Pupil_Size', 'TARGET_ZONE', 'TARGET_XY',
                           'GAZE_IA', 'GAZE_XY', 'Hit']
+    # Original keys for the generalists / experts / med students data:
+    orig_gen_data_keys = ['BUTTON', 'CURRENT_FIX_PUPIL', 'CURRENT_IMAGE', 'EVENT', 'EVENT_ACCURACY', 'EVENT_END',
+                          'EVENT_START', 'EVENT_TO_TARGET_DISTANCE', 'EVENT_X', 'EVENT_Y', 'EVENT_ZONE',
+                          'FIXATION_DURATION', 'GROUP', 'NODULE_ALL', 'NODULE_FORWARD', 'POSSIBLE_GRID_LOCATIONS',
+                          'RECORDING_SESSION_LABEL', 'SLICE_ALL', 'SLICE_FIXATION_DURATION', 'SLICE_FIXATION_END',
+                          'SLICE_FIXATION_START', 'SLICE_FORWARD', 'SLICE_TYPE', 'TARGET_X', 'TARGET_Y', 'TARGET_ZONE',
+                          'TRIAL', 'TRIAL_FIX_INDEX', 'TRIMMED_SLICE_FIXATION_DURATION']
 
     # unique_in_raw = ['SAMPLE_INDEX', 'SAMPLE_START_TIME', 'IN_BLINK', 'IN_SACCADE',
     #                  'TARGET_ZONE', 'TARGET_XY', 'GAZE_IA', 'GAZE_XY']
@@ -162,7 +200,7 @@ def get_df_for_training(
     df = pd.concat(dfs, ignore_index=True)
     df.reset_index(drop=True, inplace=True)
     # Save the original index as a column:
-    df['original_index'] = df.index + 2  # +2 because of the header and the 0-based index
+    df['original_index'] = df.index
 
     # print_and_log(f'Df len before - {len(df)}')
     # df = df[df['RECORDING_SESSION_LABEL'] == 23]
@@ -184,10 +222,15 @@ def get_df_for_training(
     is_f_pr_data = len(df_keys) == len(orig_f_pr_data_keys) and sorted(df_keys) == sorted(orig_f_pr_data_keys)
     is_cat_f_pr_data = (len(df_keys) == len(orig_cat_f_data_keys) and
                         sorted(df_keys) == sorted(orig_cat_f_data_keys))
+    is_gen_data = len(df_keys) == len(orig_gen_data_keys) and sorted(df_keys) == sorted(orig_gen_data_keys)
+    gen_data = False
+    processed_data = False
     if is_pr_data or is_f_pr_data or is_cat_f_pr_data:
         processed_data = True
     elif len(df_keys) == len(orig_raw_data_keys) and sorted(df_keys) == sorted(orig_raw_data_keys):
         processed_data = False
+    elif is_gen_data:
+        gen_data = True
     else:
         raise ValueError(f'Given file does not contain supported keys. Supported keys are either:\n'
                          f'{orig_pr_data_keys}\n'
@@ -203,14 +246,12 @@ def get_df_for_training(
     df = df.replace(to_replace='.', value=invalid_value)
     df = df.replace(to_replace=np.nan, value=invalid_value)
 
-    df.loc[:, 'target'] = (df['Hit'] == 2).astype(bool)  # Categorized data is 2 for nodule, 1 surrounding, 0 non-nodule
-
-    # Keys types conversions:
-    df['RECORDING_SESSION_LABEL'] = df['RECORDING_SESSION_LABEL'].astype(np.int8)
-    df['TRIAL_INDEX'] = df['TRIAL_INDEX'].astype(np.int8)
-    df['CURRENT_FIX_INDEX'] = df['CURRENT_FIX_INDEX'].astype(np.int16)
-    df['Pupil_Size'] = df['Pupil_Size'].astype(float).astype(np.int16)
-    df['target'] = df['target'].astype(bool)
+    if not gen_data:
+        # Keys types conversions:
+        df['RECORDING_SESSION_LABEL'] = df['RECORDING_SESSION_LABEL'].astype(np.int8)
+        df['TRIAL_INDEX'] = df['TRIAL_INDEX'].astype(np.int8)
+        df['CURRENT_FIX_INDEX'] = df['CURRENT_FIX_INDEX'].astype(np.int16)
+        df['Pupil_Size'] = df['Pupil_Size'].astype(float).astype(np.int16)
     if processed_data:
         # Updated '-1' to an (X, Y) value that would be converted to (-1, -1) - the '?' sign would be converted to -1
         df['CURRENT_FIX_INTEREST_AREA_LABEL'] = df['CURRENT_FIX_INTEREST_AREA_LABEL'].replace(
@@ -223,18 +264,17 @@ def get_df_for_training(
         df = df.drop('CURRENT_FIX_INTEREST_AREA_LABEL', axis=1)
 
         # Updating '0' to an (X, Y) value that would be converted to (-1, -1) - the '?' sign would be converted to -1
-        df['Zones'] = df['Zones'].replace(to_replace='0', value=invalid_ia_str_value)
-        df['Zones'] = df['Zones'].replace(to_replace=0, value=invalid_ia_str_value)
-        df['Zones'] = df['Zones'].replace(to_replace=str(invalid_value), value=invalid_ia_str_value)
-        df['Zones'] = df['Zones'].replace(to_replace=invalid_value, value=invalid_ia_str_value)
-        df['Zones'] = df['Zones'].str.split(',\s*')  # Split the 'Zones' column on comma with arbitrary number of spaces
-        # df['Zones'] = df['Zones'].apply(lambda x: x[0] if isinstance(x, list) and len(x) > 0 else None)
-        df = df.explode('Zones')
+        # df['Zones'] = df['Zones'].replace(to_replace='0', value=invalid_ia_str_value)
+        # df['Zones'] = df['Zones'].replace(to_replace=0, value=invalid_ia_str_value)
+        # df['Zones'] = df['Zones'].replace(to_replace=str(invalid_value), value=invalid_ia_str_value)
+        # df['Zones'] = df['Zones'].replace(to_replace=invalid_value, value=invalid_ia_str_value)
+        # df['Zones'] = df['Zones'].str.split(r',\s*')  # Split the 'Zones' column on comma with arbitrary number of spaces
+        # df = df.explode('Zones')  # Split the list items into separate rows
         # Create two new columns
         # df['Zones_X'] = df['Zones'].apply(lambda x: letter_to_num(x[0]))
         # df['Zones_Y'] = df['Zones'].apply(lambda x: int(x[1:]))
-        df['Zones_X'] = df['Zones'].apply(lambda x: convert_zone_value(x)[0])
-        df['Zones_Y'] = df['Zones'].apply(lambda x: convert_zone_value(x)[1])
+        # df['Zones_X'] = df['Zones'].apply(lambda x: convert_zone_value(x)[0])
+        # df['Zones_Y'] = df['Zones'].apply(lambda x: convert_zone_value(x)[1])
         df = df.drop(labels='Zones', axis=1)
 
         # Keys types conversions:
@@ -244,13 +284,39 @@ def get_df_for_training(
         df['CURRENT_FIX_COMPONENT_COUNT'] = df['CURRENT_FIX_COMPONENT_COUNT'].astype(np.int16)
         df['CURRENT_FIX_COMPONENT_INDEX'] = df['CURRENT_FIX_COMPONENT_INDEX'].astype(np.int16)
         df['CURRENT_FIX_COMPONENT_DURATION'] = df['CURRENT_FIX_COMPONENT_DURATION'].astype(np.int16)
-        df['Zones_X'] = df['Zones_X'].astype(np.int8)
-        df['Zones_Y'] = df['Zones_Y'].astype(np.int8)
+        # df['Zones_X'] = df['Zones_X'].astype(np.int8)
+        # df['Zones_Y'] = df['Zones_Y'].astype(np.int8)
         if 'CURRENT_FIX_COMPONENT_IMAGE_NUMBER' in df.keys():
             df['CURRENT_FIX_COMPONENT_IMAGE_NUMBER'] = df['CURRENT_FIX_COMPONENT_IMAGE_NUMBER'].astype(np.int16)
         # for drop_key in ['CURRENT_FIX_COMPONENT_IMAGE_FILE']:  # 'SCAN_TYPE', 'SLICE_TYPE', 'LOCATION_TYPE'
         #     if drop_key in df.keys():
         #         df = df.drop(labels=drop_key, axis=1)
+    elif gen_data:
+        # Updating '0' to an (X, Y) value that would be converted to (-1, -1) - the '?' sign would be converted to -1
+        # df['EVENT_ZONE'] = df['EVENT_ZONE'].replace(to_replace='0', value=invalid_ia_str_value)
+        # df['EVENT_ZONE'] = df['EVENT_ZONE'].replace(to_replace=0, value=invalid_ia_str_value)
+        # df['EVENT_ZONE'] = df['EVENT_ZONE'].replace(to_replace=str(invalid_value), value=invalid_ia_str_value)
+        # df['EVENT_ZONE'] = df['EVENT_ZONE'].replace(to_replace=invalid_value, value=invalid_ia_str_value)
+        # df['EVENT_ZONE'] = df['EVENT_ZONE'].str.split(r',\s*')  # Split on comma with arbitrary number of spaces
+        # df = df.explode('EVENT_ZONE')  # Split the list items into separate rows
+        # Create two new columns
+        # df['EVENT_ZONE_X'] = df['EVENT_ZONE'].apply(lambda x: letter_to_num(x[0]))
+        # df['EVENT_ZONE_Y'] = df['EVENT_ZONE'].apply(lambda x: int(x[1:]))
+        # df['ZONE_X'] = df['EVENT_ZONE'].apply(lambda x: convert_zone_value(x)[0])
+        # df['ZONE_Y'] = df['EVENT_ZONE'].apply(lambda x: convert_zone_value(x)[1])
+        df = df.drop(labels='EVENT_ZONE', axis=1)
+
+        # Keys types conversions:
+        # df['ZONE_X'] = df['ZONE_X'].astype(np.int8)
+        # df['ZONE_Y'] = df['ZONE_Y'].astype(np.int8)
+        df['TRIAL_FIX_INDEX'] = df['TRIAL_FIX_INDEX'].astype(np.int16)
+        df['EVENT_START'] = df['EVENT_START'].astype(np.int32)
+        df['EVENT_END'] = df['EVENT_END'].astype(np.int32)
+        df['FIXATION_DURATION'] = df['FIXATION_DURATION'].astype(np.int32)
+        df['SLICE_FIXATION_START'] = df['SLICE_FIXATION_START'].astype(np.int32)
+        df['SLICE_FIXATION_END'] = df['SLICE_FIXATION_END'].astype(np.int32)
+        df['SLICE_FIXATION_DURATION'] = df['SLICE_FIXATION_DURATION'].astype(np.int32)
+        df['CURRENT_FIX_PUPIL'] = df['CURRENT_FIX_PUPIL'].astype(np.int16)
     else:  # Raw data
         # Updated '-1' to an (X, Y) value that would be converted to (-1, -1) - the '?' sign would be converted to -1
         df['GAZE_IA'] = df['GAZE_IA'].replace(to_replace=str(invalid_value), value=invalid_ia_str_value)
@@ -273,11 +339,12 @@ def get_df_for_training(
         df = df.drop('TARGET_XY', axis=1)
         df = df.drop('GAZE_XY', axis=1)
 
-    for key in df.keys():
-        if key in ('CURRENT_FIX_COMPONENT_IMAGE_FILE', 'SCAN_TYPE', 'SLICE_TYPE', 'LOCATION_TYPE'):
-            continue
-        if ((df[key] < 0) & (df[key] != invalid_value)).any():
-            raise ValueError(f'Df at key <{key}> contains negative non invalid_value ({invalid_value}) values')
+    if not gen_data:
+        for key in df.keys():
+            if key in ('CURRENT_FIX_COMPONENT_IMAGE_FILE', 'SCAN_TYPE', 'SLICE_TYPE', 'LOCATION_TYPE'):
+                continue
+            if ((df[key] < 0) & (df[key] != invalid_value)).any():
+                raise ValueError(f'Df at key <{key}> contains negative non invalid_value ({invalid_value}) values')
 
     if normalize:  # Normalize data points used in training:
         print_and_log('Normalizing data points used in training')
@@ -289,7 +356,7 @@ def get_df_for_training(
                 'CURRENT_FIX_COMPONENT_COUNT',
                 'CURRENT_FIX_COMPONENT_DURATION',
                 # 'CURRENT_FIX_IA_X',
-                # 'CURRENT_FIX_IA_Y'
+                # 'CURRENT_FIX_IA_Y',
             ]
             # Unused features:
             #   'RECORDING_SESSION_LABEL' - Not used in training
@@ -298,6 +365,13 @@ def get_df_for_training(
             #   'Hit'- Boolean
             #   'CURRENT_FIX_COMPONENT_INDEX' - Because this parameter values range is very small
             #   'CURRENT_FIX_COMPONENT_IMAGE_NUMBER'
+        elif gen_data:
+            features_to_scale = [
+                'TRIAL_FIX_INDEX',
+                'FIXATION_DURATION',
+                'SLICE_FIXATION_DURATION',
+                'CURRENT_FIX_PUPIL',
+            ]
         else:
             features_to_scale = ['CURRENT_FIX_INDEX',
                                  'Pupil_Size',
@@ -340,8 +414,15 @@ def get_df_for_training(
 
     # Clean interest areas point out of the grid:
     print_and_log(f'Len of df before cleanup of out of the 12X12 grid interest areas - {len(df)}')
-    ia_x = 'CURRENT_FIX_IA_X' if processed_data else 'GAZE_IA_X'
-    ia_y = 'CURRENT_FIX_IA_Y' if processed_data else 'GAZE_IA_Y'
+    if processed_data:
+        ia_x = 'CURRENT_FIX_IA_X'
+        ia_y = 'CURRENT_FIX_IA_Y'
+    elif gen_data:
+        ia_x = 'ZONE_X'
+        ia_y = 'ZONE_Y'
+    else:
+        ia_x = 'GAZE_IA_X'
+        ia_y = 'GAZE_IA_Y'
     df = df[(df[ia_x] >= 0) & (df[ia_x] <= 12)]
     df = df[(df[ia_y] >= 0) & (df[ia_y] <= 12)]
     df = df.reset_index(drop=True)  # Reset the index after the cleanup, important for data splits
@@ -350,11 +431,6 @@ def get_df_for_training(
     # # For data viewing
     # for key in df.keys():
     #     print_and_log(f'For key {key} got uniques - {sorted(set(df[key]))}')
-
-    # Analyze the distribution of the target variable ('Hit'):
-    print_and_log('The distribution of the target variable (Hit):')
-    print_and_log(df['target'].value_counts(normalize=True))
-    print_and_log(df['target'].value_counts(normalize=False))
 
     # df = df.replace(-1, np.nan)
 
@@ -434,6 +510,13 @@ def get_df_for_training(
     # {'NORMAL_SLICE', 'ABNORMAL_SLICE', 'NODULE_SLICE'}
     # >>> set(df['LOCATION_TYPE'])
     # {'NORMAL_MISS', 'NODULE_SURROUND', 'NODULE_HIT', 'ABNORMAL_MISS', 'NODULE_MISS'}
+
+    # # Remove normal scans:
+    # print_and_log('Removing non abnormal scans:')
+    # print_and_log(f'Len df before removal of non abnormal scans - {len(df)}')
+    # df = df[~df['SLICE_TYPE'].isin(('NORMAL', 'NORMAL_SLICE'))]
+    # print_and_log(f'Len df after - {len(df)}')
+
     if approach_num <= 0:
         print_and_log(f'No approach (Given approach number {approach_num}). No changes to the data')
     elif approach_num in (1, 2, 3, 4, 5):
@@ -448,9 +531,8 @@ def get_df_for_training(
                       'Prediction level - slice types\n'
                       'Prediction target - nodule slices\n'
                       '==================================\n')
-        print_and_log(f'Number of targets before updating targets to be the nodule-slice - {df["target"].sum()}')
         df['target'] = np.where(df['SLICE_TYPE'] == 'NODULE_SLICE', True, False)
-        print_and_log(f'Len targets after - {df["target"].sum()}')
+        print_and_log(f'Number of targets after updating targets to be the nodule-slice - {df["target"].sum()}')
     elif approach_num == 7:
         print_and_log('=================================\n'
                       'Approach 7.\n'
@@ -464,9 +546,8 @@ def get_df_for_training(
         df = df[df['SLICE_TYPE'] != 'ABNORMAL_SLICE']
         print_and_log(f'Len df after - {len(df)}')
 
-        print_and_log(f'Number of targets before updating targets to be the nodule-slice - {df["target"].sum()}')
-        df['target'] = np.where(df['SLICE_TYPE'] == 'NODULE_SLICE', True, False)
-        print_and_log(f'Len targets after - {df["target"].sum()}')
+        df.loc[:, 'target'] = np.where(df['SLICE_TYPE'] == 'NODULE_SLICE', True, False)
+        print_and_log(f'Number of targets after updating targets to be the nodule-slice - {df["target"].sum()}')
     elif approach_num == 8:
         print_and_log('====================================\n'
                       'Approach 8.\n'
@@ -479,9 +560,8 @@ def get_df_for_training(
                       'Prediction level - zone type\n'
                       'Prediction target - nodule hit zone\n'
                       '====================================\n')
-        print_and_log(f'Number of targets before updating targets to be the nodule-hit-zone - {df["target"].sum()}')
-        df['target'] = np.where(df['LOCATION_TYPE'] == 'NODULE_HIT', True, False)
-        print_and_log(f'Len targets after - {df["target"].sum()}')
+        df.loc[:, 'target'] = np.where(df['LOCATION_TYPE'] == 'NODULE_HIT', True, False)
+        print_and_log(f'Number of targets after updating targets to be the nodule-hit-zone - {df["target"].sum()}')
     elif approach_num == 9:
         print_and_log('====================================\n'
                       'Approach 9.\n'
@@ -498,21 +578,90 @@ def get_df_for_training(
         df = df[~df['LOCATION_TYPE'].isin(('ABNORMAL_MISS', 'NODULE_MISS', 'NODULE_SURROUND'))]
         print_and_log(f'Len df after - {len(df)}')
 
-        print_and_log(f'Number of targets before updating targets to be the nodule-hit-zone - {df["target"].sum()}')
         df['target'] = np.where(df['LOCATION_TYPE'] == 'NODULE_HIT', True, False)
-        print_and_log(f'Len targets after - {df["target"].sum()}')
+        print_and_log(f'Number of targets after updating targets to be the nodule-hit-zone - {df["target"].sum()}')
+    elif approach_num == 10:
+        print_and_log('====================================\n'
+                      'Approach 10.\n'
+                      'Include - Experts & Generalists\n'
+                      'Exclude - Medical-students\n'
+                      'Prediction level - Scan\n'
+                      'Prediction target - Generalists\n'
+                      '====================================')
+        target_group = 'EXPERT'
+        group_to_remove = 'MED_STUDENT'  # 'GENERALIST', 'MED_STUDENT', 'EXPERT'
+
+        # Target is true if <target_group>, false otherwise:
+        df.loc[:, 'target'] = (df['GROUP'] == target_group).astype(bool)
+        # Remove rows where the 'GROUP' value is <group_to_remove>:
+        print_and_log(f'Len df before removal of rows where GROUP == {group_to_remove} - {len(df)}')
+        df = df[df['GROUP'] != group_to_remove]
+        print_and_log(f'Len df after - {len(df)}')
+        df.reset_index(drop=True, inplace=True)
+    elif approach_num == 11:
+        print_and_log('====================================\n'
+                      'Approach 11.\n'
+                      'Include - Experts & Medical-students\n'
+                      'Exclude - Generalists\n'
+                      'Prediction level - Scan\n'
+                      'Prediction target - Generalists\n'
+                      '====================================')
+        target_group = 'EXPERT'
+        group_to_remove = 'GENERALIST'  # 'GENERALIST', 'MED_STUDENT', 'EXPERT'
+
+        # Target is true if <target_group>, false otherwise:
+        df.loc[:, 'target'] = (df['GROUP'] == target_group).astype(bool)
+        # Remove rows where the 'GROUP' value is <group_to_remove>:
+        print_and_log(f'Len df before removal of rows where GROUP == {group_to_remove} - {len(df)}')
+        df = df[df['GROUP'] != group_to_remove]
+        print_and_log(f'Len df after - {len(df)}')
+        df.reset_index(drop=True, inplace=True)
+    elif approach_num == 12:
+        print_and_log('====================================\n'
+                      'Approach 12.\n'
+                      'Include - Generalists & Medical-students\n'
+                      'Exclude - Experts\n'
+                      'Prediction level - Scan\n'
+                      'Prediction target - Generalists\n'
+                      '====================================')
+        target_group = 'GENERALIST'
+        group_to_remove = 'EXPERTS'  # 'GENERALIST', 'MED_STUDENT', 'EXPERT'
+
+        # Target is true if <target_group>, false otherwise:
+        df.loc[:, 'target'] = (df['GROUP'] == target_group).astype(bool)
+        # Remove rows where the 'GROUP' value is <group_to_remove>:
+        print_and_log(f'Len df before removal of rows where GROUP == {group_to_remove} - {len(df)}')
+        df = df[df['GROUP'] != group_to_remove]
+        print_and_log(f'Len df after - {len(df)}')
+        df.reset_index(drop=True, inplace=True)
     else:
         raise ValueError(f'Unsupported approach - {approach_num}')
+
+    if match_non_targets_to_targets:
+        # Match non-targets to targets:
+        print_and_log('Match non-targets to targets')
+        non_targets = df[~df['target']]
+        targets = df[df['target']]
+        sampled_non_targets = non_targets.sample(n=len(targets), random_state=42)
+        df = pd.concat([targets, sampled_non_targets]).reset_index(drop=True).sample(frac=1, random_state=42)
 
     # Reset the index after all the changes:
     df.reset_index(drop=True, inplace=True)
 
+    # Analyze the distribution of the target variable ('Hit'):
+    print_and_log('The distribution of the target variable (Hit):')
+    print_and_log(df['target'].value_counts(normalize=True))
+    print_and_log(df['target'].value_counts(normalize=False))
+
+    # df['label_change'] = (df['RECORDING_SESSION_LABEL'] != df['RECORDING_SESSION_LABEL'].shift()).cumsum()
+    # # Create a dictionary to map unique combinations to new numeric labels
+    # label_dict = {combo: i + 1 for i, combo in
+    #               enumerate(df.groupby(['RECORDING_SESSION_LABEL', 'label_change']).groups.keys())}
+    # # Create UNIQUE_SESSION_LABEL using the mapping
+    # df['RECORDING_SESSION_LABEL'] = df.apply(
+    #     lambda row: label_dict[(row['RECORDING_SESSION_LABEL'], row['label_change'])], axis=1)
+    # df = df.drop('label_change', axis=1)
 
     if return_bool_asking_if_processed_data:
-        return df, processed_data
+        return df, processed_data, gen_data
     return df
-
-
-
-
-

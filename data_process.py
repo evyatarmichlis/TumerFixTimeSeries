@@ -1,15 +1,15 @@
+import argparse
 import os
-import random
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union, List
-import matplotlib
-matplotlib.use('Agg')
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
 import torch
+# import torch
 from imblearn.combine import SMOTEENN
 from imblearn.combine import SMOTETomek
 from imblearn.over_sampling import ADASYN
@@ -19,37 +19,20 @@ from imblearn.under_sampling import TomekLinks
 from lightgbm import LGBMClassifier
 from pytorch_tabnet.pretraining import TabNetPretrainer
 from pytorch_tabnet.tab_model import TabNetClassifier
+# from pytorch_tabnet.pretraining import TabNetPretrainer
+# from pytorch_tabnet.tab_model import TabNetClassifier
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix, \
-    classification_report,precision_recall_curve
+    classification_report, precision_recall_fscore_support
 # from sklearn.metrics import roc_curve
 from sklearn.model_selection import GroupShuffleSplit, ShuffleSplit
 from tqdm import tqdm
 
-from tfd_utils.data_utils import get_df_for_training
+from tfd_utils.data_utils import get_df_for_training, stratified_group_split_independent_unique  # load_config_file
 from tfd_utils.logger_utils import print_and_log
 from tfd_utils.model_stats_utils import model_stats_per_training_size, model_stats_per_weight_classes, \
     model_stats_per_learning_rate, model_stats_per_num_leaves, model_stats_per_min_child_samples
-from tfd_utils.visualization_utils import save_plot_func, visualize_data, visualize_model, compare_old_to_new_data
+from tfd_utils.visualization_utils import visualize_data, save_plot_func, visualize_model, compare_old_to_new_data
 
-def split_train_test(df, input_data_points, test_size=0.2, random_state=0):
-    df['group'] = df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']].apply(
-        lambda row: '_'.join(row.values.astype(str)), axis=1)
-    gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
-    split_indices = list(gss.split(X=df[input_data_points], y=df['target'], groups=df['group']))[0]
-    train_index, test_index = split_indices
-    x_train = df[input_data_points].iloc[train_index]
-    x_test = df[input_data_points].iloc[test_index]
-    y_train = df['target'].iloc[train_index]
-    y_test = df['target'].iloc[test_index]
-    return x_train, x_test, y_train, y_test
-# from tfd_utils.visualization_utils import visualize_data, save_plot_func, visualize_model, compare_old_to_new_data
-def seed_everything(seed):
-    random.seed(seed)  # Python random module.
-    np.random.seed(seed)  # Numpy module.
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
 
 class SmoteType:
     none = None
@@ -118,7 +101,7 @@ class IdentSubRec:
         self.old_data_file_path = old_data_file_path
         self.approach_num = approach_num
 
-        self.df, self.processed_data = self.get_df_for_training(
+        self.df, self.processed_data, self.gen_data = self.get_df_for_training(
             self.data_file_path,
             augment=augment,
             normalize=normalize,
@@ -132,7 +115,7 @@ class IdentSubRec:
         )
 
         # # DEBUG! DEBUG! DEBUG!!! For testing - keep only one participant to test on.
-        self.df = self.df[self.df['RECORDING_SESSION_LABEL'] == 1]
+        # self.df = self.df[self.df['RECORDING_SESSION_LABEL'] == 1]
 
         # Only used if a test data file path is provided:
         self.test_df = None if test_data_file_path is None else self.get_df_for_training(self.test_data_file_path,
@@ -211,26 +194,45 @@ class IdentSubRec:
 
     # ------------------------------------------ Model stats functions end ------------------------------------------
 
-    def train(self,
-              test_size: float = 0.2,
-              class_weight: Optional[dict] = None,
-              num_leaves: int = 31,
-              learning_rate: float = 0.1,
-              min_child_samples: int = 20,
-              print_stats: bool = True,
-              plot_confusion_matrix: bool = True,
-              save_plot: bool = False,
-              random_state: int = 0,
-              cross_validate: bool = True,
-              cross_validation_n_splits: int = 10,
-              split_by_participants: bool = False,
-              completely_random_data_split: bool = False,
-              smote_type: Optional[SmoteType] = False,
-              save_models: bool = False,
-              save_predicted_as_true_data_rows: bool = False):
-        print_and_log(f'Running with num_leaves={num_leaves}, learning_rate={learning_rate}, '
-                      f'min_child_samples={min_child_samples}, random_state={random_state}, '
-                      f'cross_validate={cross_validate}, cross_validation_n_splits={cross_validation_n_splits}')
+    def train(
+            self,
+            test_size: float = 0.2,
+            class_weight: Optional[dict] = None,
+            num_leaves: int = 31,
+            learning_rate: float = 0.1,
+            min_child_samples: int = 20,
+            print_stats: bool = True,
+            plot_confusion_matrix: bool = True,
+            save_plot: bool = False,
+            random_state: int = 0,
+            cross_validate: bool = True,
+            cross_validation_n_splits: int = 10,
+            split_by_participants: bool = False,
+            completely_random_data_split: bool = False,
+            smote_type: Optional[SmoteType] = False,
+            save_models: bool = False,
+            save_predicted_as_true_data_rows: bool = False,
+            predict_all_train_data: bool = False,
+            participants_to_train_on: Optional[List[int]] = None,
+            participants_to_test_on: Optional[List[int]] = None,
+    ):
+        print_and_log(f'Running with num_leaves={num_leaves}, '
+                      f'learning_rate={learning_rate}, '
+                      f'min_child_samples={min_child_samples}, '
+                      f'print_stats={print_stats}, '
+                      f'plot_confusion_matrix={plot_confusion_matrix}, '
+                      f'save_plot={save_plot}, '
+                      f'random_state={random_state}, '
+                      f'cross_validate={cross_validate}, '
+                      f'cross_validation_n_splits={cross_validation_n_splits}, ',
+                      f'split_by_participants={split_by_participants}, '
+                      f'completely_random_data_split={completely_random_data_split}, ',
+                      f'smote_type={smote_type}, '
+                      f'save_models={save_models}, '
+                      f'save_predicted_as_true_data_rows={save_predicted_as_true_data_rows}, '
+                      f'predict_all_train_data={predict_all_train_data}, ',
+                      f'participants_to_train_on={participants_to_train_on}, '
+                      f'participants_to_test_on={participants_to_test_on}')
         # ============================================= Init used model: ==============================================
         # self.clf = RandomForestClassifier(n_estimators=100, random_state=random_state, class_weight='balanced')
         # self.clf = XGBClassifier()
@@ -249,9 +251,10 @@ class IdentSubRec:
             # class_weight = {False: 1, True: 0.2 * (~self.df['target']).sum() / self.df['target'].sum()}
             class_weight = 'balanced'
 
+        # Use a simple PyTorch NN with skorch to have sklearn like usability:
+        # from tfd_utils.train_utils.torch_nn import get_skorch_model
+        # self.clf = get_skorch_model(input_params=len(input_data_points))
 
-
-        #need GPU
         use_tabnet_classifier = False
         if use_tabnet_classifier:
             n_size = 12
@@ -263,6 +266,7 @@ class IdentSubRec:
                                         scheduler_fn=torch.optim.lr_scheduler.StepLR,
                                         )
         else:
+            # Use LGBMClassifier:
             self.clf = LGBMClassifier(
                 n_estimators=100,
                 class_weight=class_weight,
@@ -274,6 +278,14 @@ class IdentSubRec:
                 verbose=-1,
             )
 
+        # Use bagging instead of 'regular' classifier model:
+        # self.base_clf = LGBMClassifier(class_weight=class_weight,
+        #                                random_state=random_state,
+        #                                num_leaves=num_leaves,
+        #                                learning_rate=learning_rate,
+        #                                min_child_samples=min_child_samples)
+        # from sklearn.ensemble import BaggingClassifier
+        # self.clf = BaggingClassifier(estimator=self.base_clf, n_estimators=10, random_state=random_state)
 
         # ============================================== Data and train ===============================================
         if self.processed_data:
@@ -287,8 +299,25 @@ class IdentSubRec:
                 'CURRENT_FIX_COMPONENT_INDEX',
                 'CURRENT_FIX_COMPONENT_DURATION',
             ]
-            if 'CURRENT_FIX_COMPONENT_IMAGE_NUMBER' in self.df.keys():
-                input_data_points.append('CURRENT_FIX_COMPONENT_IMAGE_NUMBER')
+            # if 'CURRENT_FIX_COMPONENT_IMAGE_NUMBER' in self.df.keys():
+            #     input_data_points.append('CURRENT_FIX_COMPONENT_IMAGE_NUMBER')
+            print_and_log('NOT USING CURRENT_FIX_COMPONENT_IMAGE_NUMBER')
+        elif self.gen_data:
+            input_data_points = [
+                'TRIAL_FIX_INDEX',
+                'EVENT_START',
+                'EVENT_END',
+                # 'EVENT',
+                'FIXATION_DURATION',
+                'SLICE_FIXATION_START',
+                'SLICE_FIXATION_END',
+                'SLICE_FIXATION_DURATION',
+                # 'CURRENT_IMAGE',
+                # 'EVENT_ZONE',
+                'ZONE_X',
+                'ZONE_Y',
+                'CURRENT_FIX_PUPIL',
+            ]
         else:
             input_data_points = [
                 'CURRENT_FIX_INDEX',
@@ -301,9 +330,14 @@ class IdentSubRec:
                 'IN_SACCADE',
             ]
 
+        # For experiments training with added data columns:
+        # input_data_points.append('RECORDING_SESSION_LABEL')
+        # input_data_points.append('TRIAL_INDEX')
 
         if use_tabnet_classifier and self.test_df is None:
-            self.df['group'] = self.df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_INDEX']].apply(
+            # self.df['group'] = self.df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_INDEX']].apply(
+            #     lambda row: '_'.join(row.values.astype(str)), axis=1)
+            self.df['group'] = self.df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']].apply(
                 lambda row: '_'.join(row.values.astype(str)), axis=1)
             gss = GroupShuffleSplit(n_splits=1,
                                     test_size=test_size,
@@ -370,7 +404,8 @@ class IdentSubRec:
                              from_unsupervised=unsupervised_model,
                              # batch_size=4096, virtual_batch_size=512)
                              batch_size=65536, virtual_batch_size=8192)
-
+                # batch_size=262144, virtual_batch_size=32768)
+                # batch_size=524288, virtual_batch_size=65536)
                 now = datetime.now()
                 datetime_string = now.strftime('D%y%m%dT%H%M')
                 models_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'models')
@@ -387,7 +422,56 @@ class IdentSubRec:
             f1 = f1_score(y_true=y_test, y_pred=y_pred, average='binary')
             roc_auc_score_res = roc_auc_score(y_true=y_test, y_score=y_pred)
         elif not cross_validate:
-            pass
+            # Old way, need to split randomly with groups of fixations.
+            # x_train, x_test, y_train, y_test = train_test_split(self.df[input_data_points],
+            #                                                     self.df['target'],
+            #                                                     test_size=test_size,
+            #                                                     random_state=random_state)
+
+            # Group by the three keys and split by them - RECORDING_SESSION_LABEL, TRIAL_INDEX, CURRENT_FIX_INDEX:
+            print_and_log('Splitting train / test data by RECORDING_SESSION_LABEL, TRIAL_INDEX, CURRENT_FIX_INDEX')
+
+            self.df['group'] = self.df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']].apply(
+                lambda row: '_'.join(row.values.astype(str)), axis=1)
+            # self.df['group'] = self.df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_INDEX']].apply(
+            #     lambda row: '_'.join(row.values.astype(str)), axis=1)
+            gss = GroupShuffleSplit(n_splits=1,
+                                    test_size=test_size,
+                                    random_state=random_state)
+            split_indices = list(gss.split(X=self.df[input_data_points],
+                                           y=self.df['target'],
+                                           groups=self.df['group']))[0]
+            train_index, test_index = split_indices
+            x_train, x_test = self.df[input_data_points].iloc[train_index], self.df[input_data_points].iloc[
+                test_index]
+            y_train, y_test = self.df['target'].iloc[train_index], self.df['target'].iloc[test_index]
+
+            # x_test_file_path = 'data/temp/x_test.csv'
+            # # x_test.to_csv(x_test_file_path, index=False)
+            # x_test = pd.read_csv(x_test_file_path, nrows=None)
+            # y_test_file_path = 'data/temp/y_test.csv'
+            # # y_test.to_csv(y_test_file_path, index=False)
+            # y_test = pd.read_csv(y_test_file_path, nrows=None)
+            #
+            # used_data = self.df[input_data_points]
+            # used_data_with_indices = used_data.copy().reset_index()
+            # merged_df = pd.merge(used_data_with_indices, x_test, how='outer', indicator=True)
+            # x_train_with_index_column = merged_df.query('_merge == "left_only"').drop('_merge', axis=1)
+            # original_indices = x_train_with_index_column['index'].tolist()
+            # x_train = used_data[used_data.index.isin(original_indices)]
+            # y_train = self.df['target'][self.df['target'].index.isin(original_indices)]
+
+            if smote_type is not None:
+                x_train, y_train = apply_smote_and_related(x=x_train, y=y_train, smote_type=smote_type)
+
+            self.clf.fit(x_train, y_train)
+            y_pred = self.clf.predict(x_test)
+
+            acc = accuracy_score(y_true=y_test, y_pred=y_pred)
+            precision = precision_score(y_true=y_test, y_pred=y_pred, average='binary')
+            recall = recall_score(y_true=y_test, y_pred=y_pred, average='binary')
+            f1 = f1_score(y_true=y_test, y_pred=y_pred, average='binary')
+            roc_auc_score_res = roc_auc_score(y_true=y_test, y_score=y_pred)
         else:
             print_and_log(f'Running cross-validation with n_splits = {cross_validation_n_splits}')
             if split_by_participants:
@@ -395,45 +479,85 @@ class IdentSubRec:
                 split_indices = []
                 unique_participants = self.df['RECORDING_SESSION_LABEL'].unique()
                 # split_test_size = int(len(unique_participants) * test_size)  # If I want to use the function test_size
-                split_test_size = 2
+                split_test_size = int(len(unique_participants) * 0.2)  # If I want to use a fixed test size (20%)
                 print_and_log(
                     f'Using split_test_size = {split_test_size} out of {len(unique_participants)} participants\n'
                     f'In percentage, this is {split_test_size / len(unique_participants) * 100:.2f}%')
                 np.random.seed(seed=random_state)
-                test_participants_labels = np.random.choice(unique_participants,
-                                                            size=(cross_validation_n_splits, split_test_size))
+
+                test_participants_labels = stratified_group_split_independent_unique(
+                    df=self.df,
+                    target_col='target',
+                    group_col='RECORDING_SESSION_LABEL',
+                    test_size=split_test_size,
+                    n_splits=cross_validation_n_splits
+                )
                 for test_participants_label in test_participants_labels:
                     train_indices = self.df[~self.df['RECORDING_SESSION_LABEL'].isin(test_participants_label)].index
                     test_indices = self.df[self.df['RECORDING_SESSION_LABEL'].isin(test_participants_label)].index
                     split_indices.append((train_indices, test_indices))
             else:
-
-                print_and_log('Splitting train / test data by 80% of each participants data')
-                unique_participants = self.df['RECORDING_SESSION_LABEL'].unique()
-                self.df['group'] = self.df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']].apply(
-                    lambda row: '_'.join(row.values.astype(str)), axis=1)
-                if completely_random_data_split:
-                    gss = ShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+                if participants_to_train_on is not None:
+                    print_and_log(f'Using given participants list: {participants_to_train_on}')
+                    unique_participants = participants_to_train_on
                 else:
-                    gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
-                split_indices = []
-                for _ in range(cross_validation_n_splits):
-                    train_indices = []
-                    test_indices = []
-                    for participant in unique_participants:
+                    unique_participants = self.df['RECORDING_SESSION_LABEL'].unique()
+
+                if predict_all_train_data:
+                    # Create five unique, non-overlapping splits, test it on them, saving preds to df then to file:
+                    splits_dict = {ind: [] for ind in range(5)}
+                    test_participants = unique_participants
+                    if participants_to_test_on is not None:
+                        test_participants = participants_to_test_on
+                    for participant in test_participants:
                         participant_indices = self.df[self.df['RECORDING_SESSION_LABEL'] == participant].index
-                        if completely_random_data_split:
-                            participant_split_indices = gss.split(X=participant_indices)
-                        else:
-                            participant_split_indices = gss.split(X=participant_indices,
-                                                                  groups=self.df['group'].iloc[participant_indices])
-                        participant_split_indices = list(participant_split_indices)
-                        participant_train_indices, participant_test_indices = participant_split_indices[0]
-                        train_indices.extend(participant_indices[participant_train_indices])
-                        test_indices.extend(participant_indices[participant_test_indices])
-                    np.random.shuffle(train_indices)
-                    np.random.shuffle(test_indices)
-                    split_indices.append((train_indices, test_indices))
+                        shuffled_indices = np.random.permutation(participant_indices)
+                        split_indices = np.array_split(shuffled_indices, 5)
+                        for ind in range(5):
+                            splits_dict[ind].extend(split_indices[ind])
+                    for ind in range(5):
+                        np.random.shuffle(splits_dict[ind])
+                    split_indices = [(list(set(self.df.index) - set(splits_dict[ind])), splits_dict[ind])
+                                     for ind in range(5)]
+                else:
+                    # Randomly split the data comprising 80% of the data for each participant,
+                    # rather than just 80% of the total data:
+                    print_and_log('Splitting train / test data by 80% of each participant\'s data')
+                    if not self.gen_data:
+                        # self.df['group'] = self.df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX',
+                        #                             'CURRENT_FIX_INDEX']].apply(
+                        #     lambda row: '_'.join(row.values.astype(str)), axis=1)
+                        self.df['group'] = self.df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']].apply(
+                            lambda row: '_'.join(row.values.astype(str)), axis=1)
+                    if completely_random_data_split:
+                        # gss = ShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+                        gss = GroupShuffleSplit(n_splits=1, test_size=test_size)
+                    else:
+                        # gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+                        gss = GroupShuffleSplit(n_splits=1, test_size=test_size)
+                    split_indices = []
+                    for _ in range(cross_validation_n_splits):
+                        train_indices = []
+                        test_indices = []
+                        for participant in unique_participants:
+                            participant_indices = self.df[self.df['RECORDING_SESSION_LABEL'] == participant].index
+                            if completely_random_data_split:
+                                participant_split_indices = gss.split(X=participant_indices)
+                            else:
+                                participant_split_indices = gss.split(X=participant_indices,
+                                                                      groups=self.df['group'].iloc[participant_indices])
+                            participant_split_indices = list(participant_split_indices)
+                            participant_train_indices, participant_test_indices = participant_split_indices[0]
+                            train_indices.extend(participant_indices[participant_train_indices])
+                            test_indices.extend(participant_indices[participant_test_indices])
+                        if participants_to_test_on is not None:
+                            test_indices = self.df['RECORDING_SESSION_LABEL'].isin(participants_to_test_on)
+                            participant_test_indices = self.df[test_indices].index
+                            test_indices = list(participant_test_indices)
+                            # Overwrite the test indices
+                        np.random.shuffle(train_indices)
+                        np.random.shuffle(test_indices)
+                        split_indices.append((train_indices, test_indices))
 
             # all_probabilities = []
             now = datetime.now()
@@ -441,29 +565,101 @@ class IdentSubRec:
             for split_ind, (train_index, test_index) in tqdm(iterable=enumerate(split_indices),
                                                              desc='Iterating over different data splits',
                                                              total=len(split_indices)):
-                x_train, x_test, y_train, y_test = split_train_test(
-                    df=self.df,
-                    input_data_points=input_data_points,
-                    test_size=0.2,
-                    random_state=0
-                )
-                print("Number of True and False in y_test:")
-                print(y_test.value_counts())
+                x_train, x_test = (self.df[input_data_points].iloc[train_index],
+                                   self.df[input_data_points].iloc[test_index])
+                y_train, y_test = (self.df['target'].iloc[train_index],
+                                   self.df['target'].iloc[test_index])
+
+                if participants_to_test_on is not None:  # For testing on given participants:
+                    indices = self.df[self.df['RECORDING_SESSION_LABEL'].isin(participants_to_test_on)].index
+                    common_indices = indices.intersection(x_test.index)
+                    filtered_x_test = x_test.loc[common_indices]
+                    x_test = filtered_x_test
+                    filtered_y_test = y_test[common_indices]
+                    y_test = filtered_y_test
 
                 if smote_type is not None:
                     x_train, y_train = apply_smote_and_related(x=x_train, y=y_train, smote_type=smote_type)
 
                 self.clf.fit(x_train, y_train)
                 y_pred = self.clf.predict(x_test)
-                probabilities = self.clf.predict_proba(x_test)[:, 1]
-                # all_probabilities.extend(probabilities)
 
+                # Group results by RECORDING_SESSION_LABEL:
+                if group_by_participants := False:
+                    print_and_log('Grouping results by \'RECORDING_SESSION_LABEL\'')
+                    results_df = pd.DataFrame({
+                        'prediction': y_pred,
+                        'RECORDING_SESSION_LABEL': self.df['RECORDING_SESSION_LABEL'].iloc[test_index],
+                        'target': self.df['target'].iloc[test_index],
+                    })
+
+                    def threshold_and_compare(group, threshold=0.5):
+                        mean_prediction = group['prediction'].mean()
+                        threshold_prediction = mean_prediction > threshold
+                        target = group['target'].iloc[0]  # Assuming all targets in a group are the same
+                        return pd.Series({
+                            'predicted': threshold_prediction,
+                            'target': target,
+                            'correct': threshold_prediction == target
+                        })
+
+                    grouped_results = results_df.groupby('RECORDING_SESSION_LABEL').apply(threshold_and_compare)
+                    y_pred = grouped_results['predicted'].to_numpy()
+                    y_test = grouped_results['target'].to_numpy()
+
+                if False and predict_all_train_data:
+                    # Save predictions back to the df:
+                    self.df.loc[test_index, 'predicted'] = y_pred
+
+                if group_by_fix_comp_image_file := False:
+                    print_and_log('Grouping nodules by \'CURRENT_FIX_COMPONENT_IMAGE_FILE\'')
+                    # Consider rows where SLICE_TYPE==NODULE_SLICE having the same 'CURRENT_FIX_COMPONENT_IMAGE_FILE' as
+                    # one data rows and benchmark on them accordingly:
+                    df_test = self.df.iloc[test_index].reset_index(drop=True)
+                    test_nodules = df_test[df_test['SLICE_TYPE'] == 'NODULE_SLICE']
+
+                    def apply_threshold(indices, threshold=0.5):
+                        # Convert lists of boolean to int, then calculate mean to see if it exceeds a threshold
+                        test_result = np.mean(y_test[indices]) >= threshold
+                        pred_result = np.mean(y_pred[indices]) >= threshold
+                        return test_result, pred_result
+
+                    grouped_test_nodules_results = test_nodules.groupby('CURRENT_FIX_COMPONENT_IMAGE_FILE').apply(
+                        lambda x: apply_threshold(x.index)).reset_index(drop=True)
+
+                    new_y_test = [result[0] for result in grouped_test_nodules_results]
+                    new_y_pred = [result[1] for result in grouped_test_nodules_results]
+
+                    # Handle non-NODULE_SLICE:
+                    test_non_nodules = df_test[df_test['SLICE_TYPE'] != 'NODULE_SLICE']
+                    if group_non_nodules := True:
+                        # Group by 'CURRENT_FIX_COMPONENT_IMAGE_FILE':
+                        grouped_test_non_nodules_results = test_non_nodules.groupby(
+                            'CURRENT_FIX_COMPONENT_IMAGE_FILE').apply(lambda x: apply_threshold(x.index)).reset_index(
+                            drop=True)
+                        new_y_test.extend([result[0] for result in grouped_test_non_nodules_results])
+                        new_y_pred.extend([result[1] for result in grouped_test_non_nodules_results])
+                    else:
+                        # Append rows directly to the new_y_test and new_y_pred lists:
+                        new_y_test.extend(y_test[test_non_nodules.index])
+                        new_y_pred.extend(y_pred[test_non_nodules.index])
+
+                    y_test = np.array(new_y_test)
+                    y_pred = np.array(new_y_pred)
+
+                # all_probabilities.extend(probabilities)
+                # probabilities = self.clf.predict_proba(x_test)[:, 1]
+                # roc_auc_scores.append(roc_auc_score(y_test, probabilities))
+                roc_auc_scores.append(-1)
                 acc_scores.append(accuracy_score(y_test, y_pred))
-                precision_scores.append(precision_score(y_test, y_pred, average='binary'))
-                recall_scores.append(recall_score(y_test, y_pred, average='binary'))
-                f1_scores.append(f1_score(y_test, y_pred, average='binary'))
-                roc_auc_scores.append(roc_auc_score(y_test, probabilities))
-                confusion_matrices.append(confusion_matrix(y_test, y_pred))
+                precision, recall, f1, support = precision_recall_fscore_support(y_test, y_pred, labels=[0, 1])
+                precision_scores.append(precision)
+                recall_scores.append(recall)
+                f1_scores.append(f1)
+
+                conf_matrix = confusion_matrix(y_test, y_pred)
+                if conf_matrix.shape == (2, 2):
+                    confusion_matrices.append(conf_matrix)
                 y_preds.append(y_pred)
                 y_tests.append(y_test)
 
@@ -487,7 +683,26 @@ class IdentSubRec:
                         pred_rows_csv_path = model_path.parent / f'predicted_rows_for_slice_{split_ind}.csv'
                         predicted_rows.to_csv(str(pred_rows_csv_path), index=True)
 
+            if False and predict_all_train_data:
+                # Save df to file with all the predictions:
+                now = datetime.now()
+                datetime_string = now.strftime('D%y%m%dT%H%M')
+                df_csv_dir = Path('data') / 'data_with_preds'
+                file_name = Path(self.data_file_path).stem
 
+                # Save the processed file with predictions to a csv file:
+                # processed_df_csv_path = df_csv_dir / f'Processed_file_{file_name}_with_preds_{datetime_string}.csv'
+                # self.df.to_csv(str(processed_df_csv_path), index=False)
+
+                # Load the original file:
+                original_df = pd.read_csv(self.data_file_path)
+                # Add the predictions to the original file:
+                majority_predictions = self.df.groupby('original_index')['predicted'].agg(lambda x: x.mode()[0])
+                original_df['predicted'] = original_df.index.map(majority_predictions)
+                # Save the original file with the predictions:
+                original_df_csv_path = df_csv_dir / f'Original_file_{file_name}_with_preds_{datetime_string}.csv'
+                original_df.to_csv(str(original_df_csv_path), index=False)
+                print_and_log(f'Saved the original file with predictions to {original_df_csv_path}')
 
             confusion_matrix_res = np.mean(confusion_matrices, axis=0).round().astype(int)
             y_pred = np.concatenate(y_preds)
@@ -495,116 +710,92 @@ class IdentSubRec:
 
             # This values would be returned from this training function:
             acc = np.mean(acc_scores)
-            precision = np.mean(precision_scores)
-            recall = np.mean(recall_scores)
-            f1 = np.mean(f1_scores)
-            roc_auc_score_res = np.mean(roc_auc_scores)
+            precision = np.mean(precision_scores, axis=0)
+            recall = np.mean(recall_scores, axis=0)
+            # print('=' * 50)
+            # print('F1 scores for all splits:')
+            # for ind, score in enumerate(f1_scores):
+            #     print(f'Split {ind}: {score}')
+            # print('\n', '=' * 50)
+            f1 = np.mean(f1_scores, axis=0)
+            # roc_auc_score_res = np.mean(roc_auc_scores)
+            roc_auc_score_res = [-1]
 
         if plot_confusion_matrix:
+            def plot_confusion_matrix(data, annot, fmt, title):
+                plt.xlabel('Predicted Label')
+                plt.ylabel('True Label')
+                sns.heatmap(data, annot=annot, fmt=fmt, cmap='Blues', cbar=False,
+                            xticklabels=['Predicted 0', 'Predicted 1'],
+                            yticklabels=['Actual 0', 'Actual 1'])
+                plt.title(title)
+                plt.show()
+
             if not cross_validate:
                 confusion_matrix_res = confusion_matrix(y_true=y_test, y_pred=y_pred)
-            title = f'Confusion Matrix. {self.clf.__class__.__name__} model with class_weight={self.clf.class_weight}'
-            plt.title(title)
-            sns.heatmap(confusion_matrix_res, annot=True, fmt='d', cmap='Blues', cbar=False,
-                        xticklabels=['Predicted 0', 'Predicted 1'],
-                        yticklabels=['Actual 0', 'Actual 1'])
-            plt.xlabel('Predicted Label')
-            plt.ylabel('True Label')
-            if save_plot:
-                self.save_plot_func(title=title)
-            plt.show()
+
+            if plot_with_percentage := True:
+                confusion_matrix_percentage = confusion_matrix_res / np.sum(confusion_matrix_res) * 100
+                annot = np.array([["{0:.2f}%".format(value) for value in row]
+                                  for row in confusion_matrix_percentage])
+                title = (f'Confusion Matrix (%). {self.clf.__class__.__name__} '
+                         f'model with class_weight={self.clf.class_weight}')
+                plot_confusion_matrix(confusion_matrix_percentage, annot, '', title)
+                if save_plot:
+                    self.save_plot_func(title=title)
+            if plot_with_abs_values := True:
+                plt.clf()  # Clear figure before plotting new matrix
+                title = f'Confusion Matrix. {self.clf.__class__.__name__} model with class_weight={self.clf.class_weight}'
+                plot_confusion_matrix(confusion_matrix_res, True, 'd', title)
+                if save_plot:
+                    self.save_plot_func(title=title)
 
         if print_stats:
-            if self.clf.__class__.__name__ not in ('NeuralNetBinaryClassifier', 'TabNetClassifier'):
-                set_class_weight = self.base_clf.class_weight if self.base_clf is not None else self.clf.class_weight
-                print_and_log(f'Using {self.clf.__class__.__name__} model with class_weight={set_class_weight}')
-            if self.test_df is not None or not cross_validate:
-                print_and_log(f'Results are:\n'
-                              f'Accuracy {acc * 100:.2f}%\n'
-                              f'Precision {precision * 100:.2f}%\n'
-                              f'Recall {recall * 100:.2f}%\n'
-                              f'F1 score {f1 * 100:.2f}%\n'
-                              f'ROC AUC score {roc_auc_score_res * 100:.2f}%\n\n'
-                              f'Used parameters are:\n'
-                              f'test_size={test_size}\n'
-                              f'data points keys = {input_data_points}')
-            else:
-                print_and_log(f'Used parameters are:\n'
-                              f'test_size={test_size}\n'
-                              f'data points keys = {input_data_points}')
-                for operation in (np.mean, np.max, np.min, np.std):
-                    print_and_log(f'{operation.__name__} results are:')
-                    acc = operation(acc_scores)
-                    precision = operation(precision_scores)
-                    recall = operation(recall_scores)
-                    f1 = operation(f1_scores)
-                    roc_auc_score_res = operation(roc_auc_scores)
-                    print_and_log(f'Accuracy {acc * 100:.2f}%\n'
-                                  f'Precision {precision * 100:.2f}%\n'
-                                  f'Recall {recall * 100:.2f}%\n'
-                                  f'F1 score {f1 * 100:.2f}%\n'
-                                  f'ROC AUC score {roc_auc_score_res * 100:.2f}%\n\n')
-            print_and_log(f'The full classification report is:\n{classification_report(y_true=y_test, y_pred=y_pred)}')
+
+            print_and_log(f'The full classification report is:\n{classification_report(y_true=y_test, y_pred=y_pred, digits=5)}')
+        acc = np.mean(acc_scores)
+        precision = np.mean(precision_scores, axis=0)
+        recall = np.mean(recall_scores, axis=0)
+        f1 = np.mean(f1_scores, axis=0)
+        roc_auc_score_res = np.mean(roc_auc_scores)
         return acc, precision, recall, f1, roc_auc_score_res
 
+
 if __name__ == '__main__':
-    seed_everything(0)
-    new_rad_s1_s9_csv_file_path = 'data/NewRad_Fixations_S1_S9_Data.csv'
-    expert_rad_e1_e3_csv_file_path = 'data/ExpertRad_Fixations_E1_E3.csv'
-    rad_s1_s18_file_path = 'data/Rad_Fixations_S1_S18_Data.csv'
-    formatted_rad_s1_s18_file_path = 'data/Formatted_Fixations_ML.csv'
-    categorized_rad_s1_s18_file_path = 'data/Categorized_Fixation_Data_1_18.csv'
 
-    raw_participants_file_paths = ['1_Formatted_Sample.csv', '2_Formatted_Sample.csv', '3_Formatted_Sample.csv',
-                                   '4_Formatted_Sample.csv', '6_Formatted_Sample.csv', '7_Formatted_Sample.csv',
-                                   '8_Formatted_Sample.csv', '9_Formatted_Sample.csv', '19_Formatted_Sample.csv',
-                                   '23_Formatted_Sample.csv', '24_Formatted_Sample.csv', '25_Formatted_Sample.csv',
-                                   '30_Formatted_Sample.csv', '33_Formatted_Sample.csv', '34_Formatted_Sample.csv',
-                                   '35_Formatted_Sample.csv', '36_Formatted_Sample.csv', '37_Formatted_Sample.csv']
-    raw_participants_folder_path = '/media/y/2TB/1_THESIS_FILES/Data_D231110/'
-    for i in range(len(raw_participants_file_paths)):
-        raw_participants_file_paths[i] = os.path.join(raw_participants_folder_path, raw_participants_file_paths[i])
-    raw_participant_1 = '/media/y/2TB/1_THESIS_FILES/Data_D231110/1_Formatted_Sample.csv'
+    # If used, will predict all the input train data and save it to a csv file:
+    parser = argparse.ArgumentParser(description='Train a model on the given data, predict it and save to a csv file.')
+    parser.add_argument('--data_file_path', type=str,
+                        help='The path to the data file to train the model on.')
+    args = parser.parse_args()
+    data_file_path = args.data_file_path
 
-    rad_init_kwargs = dict(data_file_path=rad_s1_s18_file_path,
-                           test_data_file_path=None,
-                           augment=False,
-                           join_train_and_test_data=False,
-                           normalize=True)
-    raw_participant_1_init_kwargs = dict(data_file_path=raw_participant_1,
-                                         test_data_file_path=None,
-                                         augment=False,
-                                         join_train_and_test_data=False,
-                                         normalize=True)
-    raw_participants_init_kwargs = dict(data_file_path=raw_participants_file_paths,
-                                        test_data_file_path=None,
-                                        augment=False,
-                                        join_train_and_test_data=False,
-                                        normalize=True,
-                                        take_every_x_rows=2)
-    experts_init_kwargs = dict(data_file_path=expert_rad_e1_e3_csv_file_path,
-                               test_data_file_path=None,
-                               augment=False,
-                               join_train_and_test_data=False,
-                               normalize=True)
-    experts_and_rad_init_kwargs = dict(data_file_path=[rad_s1_s18_file_path, expert_rad_e1_e3_csv_file_path],
-                                       test_data_file_path=None,
-                                       augment=False,
-                                       join_train_and_test_data=False,
-                                       normalize=True)
+    if data_file_path is not None:
+        used_data_file_path = data_file_path
+        predict_all_train_data = True
+        print_stats = False
+        approach_num = 8
+    else:
+        nodule_categorized_rad_s1_s18_file_path = 'data/Categorized_Fixation_Data_1_18.csv'
+        used_data_file_path = nodule_categorized_rad_s1_s18_file_path
 
-    # Hit in the categorized data are 1 for nodule and 0 for non-nodule.
-    formatted_rad_init_kwargs = dict(data_file_path=formatted_rad_s1_s18_file_path,
-                                     test_data_file_path=None,
-                                     augment=False,
-                                     join_train_and_test_data=False,
-                                     normalize=True,
-                                     remove_surrounding_to_hits=0,
-                                     update_surrounding_to_hits=0)
+        # ekg_001_file_path = 'data/ECG/ML_ECGData_P001.csv'
+        # used_data_file_path = ekg_001_file_path
 
-    # Hit in the categorized data are 2 for nodule, 1 for surrounding and 0 for non-nodule.
-    categorized_rad_init_kwargs = dict(
-        data_file_path=categorized_rad_s1_s18_file_path,
+        # six_participants = 'data/OLD_Nodule_Categorized_Fixation_Data_7_12.xlsx'
+        # used_data_file_path = six_participants
+
+        approach_num = 8
+        # generalist_expert_med_student_file_path = 'data/group_differentiation/Generalists_Experts_MedStudents_Combined.csv'
+        # approach_num = 11
+        # used_data_file_path = generalist_expert_med_student_file_path
+        predict_all_train_data = False
+        print_stats = True
+
+    print_and_log(f'Running with approach {approach_num} and data file path {used_data_file_path}')
+
+    init_kwargs = dict(
+        data_file_path=used_data_file_path,
         test_data_file_path=None,
         augment=False,
         join_train_and_test_data=False,
@@ -613,11 +804,73 @@ if __name__ == '__main__':
         update_surrounding_to_hits=0,
         approach_num=6,
     )
+    ident_sub_rec = IdentSubRec(**init_kwargs)
 
-    ident_sub_rec = IdentSubRec(**categorized_rad_init_kwargs)
-    train_kwargs = dict(test_size=0.2, num_leaves=300, learning_rate=0.1, min_child_samples=44, print_stats=True,
-                        plot_confusion_matrix=True, save_plot=False, cross_validate=True, cross_validation_n_splits=1,
+
+    # Baseline parameters:
+    train_kwargs = dict(test_size=0.2, num_leaves=300, learning_rate=0.1, min_child_samples=44, print_stats=print_stats,
+                        plot_confusion_matrix=False, save_plot=False, cross_validate=True, cross_validation_n_splits=10,
                         split_by_participants=False, completely_random_data_split=False, smote_type=SmoteType.none,
-                        save_models=False, save_predicted_as_true_data_rows=True)
-
+                        save_models=False, save_predicted_as_true_data_rows=False,
+                        predict_all_train_data=predict_all_train_data)
+    # Regular train:
     ident_sub_rec.train(**train_kwargs)
+
+    if train_all_test_one := False:
+        # Train on all participants and test every time on a different participant:
+        unique_participants = ident_sub_rec.df['RECORDING_SESSION_LABEL'].unique()
+        print_and_log(f'Unique participants are: {unique_participants}')
+        pbar = tqdm(iterable=unique_participants,
+                    desc='Iterating over all participants, testing on one',
+                    total=len(unique_participants))
+        testing_on_to_training_on_dict = {
+            1: [2, 3, 4, 6, 7, 8, 9, 19, 23, 24, 25, 30, 33, 34, 35, 36, 37],
+            2: [19, 23, 34, 36],
+            3: [2, 6, 7, 19, 24, 30, 34],
+            4: [1, 3, 6, 30, 33, 34, 35, 36, 37],
+            6: [2, 3, 4, 7, 8, 9, 19, 23, 24, 25, 30, 36, 37],
+            7: [4, 6, 37],
+            8: [3, 6, 24, 25],
+            9: [4, 6, 33],
+            19: [6, 7, 8, 9, 24, 33, 35, 37],
+            23: [1, 2, 3, 6, 7, 8, 9, 19, 24, 25, 33, 35, 36, 37],
+            24: [1, 2, 3, 6, 7, 8, 9, 19, 23, 25, 30, 33, 34, 35, 36, 37],
+            25: [9, 24, 34],
+            30: [4, 36],
+            33: [2, 3, 6, 7, 9, 23, 24, 25, 30, 34, 35, 36, 37],
+            35: [1, 2, 3, 7, 8, 19, 23, 25, 30, 33, 34],
+            36: [3, 4, 7, 9, 34],
+            37: [1, 2, 3, 6, 8, 9, 19, 24, 25, 30, 34, 35, 36]
+        }
+        for participant in pbar:
+            if participant <= 34:
+                continue
+            to_train_on = testing_on_to_training_on_dict[participant]
+            desc = f'Training on best combination without test one - {to_train_on}, testing on participant {participant}'
+            pbar.set_description(desc)
+            train_kwargs['predict_all_train_data'] = True
+            train_kwargs['split_by_participants'] = False
+            train_kwargs['participants_to_train_on'] = to_train_on
+            train_kwargs['participants_to_test_on'] = [participant]
+            # train_kwargs['print_stats'] = False
+            print_and_log(desc)
+            ident_sub_rec.train(**train_kwargs)
+            print_and_log(f'Finished running on participant {participant}')
+            print_and_log('=' * 100)
+
+
+
+    if run_single_participant_tests := False:
+        # Train with one participant once, then with this participant and one of the others, for all the others.
+        # At the end, run with all participants that improved the performance of the first participant.
+        unique_participants = ident_sub_rec.df['RECORDING_SESSION_LABEL'].unique()
+        train_kwargs['split_by_participants'] = False
+        train_kwargs['predict_all_train_data'] = True
+        for main_participant in unique_participants:
+            other_participants = [participant for participant in unique_participants if participant != main_participant]
+
+            # train_kwargs['participants_to_train_on'] = other_participants
+            train_kwargs['participants_to_train_on'] = [main_participant]
+            train_kwargs['participants_to_test_on'] = [main_participant]
+            print_and_log(f"Running on train participant(s) {train_kwargs['participants_to_train_on']}, test participant {train_kwargs['participants_to_test_on']}")
+            first_participant_stats = ident_sub_rec.train(**train_kwargs)

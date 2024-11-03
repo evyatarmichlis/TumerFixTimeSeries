@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
-from sklearn.model_selection import GroupShuffleSplit, train_test_split
+from sklearn.model_selection import GroupShuffleSplit, train_test_split, StratifiedKFold
 from sklearn.metrics import classification_report, f1_score, precision_score, recall_score, confusion_matrix
 from sklearn.utils.class_weight import compute_class_weight
 
@@ -102,6 +102,16 @@ def get_class_weights(labels):
     class_weights_dict = {cls: weight for cls, weight in zip(classes, class_weights)}
     return class_weights_dict
 # Define the FocalLoss class
+
+class WeightedCrossEntropyLoss(nn.Module):
+    def __init__(self):
+        super(WeightedCrossEntropyLoss, self).__init__()
+
+    def forward(self, inputs, targets, weights):
+        log_probs = torch.nn.functional.log_softmax(inputs, dim=1)
+        weighted_loss = -weights * log_probs[range(len(targets)), targets]
+        return weighted_loss.mean()
+
 
 class FocalLoss(nn.Module):
     def __init__(self, gamma=2., alpha=0.25):
@@ -615,11 +625,32 @@ def evaluate_model(model, test_loader, device,save_path=''):
 
     # Compute metrics
     print("Classification Report:")
-    print(classification_report(all_labels, all_preds))
-    plot_confusion_matrix(all_labels, all_preds)
+    classification_rep = classification_report(all_labels, all_preds)
+    print(classification_rep)
+    # plot_confusion_matrix(all_labels, all_preds)
+    num_preds = len(all_preds)
+    num_labels = len(all_labels)
+    cm = confusion_matrix(all_labels, all_preds)
+
+    print("Confusion Matrix:")
+    print("   Predicted 0  Predicted 1")
+    print(f"Actual 0   {cm[0, 0]:<10} {cm[0, 1]:<10}")
+    print(f"Actual 1   {cm[1, 0]:<10} {cm[1, 1]:<10}")
+
+    if save_path != '':
+        with open(save_path, 'w') as f:
+            f.write("Classification Report:\n")
+            f.write(classification_rep)
+            f.write("\n")
+            f.write(f"Number of Predictions: {num_preds}\n")
+            f.write(f"Number of Labels: {num_labels}\n")
+            f.write("Confusion Matrix:\n")
+            f.write("   Predicted 0  Predicted 1\n")
+            f.write(f"Actual 0   {cm[0, 0]:<10} {cm[0, 1]:<10}\n")
+            f.write(f"Actual 1   {cm[1, 0]:<10} {cm[1, 1]:<10}\n")
 
 def train_combined_model(model, train_loader, val_loader, criterion, optimizer, epochs, device, scheduler,
-                         save_path, early_stopping_patience):
+                         save_path, early_stopping_patience, window_weight_train_tensor, window_weight_val_tensor):
     best_val_loss = float('inf')
     patience_counter = 0
 
@@ -627,14 +658,15 @@ def train_combined_model(model, train_loader, val_loader, criterion, optimizer, 
         model.train()
         running_loss = 0.0
 
-        for inputs, labels in train_loader:
+        for i, (inputs, labels) in enumerate(train_loader):
             inputs = inputs.to(device)
             labels = labels.to(device)
+            weights = window_weight_train_tensor[i].to(device)  # Use window weights for training
 
             optimizer.zero_grad()
 
             outputs = model(inputs)
-            loss = criterion(outputs, labels)
+            loss = criterion(outputs, labels, weights)  # Pass the weights to the custom criterion
 
             loss.backward()
             optimizer.step()
@@ -649,12 +681,13 @@ def train_combined_model(model, train_loader, val_loader, criterion, optimizer, 
         correct = 0
 
         with torch.no_grad():
-            for val_inputs, val_labels in val_loader:
+            for j, (val_inputs, val_labels) in enumerate(val_loader):
                 val_inputs = val_inputs.to(device)
                 val_labels = val_labels.to(device)
+                val_weights = window_weight_val_tensor[j].to(device)  # Use window weights for validation
 
                 val_outputs = model(val_inputs)
-                val_loss = criterion(val_outputs, val_labels)
+                val_loss = criterion(val_outputs, val_labels, val_weights)  # Pass the weights
 
                 val_running_loss += val_loss.item() * val_inputs.size(0)
 
@@ -702,6 +735,17 @@ def extract_encoded_features_from_combined_model(model, data_loader, device):
     labels = np.concatenate(labels, axis=0)
     return encoded_features, labels
 
+    # 7. Combine Encoder and Classifier
+class CombinedModel(nn.Module):
+    def __init__(self, encoder, num_classes):
+        super(CombinedModel, self).__init__()
+        self.encoder = encoder.encoder  # Use the encoder part of the autoencoder
+        self.classifier = ComplexCNNClassifier(input_dim=128,num_classes=num_classes)
+
+    def forward(self, x):
+        x = self.encoder(x)
+        x = self.classifier(x)
+        return x
 
 def main_with_autoencoder(df, window_size=5, method='', resample=False, epochs=20, batch_size=32, ae_epochs=100,
                           depth=4, num_filters=32, lr=0.001, mask_probability=0.4, early_stopping_patience=30):
@@ -824,6 +868,7 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, epochs=2
     criterion_ae = nn.MSELoss()
     optimizer_ae = optim.AdamW(autoencoder.parameters(), lr=0.001, weight_decay=1e-4)
     scheduler_ae = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_ae, mode='min', factor=0.5, patience=20)
+    best_autoencoder__path = os.path.join(method_dir, 'best_autoencoder.pth')
 
     if TRAIN:
         train_autoencoder_with_input_masking(
@@ -839,21 +884,11 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, epochs=2
             save_path=method_dir,
             early_stopping_patience=early_stopping_patience
         )
-        torch.save(autoencoder.state_dict(), f'representation_models/best_autoencoder_{method}.pth')
 
-    autoencoder.load_state_dict(torch.load(f'representation_models/best_autoencoder_{method}.pth'))
+        torch.save(autoencoder.state_dict(), best_autoencoder__path)
 
-    # 7. Combine Encoder and Classifier
-    class CombinedModel(nn.Module):
-        def __init__(self, encoder, num_classes):
-            super(CombinedModel, self).__init__()
-            self.encoder = encoder.encoder  # Use the encoder part of the autoencoder
-            self.classifier = ComplexCNNClassifier(input_dim=128,num_classes=num_classes)
+    autoencoder.load_state_dict(torch.load(best_autoencoder__path))
 
-        def forward(self, x):
-            x = self.encoder(x)
-            x = self.classifier(x)
-            return x
 
     num_classes = 2
     model = CombinedModel(autoencoder, num_classes).to(device)
@@ -875,7 +910,16 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, epochs=2
     class_weights = compute_class_weight('balanced', classes=np.unique(train_labels_numpy), y=train_labels_numpy)
     class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
 
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    # criterion = nn.CrossEntropyLoss() # normal cross entropy
+
+    window_weight_train_tensor = torch.tensor(window_weight_train, dtype=torch.float32).to(device)
+    window_weight_val_tensor = torch.tensor(window_weight_val, dtype=torch.float32).to(device)
+
+    # Use the custom loss function
+    criterion = WeightedCrossEntropyLoss()
+
+
+
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
 
     # 10. Train the Combined Model
@@ -889,11 +933,15 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, epochs=2
         device,
         scheduler,
         save_path=method_dir,
-        early_stopping_patience=early_stopping_patience
+        early_stopping_patience=early_stopping_patience,
+        window_weight_train_tensor=window_weight_train_tensor,
+        window_weight_val_tensor=window_weight_val_tensor
     )
 
     # 11. Evaluate the Model on the Test Set
-    evaluate_model(model, test_loader, device, save_path=method_dir)
+    results_text_path = os.path.join(method_dir, 'result.txt')
+
+    evaluate_model(model, test_loader, device, save_path=results_text_path)
 
     encoded_features_train, train_labels = extract_encoded_features_from_combined_model(model, train_loader, device)
     encoded_features_val, val_labels = extract_encoded_features_from_combined_model(model, val_loader, device)
@@ -904,6 +952,7 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, epochs=2
     plot_pca_tsne(encoded_features_train, train_labels, method='CombinedModel_Train', save_path=method_dir)
     plot_pca_tsne(encoded_features_val, val_labels, method='CombinedModel_Val', save_path=method_dir)
     plot_pca_tsne(encoded_features_test, test_labels, method='CombinedModel_Test', save_path=method_dir)
+
 
 if __name__ == '__main__':
     # Load your dataset
@@ -933,8 +982,16 @@ if __name__ == '__main__':
     print(epochs)
     method = f" new classifer auto encoder representation without sampling ,non independent Inception Auto encoder, approach_num ={approach_num},depth = {depth},lr={lr},ae_epochs = {ae_epochs},mask_prob ={mask_probability}" \
              f"num_filters = {num_filters}"
-    main_with_autoencoder(df, window_size=window, method=method,epochs=epochs,batch_size=batch_size,ae_epochs=ae_epochs,depth=depth,num_filters=num_filters,lr=lr,mask_probability=mask_probability)
-
+    # main_with_autoencoder(df, window_size=window, method=method,epochs=epochs,batch_size=batch_size,ae_epochs=ae_epochs,depth=depth,num_filters=num_filters,lr=lr,mask_probability=mask_probability)
+    labels = list(df['RECORDING_SESSION_LABEL'].unique())
+    for label in labels:
+        print(f"############################LABEL {label}#########################")
+        method = f" non independent Inception Auto encoder, approach_num ={approach_num},depth = {depth},lr={lr},ae_epochs = {ae_epochs},mask_prob ={mask_probability}" \
+                 f"num_filters = {num_filters},ID = {label}"
+        new_df = df[df['RECORDING_SESSION_LABEL'] == label]
+        main_with_autoencoder(new_df, window_size=window, method=method, epochs=epochs, batch_size=batch_size,
+                              ae_epochs=ae_epochs, depth=depth, num_filters=num_filters, lr=lr,
+                              mask_probability=mask_probability)
 
 # test = 13466
 
@@ -953,9 +1010,62 @@ if __name__ == '__main__':
 # The full classification report is:
 #               precision    recall  f1-score   support
 #
-#        False       0.99      1.00      1.00     13253
-#         True       0.00      0.00      0.00        82
+#        False       0.98      1.00      0.99     12107
+#         True       0.00      0.00      0.00       242
 #
-#     accuracy                           0.99     13335
-#    macro avg       0.50      0.50      0.50     13335
-# weighted avg       0.99      0.99      0.99     13335
+#     accuracy                           0.98     12349
+#    macro avg       0.49      0.50      0.49     12349
+# weighted avg       0.96      0.98      0.97     12349
+
+# Confusion Matrix:
+#    Predicted 0  Predicted 1
+# Actual 0   12088       19
+# Actual 1   242        0
+
+
+#first full train ae + cnn with+with cnn W CE
+# Classification Report:
+#               precision    recall  f1-score   support
+#
+#            0       0.87      0.20      0.33     10269
+#            1       0.14      0.80      0.24      1639
+#
+#     accuracy                           0.29     11908
+#    macro avg       0.50      0.50      0.28     11908
+# weighted avg       0.77      0.29      0.32     11908
+# Confusion Matrix:
+#    Predicted 0  Predicted 1
+# Actual 0   2085       8184
+# Actual 1   324        1315
+
+#first full train ae + cnn with+with cnn + CE
+
+# Classification Report:
+#               precision    recall  f1-score   support
+#
+#            0       0.85      0.58      0.69     10269
+#            1       0.12      0.35      0.17      1639
+#
+#     accuracy                           0.55     11908
+#    macro avg       0.48      0.46      0.43     11908
+# weighted avg       0.75      0.55      0.62     11908
+#
+# Confusion Matrix:
+#    Predicted 0  Predicted 1
+# Actual 0   5940       4329
+# Actual 1   1073       566
+
+#first full train ae + cnn with+with cnn + CE + windows W
+#               precision    recall  f1-score   support
+#
+#            0       0.84      0.59      0.70     10269
+#            1       0.11      0.32      0.17      1639
+#
+#     accuracy                           0.55     11908
+#    macro avg       0.48      0.46      0.43     11908
+# weighted avg       0.74      0.55      0.62     11908
+#
+# Confusion Matrix:
+#    Predicted 0  Predicted 1
+# Actual 0   6062       4207
+# Actual 1   1113       526
