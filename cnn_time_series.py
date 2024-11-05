@@ -134,7 +134,7 @@ def create_windows(grouped,window_size):
 def resample_func(time_series_df,interval):
     resampled_data = []
 
-    for (session, trial), group in time_series_df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']):
+    for (session, trial), group in time_series_df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX','CURRENT_FIX_INDEX']):
         group = group.set_index('Cumulative_Time')
 
         # Resample features to a fixed interval (e.g., 1 second)
@@ -390,7 +390,7 @@ def plot_confusion_matrix(y_true, y_pred,save_path=''):
     print(f"Actual 1   {cm[1, 0]:<10} {cm[1, 1]:<10}")
 
 def main(df, window_size=5, method='', resample=False,epochs=100,batch_size=32):
-    interval = '10ms'
+    interval = '30ms'
 
     # Step 1: Split the dataset
     train_df, test_df = split_train_test(
@@ -400,12 +400,12 @@ def main(df, window_size=5, method='', resample=False,epochs=100,batch_size=32):
         random_state=0
     )
     print("Number of True and False in y_test:")
-    print(test_df.value_counts())
+    # print(test_df.value_counts())
     # Step 2: Create time series data for training and testing
     X_train, Y_train, window_weight_train = create_time_series(train_df, interval, window_size=window_size, resample=resample)
     X_test, Y_test, window_weights_test = create_time_series(test_df, interval, window_size=window_size, resample=resample)
     print("Number of True and False in y_test:")
-    print(pd.Series(Y_test).value_counts())
+    # print(pd.Series(Y_test).value_counts())
     # Step 3: Compute class weights for handling class imbalance
     class_weights_dict = get_class_weights(Y_train)
     print(class_weights_dict)
@@ -461,15 +461,14 @@ if __name__ == '__main__':
     ident_sub_rec = IdentSubRec(**categorized_rad_init_kwargs)
     df = ident_sub_rec.df
 
-    main(df, window_size=50, method=f'cnn_window_size=50')
-    # main(df,window_size=window,method='add weighted random sampler and dialconv')
-    # labels = list(df['RECORDING_SESSION_LABEL'].unique())
-    #
-    #
-    # for label in labels[1:]:
-    #     print(label)
 
 
+    labels = list(df['RECORDING_SESSION_LABEL'].unique())
+    for label in labels:
+        print(f"############################LABEL {label}#########################")
+
+        new_df = df[df['RECORDING_SESSION_LABEL'] == label]
+        main(df,50,f"test_all_ids_{label}",False)
     #first results without adding class balance to the model:
     #Weighted Precision: 0.9716223333336166
     # Weighted Recall: 0.9608698687517453
@@ -1085,3 +1084,43 @@ if __name__ == '__main__':
 #    Predicted 0  Predicted 1
 # Actual 0   9398       871
 # Actual 1   1580       46
+
+
+# all data:
+# Weighted Precision: 0.8197525878496921
+# Weighted Recall: 0.6475270064030967
+# Weighted F1-score: 0.7111578420904056
+# Macro Precision: 0.5207553334636554
+# Macro Recall: 0.5472387886626581
+# Macro F1-score: 0.49022149796554765
+#               precision    recall  f1-score   support
+#
+#        False       0.90      0.68      0.77    208794
+#         True       0.14      0.42      0.21     25780
+#
+#     accuracy                           0.65    234574
+#    macro avg       0.52      0.55      0.49    234574
+# weighted avg       0.82      0.65      0.71    234574
+#
+# Confusion Matrix:
+#    Predicted 0  Predicted 1
+# Actual 0   141099     67695
+# Actual 1   14986      10794
+
+#
+# The full classification report is:
+#               precision    recall  f1-score   support
+#
+#        False    0.98890   0.93158   0.95939    242504
+#         True    0.03681   0.20006   0.06218      3169
+#
+#     accuracy                        0.92215    245673
+#    macro avg    0.51286   0.56582   0.51078    245673
+# weighted avg    0.97662   0.92215   0.94782    245673
+
+# Confusion Matrix:
+#    Predicted 0  Predicted 1
+# Actual 0   225913     16591
+# Actual 1   2535       634
+#
+# Process finished with exit code 0

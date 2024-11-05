@@ -16,8 +16,8 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
-import CNN_hugging_face
-from CNN_hugging_face import create_time_series, validate_model, plot_confusion_matrix
+import cnn_time_series
+from cnn_time_series import create_time_series, validate_model, plot_confusion_matrix
 from data_process import IdentSubRec
 
 import seaborn as sns
@@ -33,7 +33,7 @@ from torchsampler import ImbalancedDatasetSampler
 TRAIN = True
 
 def split_train_test(df, input_data_points, test_size=0.2, random_state=0):
-    df['group'] = df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']].apply(
+    df['group'] = df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX','CURRENT_FIX_INDEX']].apply(
         lambda row: '_'.join(row.values.astype(str)), axis=1)
     gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
     split_indices = list(gss.split(X=df[input_data_points], y=df['target'], groups=df['group']))[0]
@@ -75,17 +75,6 @@ def apply_input_masking(inputs, mask_probability):
     return masked_inputs
 
 # Function to split the dataset
-def split_train_test_old(time_series_df):
-    df = time_series_df.copy()
-    df['group'] = df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']].apply(
-        lambda row: '_'.join(row.values.astype(str)), axis=1)
-    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-
-    split_indices = list(gss.split(X=df[feature_columns], y=df['target'], groups=df['group']))[0]
-    train_index, test_index = split_indices
-    train_df = df.iloc[train_index]
-    test_df = df.iloc[test_index]
-    return train_df, test_df
 
 
 # Function to compute class weights
@@ -781,7 +770,7 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, epochs=2
             f.write(f"{key}: {value}\n")
 
     # 1. Split the DataFrame into Training and Test DataFrames
-    train_df, test_df = CNN_hugging_face.split_train_test(
+    train_df, test_df = cnn_time_series.split_train_test(
         time_series_df=df,
         input_data_points=feature_columns,
         test_size=0.2,
@@ -957,7 +946,7 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, epochs=2
 if __name__ == '__main__':
     # Load your dataset
     categorized_rad_s1_s18_file_path = 'data/Categorized_Fixation_Data_1_18.csv'
-    approach_num = 6
+    approach_num = 8
     categorized_rad_init_kwargs = dict(
         data_file_path=categorized_rad_s1_s18_file_path,
         test_data_file_path=None,
@@ -971,7 +960,7 @@ if __name__ == '__main__':
 
     ident_sub_rec = IdentSubRec(**categorized_rad_init_kwargs)
     df = ident_sub_rec.df
-    window = 50
+    window = 20
     epochs = 20
     batch_size = 32
     ae_epochs = 100
@@ -980,92 +969,37 @@ if __name__ == '__main__':
     lr = 0.001
     mask_probability = 0.4
     print(epochs)
-    method = f" new classifer auto encoder representation without sampling ,non independent Inception Auto encoder, approach_num ={approach_num},depth = {depth},lr={lr},ae_epochs = {ae_epochs},mask_prob ={mask_probability}" \
+
+    method = f" add CURRENT_FIX_INDEX to split ,non independent Inception Auto encoder, approach_num ={approach_num},depth = {depth},lr={lr},ae_epochs = {ae_epochs},mask_prob ={mask_probability}" \
              f"num_filters = {num_filters}"
-    # main_with_autoencoder(df, window_size=window, method=method,epochs=epochs,batch_size=batch_size,ae_epochs=ae_epochs,depth=depth,num_filters=num_filters,lr=lr,mask_probability=mask_probability)
-    labels = list(df['RECORDING_SESSION_LABEL'].unique())
-    for label in labels:
-        print(f"############################LABEL {label}#########################")
-        method = f" non independent Inception Auto encoder, approach_num ={approach_num},depth = {depth},lr={lr},ae_epochs = {ae_epochs},mask_prob ={mask_probability}" \
-                 f"num_filters = {num_filters},ID = {label}"
-        new_df = df[df['RECORDING_SESSION_LABEL'] == label]
-        main_with_autoencoder(new_df, window_size=window, method=method, epochs=epochs, batch_size=batch_size,
+    new_df = df[df['RECORDING_SESSION_LABEL'] == 1]
+
+    main_with_autoencoder(new_df, window_size=window, method=method, epochs=epochs, batch_size=batch_size,
                               ae_epochs=ae_epochs, depth=depth, num_filters=num_filters, lr=lr,
                               mask_probability=mask_probability)
 
-# test = 13466
-
-# Classification Report: 10 epochs ae
-# {'window_size': 100, 'method': ' new classifer auto encoder representation without sampling ,non independent Inception Auto encoder, approach_num =6,depth = 4,lr=0.001,ae_epochs = 200,mask_prob =0.4num_filters = 32', 'resample': True, 'epochs': 10, 'batch_size': 32, 'ae_epochs': 200, 'in_channels': 6, 'num_filters': 32, 'depth': 4, 'learning_rate': 0.001, 'weight_decay': 0.0001, 'optimizer': 'AdamW', 'scheduler': 'ReduceLROnPlateau', 'mask_probability': 0.4, 'early_stopping_patience': 30, 'approach_num': 6}
-#               precision    recall  f1-score   support
-#
-#            0       0.89      0.33      0.48      9019
-#            1       0.07      0.53      0.12       799
-#
-#     accuracy                           0.34      9818
-#    macro avg       0.48      0.43      0.30      9818
-# weighted avg       0.82      0.34      0.45      9818
-
-# Yakirs
-# The full classification report is:
-#               precision    recall  f1-score   support
-#
-#        False       0.98      1.00      0.99     12107
-#         True       0.00      0.00      0.00       242
-#
-#     accuracy                           0.98     12349
-#    macro avg       0.49      0.50      0.49     12349
-# weighted avg       0.96      0.98      0.97     12349
-
-# Confusion Matrix:
-#    Predicted 0  Predicted 1
-# Actual 0   12088       19
-# Actual 1   242        0
-
-
-#first full train ae + cnn with+with cnn W CE
+    # main_with_autoencoder(df, window_size=window, method=method,epochs=epochs,batch_size=batch_size,ae_epochs=ae_epochs,depth=depth,num_filters=num_filters,lr=lr,mask_probability=mask_probability)
+    # labels = list(df['RECORDING_SESSION_LABEL'].unique())
+    # for label in labels:
+    #     print(f"############################LABEL {label}#########################")
+    #     method = f" non independent Inception Auto encoder, approach_num ={approach_num},depth = {depth},lr={lr},ae_epochs = {ae_epochs},mask_prob ={mask_probability}" \
+    #              f"num_filters = {num_filters},ID = {label}"
+    #     new_df = df[df['RECORDING_SESSION_LABEL'] == label]
+    #     main_with_autoencoder(new_df, window_size=window, method=method, epochs=epochs, batch_size=batch_size,
+    #                           ae_epochs=ae_epochs, depth=depth, num_filters=num_filters, lr=lr,
+    #                           mask_probability=mask_probability)
+    #
 # Classification Report:
 #               precision    recall  f1-score   support
 #
-#            0       0.87      0.20      0.33     10269
-#            1       0.14      0.80      0.24      1639
+#            0       0.98      0.98      0.98     11978
+#            1       0.03      0.03      0.03       187
 #
-#     accuracy                           0.29     11908
-#    macro avg       0.50      0.50      0.28     11908
-# weighted avg       0.77      0.29      0.32     11908
-# Confusion Matrix:
-#    Predicted 0  Predicted 1
-# Actual 0   2085       8184
-# Actual 1   324        1315
-
-#first full train ae + cnn with+with cnn + CE
-
-# Classification Report:
-#               precision    recall  f1-score   support
-#
-#            0       0.85      0.58      0.69     10269
-#            1       0.12      0.35      0.17      1639
-#
-#     accuracy                           0.55     11908
-#    macro avg       0.48      0.46      0.43     11908
-# weighted avg       0.75      0.55      0.62     11908
+#     accuracy                           0.97     12165
+#    macro avg       0.51      0.51      0.51     12165
+# weighted avg       0.97      0.97      0.97     12165
 #
 # Confusion Matrix:
 #    Predicted 0  Predicted 1
-# Actual 0   5940       4329
-# Actual 1   1073       566
-
-#first full train ae + cnn with+with cnn + CE + windows W
-#               precision    recall  f1-score   support
-#
-#            0       0.84      0.59      0.70     10269
-#            1       0.11      0.32      0.17      1639
-#
-#     accuracy                           0.55     11908
-#    macro avg       0.48      0.46      0.43     11908
-# weighted avg       0.74      0.55      0.62     11908
-#
-# Confusion Matrix:
-#    Predicted 0  Predicted 1
-# Actual 0   6062       4207
-# Actual 1   1113       526
+# Actual 0   11795      183
+# Actual 1   181        6

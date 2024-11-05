@@ -115,7 +115,6 @@ class IdentSubRec:
         )
 
         # # DEBUG! DEBUG! DEBUG!!! For testing - keep only one participant to test on.
-        # self.df = self.df[self.df['RECORDING_SESSION_LABEL'] == 1]
 
         # Only used if a test data file path is provided:
         self.test_df = None if test_data_file_path is None else self.get_df_for_training(self.test_data_file_path,
@@ -430,11 +429,11 @@ class IdentSubRec:
 
             # Group by the three keys and split by them - RECORDING_SESSION_LABEL, TRIAL_INDEX, CURRENT_FIX_INDEX:
             print_and_log('Splitting train / test data by RECORDING_SESSION_LABEL, TRIAL_INDEX, CURRENT_FIX_INDEX')
-
-            self.df['group'] = self.df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']].apply(
-                lambda row: '_'.join(row.values.astype(str)), axis=1)
-            # self.df['group'] = self.df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_INDEX']].apply(
+            #
+            # self.df['group'] = self.df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']].apply(
             #     lambda row: '_'.join(row.values.astype(str)), axis=1)
+            self.df['group'] = self.df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_INDEX']].apply(
+                lambda row: '_'.join(row.values.astype(str)), axis=1)
             gss = GroupShuffleSplit(n_splits=1,
                                     test_size=test_size,
                                     random_state=random_state)
@@ -758,7 +757,43 @@ class IdentSubRec:
         recall = np.mean(recall_scores, axis=0)
         f1 = np.mean(f1_scores, axis=0)
         roc_auc_score_res = np.mean(roc_auc_scores)
+        cm = confusion_matrix(y_test, y_pred)
+
+        print("Confusion Matrix:")
+        print("   Predicted 0  Predicted 1")
+        print(f"Actual 0   {cm[0, 0]:<10} {cm[0, 1]:<10}")
+        print(f"Actual 1   {cm[1, 0]:<10} {cm[1, 1]:<10}")
         return acc, precision, recall, f1, roc_auc_score_res
+# label 2
+# The full classification report is:
+#               precision    recall  f1-score   support
+#
+#        False    0.98782   0.99808   0.99293      9915
+#         True    0.00000   0.00000   0.00000       122
+#
+#     accuracy                        0.98595     10037
+#    macro avg    0.49391   0.49904   0.49646     10037
+# weighted avg    0.97581   0.98595   0.98086     10037
+# Confusion Matrix:
+#    Predicted 0  Predicted 1
+# Actual 0   9896       19
+# Actual 1   122        0
+
+# label 3
+# The full classification report is:
+#               precision    recall  f1-score   support
+#
+#        False    0.97227   0.99856   0.98524     14609
+#         True    0.08696   0.00478   0.00907       418
+#
+#     accuracy                        0.97092     15027
+#    macro avg    0.52962   0.50167   0.49716     15027
+# weighted avg    0.94765   0.97092   0.95809     15027
+#
+# Confusion Matrix:
+#    Predicted 0  Predicted 1
+# Actual 0   14588      21
+# Actual 1   416        2
 
 
 if __name__ == '__main__':
@@ -802,75 +837,23 @@ if __name__ == '__main__':
         normalize=True,
         remove_surrounding_to_hits=0,
         update_surrounding_to_hits=0,
-        approach_num=6,
+        approach_num=approach_num,
     )
     ident_sub_rec = IdentSubRec(**init_kwargs)
 
-
     # Baseline parameters:
     train_kwargs = dict(test_size=0.2, num_leaves=300, learning_rate=0.1, min_child_samples=44, print_stats=print_stats,
-                        plot_confusion_matrix=False, save_plot=False, cross_validate=True, cross_validation_n_splits=10,
+                        plot_confusion_matrix=False, save_plot=False, cross_validate=False, cross_validation_n_splits=10,
                         split_by_participants=False, completely_random_data_split=False, smote_type=SmoteType.none,
                         save_models=False, save_predicted_as_true_data_rows=False,
                         predict_all_train_data=predict_all_train_data)
-    # Regular train:
     ident_sub_rec.train(**train_kwargs)
 
-    if train_all_test_one := False:
-        # Train on all participants and test every time on a different participant:
-        unique_participants = ident_sub_rec.df['RECORDING_SESSION_LABEL'].unique()
-        print_and_log(f'Unique participants are: {unique_participants}')
-        pbar = tqdm(iterable=unique_participants,
-                    desc='Iterating over all participants, testing on one',
-                    total=len(unique_participants))
-        testing_on_to_training_on_dict = {
-            1: [2, 3, 4, 6, 7, 8, 9, 19, 23, 24, 25, 30, 33, 34, 35, 36, 37],
-            2: [19, 23, 34, 36],
-            3: [2, 6, 7, 19, 24, 30, 34],
-            4: [1, 3, 6, 30, 33, 34, 35, 36, 37],
-            6: [2, 3, 4, 7, 8, 9, 19, 23, 24, 25, 30, 36, 37],
-            7: [4, 6, 37],
-            8: [3, 6, 24, 25],
-            9: [4, 6, 33],
-            19: [6, 7, 8, 9, 24, 33, 35, 37],
-            23: [1, 2, 3, 6, 7, 8, 9, 19, 24, 25, 33, 35, 36, 37],
-            24: [1, 2, 3, 6, 7, 8, 9, 19, 23, 25, 30, 33, 34, 35, 36, 37],
-            25: [9, 24, 34],
-            30: [4, 36],
-            33: [2, 3, 6, 7, 9, 23, 24, 25, 30, 34, 35, 36, 37],
-            35: [1, 2, 3, 7, 8, 19, 23, 25, 30, 33, 34],
-            36: [3, 4, 7, 9, 34],
-            37: [1, 2, 3, 6, 8, 9, 19, 24, 25, 30, 34, 35, 36]
-        }
-        for participant in pbar:
-            if participant <= 34:
-                continue
-            to_train_on = testing_on_to_training_on_dict[participant]
-            desc = f'Training on best combination without test one - {to_train_on}, testing on participant {participant}'
-            pbar.set_description(desc)
-            train_kwargs['predict_all_train_data'] = True
-            train_kwargs['split_by_participants'] = False
-            train_kwargs['participants_to_train_on'] = to_train_on
-            train_kwargs['participants_to_test_on'] = [participant]
-            # train_kwargs['print_stats'] = False
-            print_and_log(desc)
-            ident_sub_rec.train(**train_kwargs)
-            print_and_log(f'Finished running on participant {participant}')
-            print_and_log('=' * 100)
-
-
-
-    if run_single_participant_tests := False:
-        # Train with one participant once, then with this participant and one of the others, for all the others.
-        # At the end, run with all participants that improved the performance of the first participant.
-        unique_participants = ident_sub_rec.df['RECORDING_SESSION_LABEL'].unique()
-        train_kwargs['split_by_participants'] = False
-        train_kwargs['predict_all_train_data'] = True
-        for main_participant in unique_participants:
-            other_participants = [participant for participant in unique_participants if participant != main_participant]
-
-            # train_kwargs['participants_to_train_on'] = other_participants
-            train_kwargs['participants_to_train_on'] = [main_participant]
-            train_kwargs['participants_to_test_on'] = [main_participant]
-            print_and_log(f"Running on train participant(s) {train_kwargs['participants_to_train_on']}, test participant {train_kwargs['participants_to_test_on']}")
-            first_participant_stats = ident_sub_rec.train(**train_kwargs)
+    # Regular train:
+    # labels = list(ident_sub_rec.df['RECORDING_SESSION_LABEL'].unique())
+    # for label in labels:
+    #     ident_sub_rec = IdentSubRec(**init_kwargs)
+    #     print(f"############################LABEL {label}#########################")
+    #     ident_sub_rec.df = ident_sub_rec.df[ident_sub_rec.df['RECORDING_SESSION_LABEL'] == label]
+    #     ident_sub_rec.train(**train_kwargs)
+    #
