@@ -697,7 +697,7 @@ def train_cnn(model, train_loader, val_loader, criterion, optimizer, epochs, dev
 
 
 
-def evaluate_model(model, test_loader, device,save_path=''):
+def evaluate_model(model, test_loader, device,save_path='',threshold = 0.5):
     model.eval()
     all_preds = []
     all_labels = []
@@ -705,8 +705,11 @@ def evaluate_model(model, test_loader, device,save_path=''):
         for inputs, labels in test_loader:
             inputs = inputs.to(device)
             labels = labels.to(device)
-            outputs = model(inputs)
-            _, preds = torch.max(outputs, 1)
+            outputs = model(inputs)[:, 0]
+            probabilities = torch.sigmoid(outputs).squeeze()
+            threshold = threshold
+            preds = (probabilities >= threshold).long()
+            # _, preds = torch.max(outputs, 1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 
@@ -839,7 +842,7 @@ class CombinedModel(nn.Module):
         return logits
 
 def main_with_autoencoder(df, window_size=5, method='', resample=False, classification_epochs=20, batch_size=32, ae_epochs=100,
-                          depth=4, num_filters=32, lr=0.001, mask_probability=0.4, early_stopping_patience=30,alpha=2.0,gamma=2.0):
+                          depth=4, num_filters=32, lr=0.001, mask_probability=0.4, early_stopping_patience=30,threshold = 0.5):
     seed_everything(0)
     interval = '30ms'
 
@@ -1048,7 +1051,7 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
     # 11. Evaluate the Model on the Test Set
     results_text_path = os.path.join(method_dir, 'result.txt')
 
-    evaluate_model(model, test_loader, device, save_path=results_text_path)
+    evaluate_model(model, test_loader, device, results_text_path,threshold)
     #
     # encoded_features_train, train_labels = extract_encoded_features_from_combined_model(model, train_loader, device)
     # encoded_features_val, val_labels = extract_encoded_features_from_combined_model(model, val_loader, device)
@@ -1087,13 +1090,14 @@ if __name__ == '__main__':
     lr = 0.001
     mask_probability = 0.4
     participant = 1
+    threshold = 0.9
     method = f" Add GRU to encoder decoder , approach_num ={approach_num},depth = {depth},lr={lr},ae_epochs = {ae_epochs},mask_prob ={mask_probability}" \
              f"num_filters = {num_filters},participant = {1}"
     new_df = df[df['RECORDING_SESSION_LABEL'] == participant]
 
     main_with_autoencoder(new_df, window_size=window, method=method, classification_epochs=classification_epochs, batch_size=batch_size,
                               ae_epochs=ae_epochs, depth=depth, num_filters=num_filters, lr=lr,
-                              mask_probability=mask_probability,alpha=2,gamma=2)
+                              mask_probability=mask_probability,threshold =threshold)
 
 
 
@@ -1137,3 +1141,17 @@ if __name__ == '__main__':
 #    Predicted 0  Predicted 1
 # Actual 0   7050       3219
 # Actual 1   1133       493
+
+
+
+# Classification Report: threshold 0.9
+#               precision    recall  f1-score   support
+#            0       0.88      0.84      0.86     10269
+#            1       0.22      0.28      0.25      1626
+#     accuracy                           0.76     11895
+#    macro avg       0.55      0.56      0.55     11895
+# weighted avg       0.79      0.76      0.78     11895
+# Confusion Matrix:
+#    Predicted 0  Predicted 1
+# Actual 0   8640       1629
+# Actual 1   1169       457
