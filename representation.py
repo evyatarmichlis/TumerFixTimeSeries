@@ -30,23 +30,12 @@ import torch
 from torchsampler import ImbalancedDatasetSampler
 
 
-TRAIN = True
+TRAIN = False
 
-def split_train_test(df, input_data_points, test_size=0.2, random_state=0):
-    df['group'] = df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX','CURRENT_FIX_INDEX']].apply(
-        lambda row: '_'.join(row.values.astype(str)), axis=1)
-    gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
-    split_indices = list(gss.split(X=df[input_data_points], y=df['target'], groups=df['group']))[0]
-    train_index, test_index = split_indices
-    x_train = df.iloc[train_index]
-    x_test = df.iloc[test_index]
-    y_train = df['target'].iloc[train_index]
-    y_test = df['target'].iloc[test_index]
-    return x_train, x_test, y_train, y_test
 
 def seed_everything(seed):
-    random.seed(seed)  # Python random module.
-    np.random.seed(seed)  # Numpy module.
+    random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
@@ -100,6 +89,30 @@ class WeightedCrossEntropyLoss(nn.Module):
         log_probs = torch.nn.functional.log_softmax(inputs, dim=1)
         weighted_loss = -weights * log_probs[range(len(targets)), targets]
         return weighted_loss.mean()
+
+
+
+
+class ModifiedCrossEntropyLoss(nn.Module):
+    def __init__(self, weight=None, alpha=1.0, gamma=1.0):
+        super(ModifiedCrossEntropyLoss, self).__init__()
+        self.weight = weight  # Class weights, if any
+        self.alpha = alpha  # Scaling factor for false positives
+        self.gamma = gamma  # Exponent for scaling (controls curvature)
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, weight=self.weight, reduction='none')
+
+        probs = F.softmax(inputs, dim=1)
+        prob_class1 = probs[:, 1]
+        mask_negatives = (targets == 0)
+
+        scaling_factor = torch.ones_like(ce_loss)
+        scaling_factor[mask_negatives] += self.alpha * torch.pow(prob_class1[mask_negatives], self.gamma)
+
+        weighted_loss = ce_loss * scaling_factor
+
+        return torch.mean(weighted_loss)
 
 
 class FocalLoss(nn.Module):
@@ -163,6 +176,91 @@ def plot_pca_tsne(encoded_features, labels, method='PCA & t-SNE', save_path=''):
     plt.close()
 
 
+class CNNRecurrentEncoder(nn.Module):
+    def __init__(self, in_channels, num_filters, depth, hidden_size, num_layers=1, rnn_type='GRU'):
+        super(CNNRecurrentEncoder, self).__init__()
+        self.conv_encoder = InceptionEncoder(in_channels, num_filters, depth)
+        self.encoder_channels = self.conv_encoder.get_channels()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.rnn_type = rnn_type
+
+        if rnn_type == 'GRU':
+            self.rnn = nn.GRU(input_size=self.encoder_channels[-1], hidden_size=hidden_size, num_layers=num_layers, batch_first=True)
+        elif rnn_type == 'LSTM':
+            self.rnn = nn.LSTM(input_size=self.encoder_channels[-1], hidden_size=hidden_size, num_layers=num_layers, batch_first=True)
+        else:
+            raise ValueError("rnn_type must be 'GRU' or 'LSTM'")
+
+        self.encoded_length = None
+
+    def forward(self, x):
+        x = self.conv_encoder(x)
+        self.encoded_length = x.size(2)
+        x = x.permute(0, 2, 1)  # (batch_size, seq_len, channels)
+        outputs, hidden = self.rnn(x)
+        if isinstance(outputs, tuple):
+            outputs = outputs[0]
+        return outputs, hidden
+
+    def get_channels(self):
+        return self.encoder_channels
+
+    def get_encoded_length(self):
+        return self.encoded_length
+
+
+
+class CNNRecurrentDecoder(nn.Module):
+    def __init__(self, num_filters, depth, encoder_channels, input_length, hidden_size, num_layers=1, rnn_type='GRU'):
+        super(CNNRecurrentDecoder, self).__init__()
+        self.hidden_size = hidden_size
+
+        if rnn_type == 'GRU':
+            self.rnn = nn.GRU(input_size=hidden_size, hidden_size=encoder_channels[-1], num_layers=num_layers, batch_first=True)
+        elif rnn_type == 'LSTM':
+            self.rnn = nn.LSTM(input_size=hidden_size, hidden_size=encoder_channels[-1], num_layers=num_layers, batch_first=True)
+        else:
+            raise ValueError("rnn_type must be 'GRU' or 'LSTM'")
+
+        self.conv_decoder = InceptionDecoder(num_filters=num_filters, depth=depth, encoder_channels=encoder_channels, input_length=input_length)
+
+    def forward(self, x):
+
+        outputs, hidden = self.rnn(x)
+        x = outputs.permute(0, 2, 1)
+        x = self.conv_decoder(x)
+        return x
+
+
+class CNNRecurrentAutoencoder(nn.Module):
+    def __init__(self, in_channels, num_filters, depth, hidden_size, num_layers=1, rnn_type='GRU', input_length=None):
+        super(CNNRecurrentAutoencoder, self).__init__()
+        self.encoder = CNNRecurrentEncoder(
+            in_channels=in_channels,
+            num_filters=num_filters,
+            depth=depth,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            rnn_type=rnn_type
+        )
+        encoder_channels = self.encoder.get_channels()
+        if input_length is None:
+            input_length = self.encoder.get_encoded_length()
+        self.decoder = CNNRecurrentDecoder(
+            num_filters=num_filters,
+            depth=depth,
+            encoder_channels=encoder_channels,
+            input_length=input_length,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            rnn_type=rnn_type
+        )
+
+    def forward(self, x):
+        encoded_outputs, hidden = self.encoder(x)
+        reconstructed_outputs = self.decoder(encoded_outputs)
+        return reconstructed_outputs
 
 
 # Define the Inception Module
@@ -638,6 +736,7 @@ def evaluate_model(model, test_loader, device,save_path=''):
             f.write(f"Actual 0   {cm[0, 0]:<10} {cm[0, 1]:<10}\n")
             f.write(f"Actual 1   {cm[1, 0]:<10} {cm[1, 1]:<10}\n")
 
+
 def train_combined_model(model, train_loader, val_loader, criterion, optimizer, epochs, device, scheduler,
                          save_path, early_stopping_patience, window_weight_train_tensor, window_weight_val_tensor):
     best_val_loss = float('inf')
@@ -732,12 +831,15 @@ class CombinedModel(nn.Module):
         self.classifier = ComplexCNNClassifier(input_dim=128,num_classes=num_classes)
 
     def forward(self, x):
-        x = self.encoder(x)
-        x = self.classifier(x)
-        return x
+        outputs, hidden = self.encoder(x)
+        if isinstance(outputs, tuple):
+            outputs = outputs[0]
+        x = outputs.permute(0, 2, 1)
+        logits = self.classifier(x)
+        return logits
 
-def main_with_autoencoder(df, window_size=5, method='', resample=False, epochs=20, batch_size=32, ae_epochs=100,
-                          depth=4, num_filters=32, lr=0.001, mask_probability=0.4, early_stopping_patience=30):
+def main_with_autoencoder(df, window_size=5, method='', resample=False, classification_epochs=20, batch_size=32, ae_epochs=100,
+                          depth=4, num_filters=32, lr=0.001, mask_probability=0.4, early_stopping_patience=30,alpha=2.0,gamma=2.0):
     seed_everything(0)
     interval = '30ms'
 
@@ -748,7 +850,7 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, epochs=2
         'window_size': window_size,
         'method': method,
         'resample': resample,
-        'epochs': epochs,
+        'classification_epochs': classification_epochs,
         'batch_size': batch_size,
         'ae_epochs': ae_epochs,
         'in_channels': len(feature_columns),
@@ -850,8 +952,23 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, epochs=2
     # Step 6: Initialize and train the autoencoder
     in_channels = len(feature_columns)
     input_length = X_train_tensor.shape[2]  # Get the sequence length from the input tensor
-    autoencoder = InceptionAutoencoder(in_channels=in_channels, input_length=input_length, num_filters=32, depth=4).to(
-        device)
+    # autoencoder = InceptionAutoencoder(in_channels=in_channels, input_length=input_length, num_filters=32, depth=4).to(
+    #     device)
+    hidden_size = 128  # Adjust as needed
+    num_layers = 1  # Adjust as needed
+    rnn_type = 'GRU'  # 'GRU' or 'LSTM'
+
+    # Initialize the CNNRecurrentAutoencoder
+    autoencoder = CNNRecurrentAutoencoder(
+        in_channels=in_channels,
+        num_filters=num_filters,
+        depth=depth,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        rnn_type=rnn_type,
+        input_length=input_length  # Pass the initial input_length here
+    ).to(device)
+
     autoencoder.apply(initialize_weights)
 
     criterion_ae = nn.MSELoss()
@@ -878,6 +995,8 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, epochs=2
 
     autoencoder.load_state_dict(torch.load(best_autoencoder__path))
 
+    # encoded_features_test, test_labels = extract_encoded_features(autoencoder, test_loader, device)
+    # plot_pca_tsne(encoded_features_test, test_labels, method='autoencoder_without_cnn_GRU', save_path=method_dir)
 
     num_classes = 2
     model = CombinedModel(autoencoder, num_classes).to(device)
@@ -908,7 +1027,6 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, epochs=2
     criterion = WeightedCrossEntropyLoss()
 
 
-
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
 
     # 10. Train the Combined Model
@@ -918,11 +1036,11 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, epochs=2
         val_loader,
         criterion,
         optimizer,
-        epochs,
+        classification_epochs,
         device,
         scheduler,
         save_path=method_dir,
-        early_stopping_patience=early_stopping_patience,
+        early_stopping_patience=5,
         window_weight_train_tensor=window_weight_train_tensor,
         window_weight_val_tensor=window_weight_val_tensor
     )
@@ -931,22 +1049,22 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, epochs=2
     results_text_path = os.path.join(method_dir, 'result.txt')
 
     evaluate_model(model, test_loader, device, save_path=results_text_path)
-
-    encoded_features_train, train_labels = extract_encoded_features_from_combined_model(model, train_loader, device)
-    encoded_features_val, val_labels = extract_encoded_features_from_combined_model(model, val_loader, device)
-    encoded_features_test, test_labels = extract_encoded_features_from_combined_model(model, test_loader, device)
-
-    # 13. Visualize Encoded Features using PCA and t-SNE
-    print("Visualizing encoded features using PCA and t-SNE...")
-    plot_pca_tsne(encoded_features_train, train_labels, method='CombinedModel_Train', save_path=method_dir)
-    plot_pca_tsne(encoded_features_val, val_labels, method='CombinedModel_Val', save_path=method_dir)
-    plot_pca_tsne(encoded_features_test, test_labels, method='CombinedModel_Test', save_path=method_dir)
-
+    #
+    # encoded_features_train, train_labels = extract_encoded_features_from_combined_model(model, train_loader, device)
+    # encoded_features_val, val_labels = extract_encoded_features_from_combined_model(model, val_loader, device)
+    # encoded_features_test, test_labels = extract_encoded_features_from_combined_model(model, test_loader, device)
+    #
+    # # # 13. Visualize Encoded Features using PCA and t-SNE
+    # # print("Visualizing encoded features using PCA and t-SNE...")
+    # # plot_pca_tsne(encoded_features_train, train_labels, method='CombinedModel_Train', save_path=method_dir)
+    # # plot_pca_tsne(encoded_features_val, val_labels, method='CombinedModel_Val', save_path=method_dir)
+    # # plot_pca_tsne(encoded_features_test, test_labels, method='CombinedModel_Test', save_path=method_dir)
+    # #
 
 if __name__ == '__main__':
     # Load your dataset
     categorized_rad_s1_s18_file_path = 'data/Categorized_Fixation_Data_1_18.csv'
-    approach_num = 8
+    approach_num = 6
     categorized_rad_init_kwargs = dict(
         data_file_path=categorized_rad_s1_s18_file_path,
         test_data_file_path=None,
@@ -960,23 +1078,24 @@ if __name__ == '__main__':
 
     ident_sub_rec = IdentSubRec(**categorized_rad_init_kwargs)
     df = ident_sub_rec.df
-    window = 20
-    epochs = 20
+    window = 50
+    classification_epochs = 10
     batch_size = 32
     ae_epochs = 100
     depth = 4
     num_filters = 32
     lr = 0.001
     mask_probability = 0.4
-    print(epochs)
+    participant = 1
+    method = f" Add GRU to encoder decoder , approach_num ={approach_num},depth = {depth},lr={lr},ae_epochs = {ae_epochs},mask_prob ={mask_probability}" \
+             f"num_filters = {num_filters},participant = {1}"
+    new_df = df[df['RECORDING_SESSION_LABEL'] == participant]
 
-    method = f" add CURRENT_FIX_INDEX to split ,non independent Inception Auto encoder, approach_num ={approach_num},depth = {depth},lr={lr},ae_epochs = {ae_epochs},mask_prob ={mask_probability}" \
-             f"num_filters = {num_filters}"
-    new_df = df[df['RECORDING_SESSION_LABEL'] == 1]
-
-    main_with_autoencoder(new_df, window_size=window, method=method, epochs=epochs, batch_size=batch_size,
+    main_with_autoencoder(new_df, window_size=window, method=method, classification_epochs=classification_epochs, batch_size=batch_size,
                               ae_epochs=ae_epochs, depth=depth, num_filters=num_filters, lr=lr,
-                              mask_probability=mask_probability)
+                              mask_probability=mask_probability,alpha=2,gamma=2)
+
+
 
     # main_with_autoencoder(df, window_size=window, method=method,epochs=epochs,batch_size=batch_size,ae_epochs=ae_epochs,depth=depth,num_filters=num_filters,lr=lr,mask_probability=mask_probability)
     # labels = list(df['RECORDING_SESSION_LABEL'].unique())
@@ -1003,3 +1122,18 @@ if __name__ == '__main__':
 #    Predicted 0  Predicted 1
 # Actual 0   11795      183
 # Actual 1   181        6
+
+# Classification Report:
+#               precision    recall  f1-score   support
+#
+#            0       0.86      0.69      0.76     10269
+#            1       0.13      0.30      0.18      1626
+#
+#     accuracy                           0.63     11895
+#    macro avg       0.50      0.49      0.47     11895
+# weighted avg       0.76      0.63      0.68     11895
+#
+# Confusion Matrix:
+#    Predicted 0  Predicted 1
+# Actual 0   7050       3219
+# Actual 1   1133       493

@@ -69,26 +69,6 @@ input_data_points = [
     'CURRENT_FIX_COMPONENT_DURATION',
 ]
 
-# def split_train_test(time_series_df):
-#     df =time_series_df
-#     df['group'] = df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']].apply(
-#         lambda row: '_'.join(row.values.astype(str)), axis=1)
-#     gss = GroupShuffleSplit(n_splits=1,
-#                             test_size=0.2,
-#                             random_state=0)
-#
-#     split_indices = list(gss.split(X=df[input_data_points],
-#                                    y=df['target'],
-#                                    groups=df['group']))[0]
-#
-#
-#     train_index, test_index = split_indices
-#     x_train, x_test = df[input_data_points].iloc[train_index], df[input_data_points].iloc[test_index]
-#     y_train, y_test = df['target'].iloc[train_index], df['target'].iloc[test_index]
-#     train_df = pd.concat([x_train, y_train], axis=1)
-#     test_df = pd.concat([x_test, y_test], axis=1)
-#
-#     return train_df, test_df
 
 def create_windows(grouped,window_size):
     max_possible_time_length = 0
