@@ -1,0 +1,21 @@
+project/
+├── models/
+│   ├── __init__.py
+│   ├── autoencoder.py      # Autoencoder related models
+│   ├── classifier.py       # Classifier related models
+│   ├── gan.py             # TimeGAN related code
+│   └── combined.py        # Combined model architecture
+├── utils/
+│   ├── __init__.py
+│   ├── losses.py
+│   ├── gan_utils.py
+│   ├── visualization.py
+│   ├── data_utils.py
+│   └── general_utils.py    # Evaluation and validation functions
+├── metrics/
+│   ├── __init__.py
+│   └── validation.py      # Validation metrics and visualizations
+├── losses/
+│   ├── __init__.py
+│   └── custom_losses.py   # Custom loss functions
+└── main.py               # Main training script

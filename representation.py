@@ -3,6 +3,7 @@ import random
 
 import numpy as np
 import pandas as pd
+import scipy
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.model_selection import GroupShuffleSplit, train_test_split, StratifiedKFold
@@ -17,6 +18,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 
 import cnn_time_series
+from TimeGan.timegan import timegan
 from cnn_time_series import create_time_series, validate_model, plot_confusion_matrix
 from data_process import IdentSubRec
 
@@ -32,7 +34,7 @@ from torchsampler import ImbalancedDatasetSampler
 
 TRAIN = False
 
-
+device = "cuda"
 def seed_everything(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -40,6 +42,7 @@ def seed_everything(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
+
 def initialize_weights(m):
     if isinstance(m, nn.Conv1d) or isinstance(m, nn.ConvTranspose1d):
         nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
@@ -91,28 +94,6 @@ class WeightedCrossEntropyLoss(nn.Module):
         return weighted_loss.mean()
 
 
-
-
-class ModifiedCrossEntropyLoss(nn.Module):
-    def __init__(self, weight=None, alpha=1.0, gamma=1.0):
-        super(ModifiedCrossEntropyLoss, self).__init__()
-        self.weight = weight  # Class weights, if any
-        self.alpha = alpha  # Scaling factor for false positives
-        self.gamma = gamma  # Exponent for scaling (controls curvature)
-
-    def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, weight=self.weight, reduction='none')
-
-        probs = F.softmax(inputs, dim=1)
-        prob_class1 = probs[:, 1]
-        mask_negatives = (targets == 0)
-
-        scaling_factor = torch.ones_like(ce_loss)
-        scaling_factor[mask_negatives] += self.alpha * torch.pow(prob_class1[mask_negatives], self.gamma)
-
-        weighted_loss = ce_loss * scaling_factor
-
-        return torch.mean(weighted_loss)
 
 
 class FocalLoss(nn.Module):
@@ -609,19 +590,7 @@ def validate_autoencoder(model, val_loader, criterion, epoch, running_loss, trai
     print(f"Epoch {epoch + 1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
     return avg_val_loss
 # Define the classification model using extracted features
-class ClassificationHead(nn.Module):
-    def __init__(self, input_dim, num_classes):
-        super(ClassificationHead, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 128)
-        self.bn1 = nn.BatchNorm1d(128)
-        self.dropout = nn.Dropout(0.3)
-        self.fc2 = nn.Linear(128, num_classes)
 
-    def forward(self, x):
-        x = F.relu(self.bn1(self.fc1(x)))
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return x
 
 # Function to train the classifier
 def train_classifier(model, train_loader, val_loader, criterion, optimizer, epochs, device):
@@ -841,8 +810,275 @@ class CombinedModel(nn.Module):
         logits = self.classifier(x)
         return logits
 
-def main_with_autoencoder(df, window_size=5, method='', resample=False, classification_epochs=20, batch_size=32, ae_epochs=100,
-                          depth=4, num_filters=32, lr=0.001, mask_probability=0.4, early_stopping_patience=30,threshold = 0.5):
+
+def validate_synthetic_data(original_data, synthetic_data, save_dir):
+    """
+    Comprehensive validation of synthetic data quality through various metrics and visualizations.
+
+    Args:
+        original_data: Original minority class data (numpy array of shape [n_samples, seq_len, n_features])
+        synthetic_data: Generated synthetic data (same shape as original_data)
+        save_dir: Directory to save validation results and plots
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Open a file to write statistical results
+    with open(os.path.join(save_dir, 'validation_metrics.txt'), 'w') as f:
+        f.write("Synthetic Data Validation Metrics\n")
+        f.write("================================\n\n")
+
+        # Basic shape information
+        f.write(f"Data Shapes:\n")
+        f.write(f"Original data: {original_data.shape}\n")
+        f.write(f"Synthetic data: {synthetic_data.shape}\n\n")
+
+        # Statistical moments for each feature
+        f.write("Statistical Moments per Feature:\n")
+        for feature_idx in range(original_data.shape[2]):
+            orig_feat = original_data[:, :, feature_idx].flatten()
+            syn_feat = synthetic_data[:, :, feature_idx].flatten()
+
+            f.write(f"\nFeature {feature_idx}:\n")
+            f.write(f"Mean - Original: {np.mean(orig_feat):.4f}, Synthetic: {np.mean(syn_feat):.4f}\n")
+            f.write(f"Std  - Original: {np.std(orig_feat):.4f}, Synthetic: {np.std(syn_feat):.4f}\n")
+            f.write(
+                f"Skew - Original: {scipy.stats.skew(orig_feat):.4f}, Synthetic: {scipy.stats.skew(syn_feat):.4f}\n")
+            f.write(
+                f"Kurt - Original: {scipy.stats.kurtosis(orig_feat):.4f}, Synthetic: {scipy.stats.kurtosis(syn_feat):.4f}\n")
+
+    # Create visualizations
+    _plot_feature_distributions(original_data, synthetic_data, save_dir)
+    _plot_temporal_patterns(original_data, synthetic_data, save_dir)
+    _plot_correlation_matrices(original_data, synthetic_data, save_dir)
+    _plot_pca_analysis(original_data, synthetic_data, save_dir)
+
+
+def _plot_feature_distributions(original_data, synthetic_data, save_dir):
+    """Plot distribution comparisons for each feature."""
+    n_features = original_data.shape[2]
+    n_cols = min(3, n_features)
+    n_rows = (n_features + n_cols - 1) // n_cols
+
+    plt.figure(figsize=(6 * n_cols, 4 * n_rows))
+    for i in range(n_features):
+        plt.subplot(n_rows, n_cols, i + 1)
+
+        # Plot histograms
+        plt.hist(original_data[:, :, i].flatten(), bins=50, alpha=0.5,
+                 density=True, label='Original', color='blue')
+        plt.hist(synthetic_data[:, :, i].flatten(), bins=50, alpha=0.5,
+                 density=True, label='Synthetic', color='red')
+
+        # Add KDE plots
+        sns.kdeplot(data=original_data[:, :, i].flatten(), color='blue', linewidth=2)
+        sns.kdeplot(data=synthetic_data[:, :, i].flatten(), color='red', linewidth=2)
+
+        plt.title(f'Feature {i} Distribution')
+        plt.legend()
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'feature_distributions.png'))
+    plt.close()
+
+
+def _plot_temporal_patterns(original_data, synthetic_data, save_dir):
+    """Plot temporal patterns and autocorrelations."""
+    n_features = original_data.shape[2]
+    n_cols = min(3, n_features)
+    n_rows = (n_features + n_cols - 1) // n_cols * 2  # *2 for time series and autocorr
+
+    plt.figure(figsize=(6 * n_cols, 4 * n_rows))
+    for i in range(n_features):
+        # Time series plot
+        plt.subplot(n_rows, n_cols, i + 1)
+        plt.plot(original_data[0, :, i], label='Original', color='blue', alpha=0.7)
+        plt.plot(synthetic_data[0, :, i], label='Synthetic', color='red', alpha=0.7)
+        plt.title(f'Feature {i} Time Series Example')
+        plt.legend()
+
+        # Autocorrelation plot
+        plt.subplot(n_rows, n_cols, i + 1 + n_features)
+        orig_autocorr = np.correlate(original_data[0, :, i],
+                                     original_data[0, :, i], mode='full')
+        syn_autocorr = np.correlate(synthetic_data[0, :, i],
+                                    synthetic_data[0, :, i], mode='full')
+
+        max_lag = min(50, len(orig_autocorr) // 2)
+        lags = range(max_lag)
+        plt.plot(lags, orig_autocorr[len(orig_autocorr) // 2:len(orig_autocorr) // 2 + max_lag],
+                 label='Original', color='blue')
+        plt.plot(lags, syn_autocorr[len(syn_autocorr) // 2:len(syn_autocorr) // 2 + max_lag],
+                 label='Synthetic', color='red')
+        plt.title(f'Feature {i} Autocorrelation')
+        plt.legend()
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'temporal_patterns.png'))
+    plt.close()
+
+
+def _plot_correlation_matrices(original_data, synthetic_data, save_dir):
+    """Plot and compare correlation matrices."""
+    # Calculate correlation matrices
+    orig_corr = np.corrcoef(original_data.reshape(-1, original_data.shape[2]).T)
+    syn_corr = np.corrcoef(synthetic_data.reshape(-1, synthetic_data.shape[2]).T)
+
+    # Plot
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    sns.heatmap(orig_corr, ax=ax1, cmap='coolwarm', vmin=-1, vmax=1, center=0,
+                annot=True, fmt='.2f', square=True)
+    ax1.set_title('Original Data Correlation Matrix')
+
+    sns.heatmap(syn_corr, ax=ax2, cmap='coolwarm', vmin=-1, vmax=1, center=0,
+                annot=True, fmt='.2f', square=True)
+    ax2.set_title('Synthetic Data Correlation Matrix')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'correlation_matrices.png'))
+    plt.close()
+
+
+def _plot_pca_analysis(original_data, synthetic_data, save_dir):
+    """Perform and visualize PCA analysis."""
+    # Reshape data for PCA
+    orig_reshaped = original_data.reshape(-1, original_data.shape[2])
+    syn_reshaped = synthetic_data.reshape(-1, synthetic_data.shape[2])
+
+    # Combine data for PCA
+    combined_data = np.vstack([orig_reshaped, syn_reshaped])
+
+    # Perform PCA
+    pca = PCA(n_components=2)
+    combined_pca = pca.fit_transform(combined_data)
+
+    # Split back into original and synthetic
+    n_orig = orig_reshaped.shape[0]
+    orig_pca = combined_pca[:n_orig]
+    syn_pca = combined_pca[n_orig:]
+
+    # Plot
+    plt.figure(figsize=(8, 6))
+    plt.scatter(orig_pca[:, 0], orig_pca[:, 1], alpha=0.5, label='Original', color='blue')
+    plt.scatter(syn_pca[:, 0], syn_pca[:, 1], alpha=0.5, label='Synthetic', color='red')
+    plt.title('PCA Analysis of Original vs Synthetic Data')
+    plt.xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
+    plt.ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
+    plt.legend()
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'pca_analysis.png'))
+    plt.close()
+
+def train_time_gan(X_minority, device, method_dir, params):
+    """
+    Train TimeGAN and generate synthetic data.
+
+    Args:
+        X_minority: Minority class samples to learn from
+        device: torch device
+        method_dir: Directory to save results
+        params: GAN parameters
+
+    Returns:
+        synthetic_data: Generated synthetic samples
+    """
+    print("Training TimeGAN...")
+
+    # Convert data format if needed
+    ori_data = np.asarray(X_minority)
+
+    # TimeGAN parameters
+    parameters = {
+        'module': params.get('module', 'gru'),
+        'hidden_dim': params.get('hidden_dim', 24),
+        'num_layer': params.get('num_layer', 3),
+        'iterations': params.get('iterations', 1000),
+        'batch_size': params.get('batch_size', 128),
+        'metric_iterations': params.get('metric_iterations', 10)
+    }
+
+    # Save initial parameters
+    with open(os.path.join(method_dir, 'timegan_params.txt'), 'w') as f:
+        for key, value in parameters.items():
+            f.write(f"{key}: {value}\n")
+
+    # Train TimeGAN
+    print("Original data shape:", ori_data.shape)
+    generated_data = timegan(ori_data, parameters)
+
+    return generated_data
+
+
+
+
+def generate_balanced_data_with_gan(X_train_scaled, Y_train, window_weight_train, method_dir, device):
+    """
+    Generate synthetic data using TimeGAN to balance the dataset.
+
+    Args:
+        X_train_scaled: Scaled training data
+        Y_train: Training labels
+        window_weight_train: Window weights for training data
+        method_dir: Directory to save validation plots
+        device: torch device
+
+    Returns:
+        tuple: (balanced_X, balanced_Y, balanced_weights)
+    """
+    print("Starting TimeGAN data generation process...")
+
+    # Find minority class samples
+    minority_indices = np.where(Y_train == 1)[0]
+    majority_indices = np.where(Y_train == 0)[0]
+    X_minority = X_train_scaled[minority_indices]
+
+    # Calculate how many synthetic samples needed
+    num_synthetic_needed = len(majority_indices) - len(minority_indices)
+    print(f"Need to generate {num_synthetic_needed} synthetic samples")
+
+    # TimeGAN parameters
+    gan_params = {
+        'module': 'gru',
+        'hidden_dim': 24,
+        'num_layer': 3,
+        'iterations': 1000,  # You might want to adjust this
+        'batch_size': 128,
+        'metric_iterations': 10
+    }
+
+    # Train GAN and generate synthetic data
+    synthetic_data = train_time_gan(X_minority, device, method_dir, gan_params)
+
+    # Trim synthetic data if needed
+    if len(synthetic_data) > num_synthetic_needed:
+        synthetic_data = synthetic_data[:num_synthetic_needed]
+    elif len(synthetic_data) < num_synthetic_needed:
+        print(f"Warning: Generated only {len(synthetic_data)} samples out of {num_synthetic_needed} needed")
+
+    # Combine original and synthetic data
+    X_balanced = np.concatenate([X_train_scaled, synthetic_data])
+    Y_balanced = np.concatenate([Y_train, np.ones(len(synthetic_data))])
+    weights_balanced = np.concatenate([window_weight_train, np.ones(len(synthetic_data))])
+
+    # Print class distribution
+    print("\nClass distribution:")
+    print(f"Original - {np.bincount(Y_train)}")
+    print(f"Balanced - {np.bincount(Y_balanced)}")
+
+    # Validate synthetic data
+    gan_validation_dir = os.path.join(method_dir, 'gan_validation')
+    os.makedirs(gan_validation_dir, exist_ok=True)
+    validate_synthetic_data(X_minority, synthetic_data, gan_validation_dir)
+
+    return X_balanced, Y_balanced, weights_balanced
+
+
+def main_with_autoencoder(df, window_size=5, method='', resample=False, classification_epochs=20, batch_size=32,
+                          ae_epochs=100,
+                          depth=4, num_filters=32, lr=0.001, mask_probability=0.4, early_stopping_patience=30,
+                          threshold=0.5,
+                          use_gan=False):
     seed_everything(0)
     interval = '30ms'
 
@@ -865,103 +1101,53 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
         'scheduler': 'ReduceLROnPlateau',
         'mask_probability': mask_probability,
         'early_stopping_patience': early_stopping_patience,
-        'approach_num': approach_num,
+        'use_gan': use_gan
     }
 
     print(hyperparameters)
-    hyperparams_file = os.path.join(method_dir, 'hyperparameters.txt')
-    with open(hyperparams_file, 'w') as f:
+    with open(os.path.join(method_dir, 'hyperparameters.txt'), 'w') as f:
         for key, value in hyperparameters.items():
             f.write(f"{key}: {value}\n")
 
-    # 1. Split the DataFrame into Training and Test DataFrames
+    # 1. Initial Data Split
     train_df, test_df = cnn_time_series.split_train_test(
         time_series_df=df,
         input_data_points=feature_columns,
         test_size=0.2,
         random_state=0
     )
-    print("Number of True and False in y_test:")
+    print("Original class distribution in test set:")
     print(test_df["target"].value_counts())
-    # 2. Create Time Series Data for Training and Testing
+
+    # 2. Create Time Series
     X_train_full, Y_train_full, window_weight_train_full = create_time_series(
         train_df, interval, window_size=window_size, resample=resample)
     X_test, Y_test, window_weight_test = create_time_series(
         test_df, interval, window_size=window_size, resample=resample)
-    print("Number of True and False after time series creation y_test:")
-    print(pd.Series(Y_test).value_counts())
 
-    # 3. Split the Training Data into Training and Validation Sets
-    from sklearn.model_selection import train_test_split
-
+    # 3. Split Training/Validation
     X_train, X_val, Y_train, Y_val, window_weight_train, window_weight_val = train_test_split(
         X_train_full, Y_train_full, window_weight_train_full, test_size=0.2, random_state=42, stratify=Y_train_full)
 
-    # 4. Reshape and Scale the Data
-    # Reshape X_train for scaling
-    num_samples_train, seq_len_train, num_features = X_train.shape
-    X_train_reshaped = X_train.reshape(-1, num_features)
-
-    # Reshape X_val for scaling
-    num_samples_val, seq_len_val, _ = X_val.shape
-    X_val_reshaped = X_val.reshape(-1, num_features)  # Use num_features from training data
-
-    # Reshape X_test for scaling
-    num_samples_test, seq_len_test, _ = X_test.shape
-    X_test_reshaped = X_test.reshape(-1, num_features)  # Use num_features from training data
-
-    # Initialize and fit the scaler on the training data
+    # 4. Scale Data
     scaler = StandardScaler()
+    X_train_reshaped = X_train.reshape(-1, X_train.shape[-1])
     scaler.fit(X_train_reshaped)
 
-    # Scale the data
-    X_train_scaled = scaler.transform(X_train_reshaped).reshape(num_samples_train, seq_len_train, num_features)
-    X_val_scaled = scaler.transform(X_val_reshaped).reshape(num_samples_val, seq_len_val, num_features)
-    X_test_scaled = scaler.transform(X_test_reshaped).reshape(num_samples_test, seq_len_test, num_features)
+    X_train_scaled = scaler.transform(X_train_reshaped).reshape(X_train.shape)
+    X_val_scaled = scaler.transform(X_val.reshape(-1, X_val.shape[-1])).reshape(X_val.shape)
+    X_test_scaled = scaler.transform(X_test.reshape(-1, X_test.shape[-1])).reshape(X_test.shape)
 
-    # 5. Prepare Data Loaders for Training
+    # 5. Setup Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Convert scaled data to tensors and permute dimensions
-    X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32).permute(0, 2, 1)
-    X_val_tensor = torch.tensor(X_val_scaled, dtype=torch.float32).permute(0, 2, 1)
-    X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32).permute(0, 2, 1)
-
-    # Convert labels to tensors
-    Y_train_tensor = torch.tensor(Y_train, dtype=torch.long)
-    Y_val_tensor = torch.tensor(Y_val, dtype=torch.long)
-    Y_test_tensor = torch.tensor(Y_test, dtype=torch.long)
-
-    # Create TensorDatasets
-    train_dataset = torch.utils.data.TensorDataset(X_train_tensor, Y_train_tensor)
-    val_dataset = torch.utils.data.TensorDataset(X_val_tensor, Y_val_tensor)
-    test_dataset = torch.utils.data.TensorDataset(X_test_tensor, Y_test_tensor)
-
-    # Compute Sample Weights for the Training Data
-    train_labels_numpy = Y_train
-    classes, class_indices = np.unique(train_labels_numpy, return_inverse=True)
-    class_sample_counts = np.array([np.sum(class_indices == i) for i in range(len(classes))])
-    weights = 1. / class_sample_counts
-
-    samples_weight = weights[class_indices]
-    samples_weight = torch.from_numpy(samples_weight).float()
-    sampler = WeightedRandomSampler(samples_weight, len(samples_weight))
-
-    # Create DataLoaders
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-    # Step 6: Initialize and train the autoencoder
+    # 6. Initialize and Train Autoencoder
     in_channels = len(feature_columns)
-    input_length = X_train_tensor.shape[2]  # Get the sequence length from the input tensor
-    # autoencoder = InceptionAutoencoder(in_channels=in_channels, input_length=input_length, num_filters=32, depth=4).to(
-    #     device)
-    hidden_size = 128  # Adjust as needed
-    num_layers = 1  # Adjust as needed
-    rnn_type = 'GRU'  # 'GRU' or 'LSTM'
+    input_length = X_train.shape[1]
+    hidden_size = 128
+    num_layers = 1
+    rnn_type = 'GRU'
 
-    # Initialize the CNNRecurrentAutoencoder
     autoencoder = CNNRecurrentAutoencoder(
         in_channels=in_channels,
         num_filters=num_filters,
@@ -969,70 +1155,104 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
         hidden_size=hidden_size,
         num_layers=num_layers,
         rnn_type=rnn_type,
-        input_length=input_length  # Pass the initial input_length here
+        input_length=input_length
     ).to(device)
 
     autoencoder.apply(initialize_weights)
+    best_autoencoder_path = os.path.join(method_dir, 'best_autoencoder.pth')
 
-    criterion_ae = nn.MSELoss()
-    optimizer_ae = optim.AdamW(autoencoder.parameters(), lr=0.001, weight_decay=1e-4)
-    scheduler_ae = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_ae, mode='min', factor=0.5, patience=20)
-    best_autoencoder__path = os.path.join(method_dir, 'best_autoencoder.pth')
-
+    # Train or load autoencoder
     if TRAIN:
+        criterion_ae = nn.MSELoss()
+        optimizer_ae = optim.AdamW(autoencoder.parameters(), lr=0.001, weight_decay=1e-4)
+        scheduler_ae = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_ae, mode='min', factor=0.5, patience=20)
+
+        X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32).permute(0, 2, 1)
+        X_val_tensor = torch.tensor(X_val_scaled, dtype=torch.float32).permute(0, 2, 1)
+        Y_train_tensor = torch.tensor(Y_train, dtype=torch.long)
+        Y_val_tensor = torch.tensor(Y_val, dtype=torch.long)
+
+        train_dataset = torch.utils.data.TensorDataset(X_train_tensor, Y_train_tensor)
+        val_dataset = torch.utils.data.TensorDataset(X_val_tensor, Y_val_tensor)
+
+        train_loader_ae = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader_ae = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
         train_autoencoder_with_input_masking(
             autoencoder,
-            train_loader,
-            val_loader,
+            train_loader_ae,
+            val_loader_ae,
             criterion_ae,
             optimizer_ae,
             epochs=ae_epochs,
             device=device,
             scheduler=scheduler_ae,
-            mask_probability=0.4,
+            mask_probability=mask_probability,
             save_path=method_dir,
             early_stopping_patience=early_stopping_patience
         )
+        torch.save(autoencoder.state_dict(), best_autoencoder_path)
 
-        torch.save(autoencoder.state_dict(), best_autoencoder__path)
+    autoencoder.load_state_dict(torch.load(best_autoencoder_path))
 
-    autoencoder.load_state_dict(torch.load(best_autoencoder__path))
+    # 7. Generate Synthetic Data if use_gan is True
+    if use_gan:
+        print("\nGenerating synthetic data using TimeGAN...")
+        X_train_balanced, Y_train_balanced, window_weight_balanced = generate_balanced_data_with_gan(
+            X_train_scaled, Y_train, window_weight_train, method_dir, device)
+        print("Finished generating synthetic data")
+    else:
+        X_train_balanced = X_train_scaled
+        Y_train_balanced = Y_train
+        window_weight_balanced = window_weight_train
 
-    # encoded_features_test, test_labels = extract_encoded_features(autoencoder, test_loader, device)
-    # plot_pca_tsne(encoded_features_test, test_labels, method='autoencoder_without_cnn_GRU', save_path=method_dir)
+    # 8. Prepare Data Loaders for Classification
+    X_train_tensor = torch.tensor(X_train_balanced, dtype=torch.float32).permute(0, 2, 1)
+    X_val_tensor = torch.tensor(X_val_scaled, dtype=torch.float32).permute(0, 2, 1)
+    X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32).permute(0, 2, 1)
 
+    Y_train_tensor = torch.tensor(Y_train_balanced, dtype=torch.long)
+    Y_val_tensor = torch.tensor(Y_val, dtype=torch.long)
+    Y_test_tensor = torch.tensor(Y_test, dtype=torch.long)
+
+    train_dataset = torch.utils.data.TensorDataset(X_train_tensor, Y_train_tensor)
+    val_dataset = torch.utils.data.TensorDataset(X_val_tensor, Y_val_tensor)
+    test_dataset = torch.utils.data.TensorDataset(X_test_tensor, Y_test_tensor)
+
+    if use_gan:
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    else:
+        # Use weighted sampling for imbalanced data
+        train_labels_numpy = Y_train_balanced
+        classes = np.unique(train_labels_numpy)
+        class_weights = compute_class_weight('balanced', classes=classes, y=train_labels_numpy)
+        samples_weight = np.array([class_weights[t] for t in train_labels_numpy])
+        samples_weight = torch.from_numpy(samples_weight).float()
+        sampler = WeightedRandomSampler(samples_weight, len(samples_weight))
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
+
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    # 9. Initialize Combined Model
     num_classes = 2
     model = CombinedModel(autoencoder, num_classes).to(device)
 
-    # 8. Set Different Learning Rates
+    # 10. Setup Optimizer with Different Learning Rates
     encoder_params = list(model.encoder.parameters())
     classifier_params = list(model.classifier.parameters())
-
     optimizer = optim.AdamW([
         {'params': encoder_params, 'lr': lr * 0.1},
         {'params': classifier_params, 'lr': lr}
     ], weight_decay=1e-4)
 
-    # 9. Define Criterion and Scheduler
-    from sklearn.utils.class_weight import compute_class_weight
-
-    # Compute class weights for training data
-    train_labels_numpy = Y_train_tensor.numpy()
-    class_weights = compute_class_weight('balanced', classes=np.unique(train_labels_numpy), y=train_labels_numpy)
-    class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
-
-    # criterion = nn.CrossEntropyLoss() # normal cross entropy
-
-    window_weight_train_tensor = torch.tensor(window_weight_train, dtype=torch.float32).to(device)
+    # 11. Setup Loss and Scheduler
+    window_weight_train_tensor = torch.tensor(window_weight_balanced, dtype=torch.float32).to(device)
     window_weight_val_tensor = torch.tensor(window_weight_val, dtype=torch.float32).to(device)
-
-    # Use the custom loss function
     criterion = WeightedCrossEntropyLoss()
-
-
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
 
-    # 10. Train the Combined Model
+    # 12. Train Combined Model
     train_combined_model(
         model,
         train_loader,
@@ -1048,21 +1268,9 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
         window_weight_val_tensor=window_weight_val_tensor
     )
 
-    # 11. Evaluate the Model on the Test Set
     results_text_path = os.path.join(method_dir, 'result.txt')
+    evaluate_model(model, test_loader, device, results_text_path, threshold)
 
-    evaluate_model(model, test_loader, device, results_text_path,threshold)
-    #
-    # encoded_features_train, train_labels = extract_encoded_features_from_combined_model(model, train_loader, device)
-    # encoded_features_val, val_labels = extract_encoded_features_from_combined_model(model, val_loader, device)
-    # encoded_features_test, test_labels = extract_encoded_features_from_combined_model(model, test_loader, device)
-    #
-    # # # 13. Visualize Encoded Features using PCA and t-SNE
-    # # print("Visualizing encoded features using PCA and t-SNE...")
-    # # plot_pca_tsne(encoded_features_train, train_labels, method='CombinedModel_Train', save_path=method_dir)
-    # # plot_pca_tsne(encoded_features_val, val_labels, method='CombinedModel_Val', save_path=method_dir)
-    # # plot_pca_tsne(encoded_features_test, test_labels, method='CombinedModel_Test', save_path=method_dir)
-    # #
 
 if __name__ == '__main__':
     # Load your dataset
