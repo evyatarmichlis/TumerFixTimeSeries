@@ -9,49 +9,100 @@ import scipy
 from TimeGan.timegan import timegan
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
-import matplotlib.pyplot as plt #3.4.0
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
 import seaborn as sns
+
+
 def validate_synthetic_data(original_data, synthetic_data, save_dir):
     """
     Comprehensive validation of synthetic data quality through various metrics and visualizations.
 
     Args:
-        original_data: Original minority class data (numpy array of shape [n_samples, seq_len, n_features])
+        original_data: Original minority class data (numpy array or list of shape [n_samples, seq_len, n_features])
         synthetic_data: Generated synthetic data (same shape as original_data)
         save_dir: Directory to save validation results and plots
     """
+    if isinstance(original_data, list):
+        original_data = np.array(original_data)
+    if isinstance(synthetic_data, list):
+        synthetic_data = np.array(synthetic_data)
+
+    if len(original_data.shape) == 2:
+        original_data = np.expand_dims(original_data, axis=-1)
+    if len(synthetic_data.shape) == 2:
+        synthetic_data = np.expand_dims(synthetic_data, axis=-1)
+
     os.makedirs(save_dir, exist_ok=True)
 
-    # Open a file to write statistical results
     with open(os.path.join(save_dir, 'validation_metrics.txt'), 'w') as f:
         f.write("Synthetic Data Validation Metrics\n")
         f.write("================================\n\n")
 
-        # Basic shape information
         f.write(f"Data Shapes:\n")
         f.write(f"Original data: {original_data.shape}\n")
         f.write(f"Synthetic data: {synthetic_data.shape}\n\n")
 
-        # Statistical moments for each feature
-        f.write("Statistical Moments per Feature:\n")
-        for feature_idx in range(original_data.shape[2]):
-            orig_feat = original_data[:, :, feature_idx].flatten()
-            syn_feat = synthetic_data[:, :, feature_idx].flatten()
+        try:
+            # Statistical moments for each feature
+            f.write("Statistical Moments per Feature:\n")
+            for feature_idx in range(original_data.shape[2]):
+                orig_feat = original_data[:, :, feature_idx].flatten()
+                syn_feat = synthetic_data[:, :, feature_idx].flatten()
 
-            f.write(f"\nFeature {feature_idx}:\n")
-            f.write(f"Mean - Original: {np.mean(orig_feat):.4f}, Synthetic: {np.mean(syn_feat):.4f}\n")
-            f.write(f"Std  - Original: {np.std(orig_feat):.4f}, Synthetic: {np.std(syn_feat):.4f}\n")
-            f.write(
-                f"Skew - Original: {scipy.stats.skew(orig_feat):.4f}, Synthetic: {scipy.stats.skew(syn_feat):.4f}\n")
-            f.write(
-                f"Kurt - Original: {scipy.stats.kurtosis(orig_feat):.4f}, Synthetic: {scipy.stats.kurtosis(syn_feat):.4f}\n")
+                # Handle potential NaN or infinite values
+                orig_feat = orig_feat[np.isfinite(orig_feat)]
+                syn_feat = syn_feat[np.isfinite(syn_feat)]
 
-    # Create visualizations
-    _plot_feature_distributions(original_data, synthetic_data, save_dir)
-    _plot_temporal_patterns(original_data, synthetic_data, save_dir)
-    _plot_correlation_matrices(original_data, synthetic_data, save_dir)
-    _plot_pca_analysis(original_data, synthetic_data, save_dir)
+                f.write(f"\nFeature {feature_idx}:\n")
 
+                # Basic statistics with error handling
+                try:
+                    f.write(f"Mean - Original: {np.mean(orig_feat):.4f}, Synthetic: {np.mean(syn_feat):.4f}\n")
+                except:
+                    f.write("Error calculating mean\n")
+
+                try:
+                    f.write(f"Std  - Original: {np.std(orig_feat):.4f}, Synthetic: {np.std(syn_feat):.4f}\n")
+                except:
+                    f.write("Error calculating standard deviation\n")
+
+                try:
+                    f.write(
+                        f"Skew - Original: {scipy.stats.skew(orig_feat):.4f}, Synthetic: {scipy.stats.skew(syn_feat):.4f}\n")
+                except:
+                    f.write("Error calculating skewness\n")
+
+                try:
+                    f.write(
+                        f"Kurt - Original: {scipy.stats.kurtosis(orig_feat):.4f}, Synthetic: {scipy.stats.kurtosis(syn_feat):.4f}\n")
+                except:
+                    f.write("Error calculating kurtosis\n")
+
+        except Exception as e:
+            f.write(f"\nError during statistical analysis: {str(e)}\n")
+
+    # Create visualizations with error handling
+    try:
+        _plot_feature_distributions(original_data, synthetic_data, save_dir)
+    except Exception as e:
+        print(f"Error plotting feature distributions: {str(e)}")
+
+    try:
+        _plot_temporal_patterns(original_data, synthetic_data, save_dir)
+    except Exception as e:
+        print(f"Error plotting temporal patterns: {str(e)}")
+
+    try:
+        _plot_correlation_matrices(original_data, synthetic_data, save_dir)
+    except Exception as e:
+        print(f"Error plotting correlation matrices: {str(e)}")
+
+    try:
+        _plot_pca_analysis(original_data, synthetic_data, save_dir)
+    except Exception as e:
+        print(f"Error plotting PCA analysis: {str(e)}")
 
 
 def _plot_feature_distributions(original_data, synthetic_data, save_dir):
@@ -171,6 +222,31 @@ def _plot_pca_analysis(original_data, synthetic_data, save_dir):
     plt.savefig(os.path.join(save_dir, 'pca_analysis.png'))
     plt.close()
 
+
+def create_gan_directory(method_dir):
+    """
+    Create a GAN directory inside the method directory
+
+    Args:
+        method_dir (str): Path to the method directory
+
+    Returns:
+        str: Path to the GAN directory
+    """
+    try:
+        # Create main method directory if it doesn't exist
+        os.makedirs(method_dir, exist_ok=True)
+
+        # Create GAN directory inside method directory
+        gan_dir = os.path.join(method_dir, 'GAN')
+        os.makedirs(gan_dir, exist_ok=True)
+
+        print(f"Successfully created GAN directory at: {gan_dir}")
+        return gan_dir
+
+    except Exception as e:
+        print(f"Error creating directories: {str(e)}")
+        return None
 def train_time_gan(X_minority, device, method_dir, params):
     """
     Train TimeGAN and generate synthetic data.
@@ -188,21 +264,26 @@ def train_time_gan(X_minority, device, method_dir, params):
 
     # Prepare data
     ori_data = np.asarray(X_minority)
-
+    gan_dir = create_gan_directory(method_dir)
     # Set up parameters
     parameters = {
         'module': params.get('module', 'gru'),
         'hidden_dim': params.get('hidden_dim', 24),
-        'num_layer': params.get('num_layer', 3),
-        'iterations': params.get('iterations', 1000),
+        'num_layers': params.get('num_layers', 3),
+        'iterations': params.get('iterations', 10000),
         'batch_size': params.get('batch_size', 128),
-        'metric_iterations': params.get('metric_iterations', 10)
+        'metric_iterations': params.get('metric_iterations', 10),
+        'save_dir': gan_dir
     }
 
     # Save parameters
-    with open(os.path.join(method_dir, 'timegan_params.txt'), 'w') as f:
+
+    parameters['iterations'] = 10000
+    with open(os.path.join(gan_dir, 'timegan_params.txt'), 'w') as f:
         for key, value in parameters.items():
             f.write(f"{key}: {value}\n")
+
+
 
     print("Original data shape:", ori_data.shape)
     generated_data = timegan(ori_data, parameters)

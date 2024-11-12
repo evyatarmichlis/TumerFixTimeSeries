@@ -4,6 +4,8 @@ Utilities for data processing and window creation.
 
 import numpy as np
 import pandas as pd
+from sklearn.model_selection import GroupShuffleSplit
+
 feature_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X', 'CURRENT_FIX_IA_Y',
                    'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT']
 def resample_func(time_series_df, interval, feature_columns=None):
@@ -142,3 +144,26 @@ def create_time_series(time_series_df, interval='30ms', window_size=5, resample=
     return create_windows(grouped, window_size, feature_columns)
 
 
+def split_train_test_for_time_series(time_series_df, input_data_points, test_size=0.2, random_state=0,
+                                     split_columns=None):
+    if split_columns is None:
+        split_columns = ['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']
+    df = time_series_df
+    df['group'] = df[split_columns].apply(
+        lambda row: '_'.join(row.values.astype(str)), axis=1
+    )
+    gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+    split_indices = list(gss.split(X=df[input_data_points], y=df['target'], groups=df['group']))[0]
+
+    train_index, test_index = split_indices
+
+    x_train = df.iloc[train_index].drop(columns='target', errors='ignore')
+    x_test = df.iloc[test_index].drop(columns='target', errors='ignore')
+
+    y_train = df['target'].iloc[train_index]
+    y_test = df['target'].iloc[test_index]
+
+    train_df = pd.concat([x_train, y_train], axis=1)
+    test_df = pd.concat([x_test, y_test], axis=1)
+
+    return train_df, test_df

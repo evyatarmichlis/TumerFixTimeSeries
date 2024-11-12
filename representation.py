@@ -34,6 +34,7 @@ from torchsampler import ImbalancedDatasetSampler
 
 TRAIN = False
 
+
 device = "cuda"
 def seed_everything(seed):
     random.seed(seed)

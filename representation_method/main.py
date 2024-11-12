@@ -29,7 +29,7 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
     """
     Main training pipeline with autoencoder and optional GAN augmentation.
     """
-    # 1. Setup
+    # 1. SetupRemote Python 3.10.13 (sftp://evyatar613@cas602.cs.huji.ac.il:22/cs/labs/josko/evyatar613/Pycharm/TumerFixTimeSeries/tumer_venv/bin/python)
     seed_everything(0)
     interval = '30ms'
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

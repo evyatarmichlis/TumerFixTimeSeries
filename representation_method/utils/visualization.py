@@ -3,6 +3,8 @@ Visualization utilities for model training and evaluation.
 """
 
 import os
+import matplotlib
+matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
