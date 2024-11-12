@@ -796,6 +796,7 @@ class IdentSubRec:
 # Actual 1   416        2
 
 
+
 if __name__ == '__main__':
 
     # If used, will predict all the input train data and save it to a csv file:
@@ -820,7 +821,7 @@ if __name__ == '__main__':
         # six_participants = 'data/OLD_Nodule_Categorized_Fixation_Data_7_12.xlsx'
         # used_data_file_path = six_participants
 
-        approach_num = 8
+        approach_num = 6
         # generalist_expert_med_student_file_path = 'data/group_differentiation/Generalists_Experts_MedStudents_Combined.csv'
         # approach_num = 11
         # used_data_file_path = generalist_expert_med_student_file_path
