@@ -227,7 +227,7 @@ class AutoencoderTrainer(BaseTrainer):
             print(f"Total training time: {total_time:.2f}s")
             print(f"Best validation loss: {self.best_val_loss:.4f} at epoch {best_epoch + 1}")
 
-            # Save final results
+            # Save final results_old
             if self.save_path:
                 # Save training curves
                 self._plot_training_curves(train_losses, val_losses)
@@ -355,7 +355,7 @@ class CombinedModelTrainer(BaseTrainer):
         Returns:
             float: Optimal threshold value
             dict: Detailed metrics for the optimal threshold
-            list: All results for analysis
+            list: All results_old for analysis
         """
         self.model.eval()
         all_probs = []
@@ -406,7 +406,7 @@ class CombinedModelTrainer(BaseTrainer):
                 'tn': tn
             })
 
-        # Filter results based on criteria
+        # Filter results_old based on criteria
         valid_results = [r for r in results if r['fp_tp_ratio'] <= max_fp_tp_ratio
                          and r['recall'] >= min_recall]
 
@@ -419,7 +419,7 @@ class CombinedModelTrainer(BaseTrainer):
             else:
                 best_result = max(results, key=lambda x: x['f1'])
         else:
-            # Among valid results, choose the one with highest F1 score
+            # Among valid results_old, choose the one with highest F1 score
             best_result = max(valid_results, key=lambda x: x['f1'])
 
         # Create visualization of metrics

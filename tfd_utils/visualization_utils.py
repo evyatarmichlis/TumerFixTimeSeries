@@ -145,13 +145,13 @@ def plot_model_stats_per_x_results(x_axis_vals,
                                    font_size: int = 20,
                                    one_plot: bool = True,
                                    save_plot: bool = False):
-    results_names = ['acc', 'precision', 'recall', 'f1']  # This is the first four results from self.train by order
+    results_names = ['acc', 'precision', 'recall', 'f1']  # This is the first four results_old from self.train by order
     ncols = 1  # To calm down PyCharm that I won't use this parameter without initialization.
     if one_plot:
         fig, axs = plt.subplots()
     else:
         nrows, ncols = 2, 2
-        assert nrows * ncols >= len(results_names), 'Must plot at least as much subplots as the used results'
+        assert nrows * ncols >= len(results_names), 'Must plot at least as much subplots as the used results_old'
         fig, axs = plt.subplots(nrows=nrows, ncols=ncols)
     fig.suptitle(title)
     for res_ind, res_name in enumerate(results_names):

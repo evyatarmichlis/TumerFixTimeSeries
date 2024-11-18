@@ -6,7 +6,7 @@ import os
 import numpy as np
 import scipy
 
-from TimeGan.timegan import timegan
+from gans.timegan import timegan
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 import matplotlib
@@ -22,7 +22,7 @@ def validate_synthetic_data(original_data, synthetic_data, save_dir):
     Args:
         original_data: Original minority class data (numpy array or list of shape [n_samples, seq_len, n_features])
         synthetic_data: Generated synthetic data (same shape as original_data)
-        save_dir: Directory to save validation results and plots
+        save_dir: Directory to save validation results_old and plots
     """
     if isinstance(original_data, list):
         original_data = np.array(original_data)
@@ -254,7 +254,7 @@ def train_time_gan(X_minority, device, method_dir, params):
     Args:
         X_minority: Minority class samples
         device: PyTorch device
-        method_dir: Directory to save results
+        method_dir: Directory to save results_old
         params: GAN parameters
 
     Returns:
@@ -299,7 +299,7 @@ def generate_balanced_data_with_gan(X_train_scaled, Y_train, window_weight_train
         X_train_scaled: Scaled training data
         Y_train: Training labels
         window_weight_train: Window weights
-        method_dir: Directory to save results
+        method_dir: Directory to save results_old
         device: PyTorch device
 
     Returns:

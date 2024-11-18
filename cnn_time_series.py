@@ -317,7 +317,7 @@ def print_metrics(precision_weighted, recall_weighted, f1_weighted, precision_ma
     print(f"Macro F1-score: {f1_macro}")
 
 def evaluate_and_save_model(model, X_test, Y_test, device, method):
-    """Evaluate the model and save results."""
+    """Evaluate the model and save results_old."""
     model.eval()
     with torch.no_grad():
         X_test = torch.tensor(X_test, dtype=torch.float32).permute(0, 2, 1).to(device)
@@ -449,7 +449,7 @@ if __name__ == '__main__':
 
         new_df = df[df['RECORDING_SESSION_LABEL'] == label]
         main(df,50,f"test_all_ids_{label}",False)
-    #first results without adding class balance to the model:
+    #first results_old without adding class balance to the model:
     #Weighted Precision: 0.9716223333336166
     # Weighted Recall: 0.9608698687517453
     # Weighted F1-score: 0.9662139812876347
@@ -633,7 +633,7 @@ if __name__ == '__main__':
 
 
 #yakir result- mthod 7
-# max results are:
+# max results_old are:
 # Accuracy 97.51%
 # Precision 52.68%
 # Recall 33.52%
@@ -837,8 +837,8 @@ if __name__ == '__main__':
 # Micro F1-score: 0.9801840822956145
 
 
-# yakir results:
-# mean results are:
+# yakir results_old:
+# mean results_old are:
 # Accuracy 97.51%
 # Precision 52.68%
 # Recall 33.52%
@@ -846,7 +846,7 @@ if __name__ == '__main__':
 # ROC AUC score 95.73%
 #
 #
-# max results are:
+# max results_old are:
 # Accuracy 97.51%
 # Precision 52.68%
 # Recall 33.52%
@@ -854,7 +854,7 @@ if __name__ == '__main__':
 # ROC AUC score 95.73%
 #
 #
-# min results are:
+# min results_old are:
 # Accuracy 97.51%
 # Precision 52.68%
 # Recall 33.52%
@@ -862,7 +862,7 @@ if __name__ == '__main__':
 # ROC AUC score 95.73%
 #
 #
-# std results are:
+# std results_old are:
 # Accuracy 0.00%
 # Precision 0.00%
 # Recall 0.00%
@@ -895,7 +895,7 @@ if __name__ == '__main__':
 # Recall for class 1: 0.38
 
 
-#test with dropouts: - better results
+#test with dropouts: - better results_old
 
 # Weighted Precision: 0.9878975191754963
 # Weighted Recall: 0.9836139025795302
@@ -911,7 +911,7 @@ if __name__ == '__main__':
 
 
 
-#test with dropouts and resampling minorty group: - better results
+#test with dropouts and resampling minorty group: - better results_old
 
 # Weighted Precision: 0.9880684520071987
 # Weighted Recall: 0.9822057223324585
@@ -926,7 +926,7 @@ if __name__ == '__main__':
 # Recall for class 1: 0.49333333333333335
 
 
-# #test with dropouts and resampling minorty group and dialted: - better results
+# #test with dropouts and resampling minorty group and dialted: - better results_old
 # Weighted Precision: 0.9878313866875356
 # Weighted Recall: 0.9555783140241951
 # Weighted F1-score: 0.969793044744182
@@ -939,7 +939,7 @@ if __name__ == '__main__':
 # Recall for class 0: 0.958831512958056
 # Recall for class 1: 0.62
 
-#this is results for window = 1
+#this is results_old for window = 1
 # Weighted Precision: 0.9736260298152839
 # Weighted Recall: 0.8276873167384117
 # Weighted F1-score: 0.8914465079756182

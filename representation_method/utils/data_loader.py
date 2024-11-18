@@ -1,4 +1,6 @@
 import os
+import pickle
+
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass
@@ -7,8 +9,11 @@ from pathlib import Path
 import logging
 from tqdm import tqdm
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
+from data_process import IdentSubRec
+import gc
+
+from representation_method.utils.data_utils import DataSplitter
+
 
 @dataclass
 class DataConfig:
@@ -182,416 +187,213 @@ class BaseDataLoader(ABC):
     def create_rolling_windows(self, df_new):
         pass
 
+    def cleanup_temp_files(self, param):
+        pass
+
 
 class TimeSeriesDataLoader(BaseDataLoader):
-    """Handles loading and preprocessing of time series formatted eye tracking data."""
-
     @staticmethod
     def letter_to_num(letter: str) -> int:
-        """Convert a letter to its corresponding number (A=1, B=2, etc.)."""
         return ord(letter.upper()) - ord('A') + 1
 
-    def load_data(self, data_type: str = 'raw') -> Union[pd.DataFrame, Tuple[np.ndarray, np.ndarray, Dict]]:
-        """
-        Load data either as raw DataFrame or as processed windows.
+    def _preprocess_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Optimize data types and preprocessing for memory efficiency."""
+        # Print columns before dropping to debug
+        print("Columns before dropping:", df.columns.tolist())
 
-        Parameters:
-        -----------
-        data_type : str
-            'raw': Load raw CSV data
-            'windowed': Load preprocessed windowed data
+        # Initial cleanup
+        df = df.replace(['.', np.nan], self.config.invalid_value)
 
-        Returns:
-        --------
-        Union[pd.DataFrame, Tuple[np.ndarray, np.ndarray, Dict]]:
-            For raw: Returns DataFrame
-            For windowed: Returns (samples, labels, trial_maps)
-        """
-        if data_type == 'raw':
-            return self._load_raw_data()
-        elif data_type == 'windowed':
-            return self._load_windowed_data()
+        # Handle per-slice targeting
+        if self.config.per_slice_target:
+            if 'AILMENT_NUMBER' in df.columns:
+                df['has_ailment'] = df.groupby('CURRENT_IMAGE')['AILMENT_NUMBER'].transform(
+                    lambda x: (x != self.config.invalid_value).any()
+                )
+                df['target'] = df['has_ailment'].astype(np.int8)
+                df = df.drop('has_ailment', axis=1)
         else:
-            raise ValueError("data_type must be either 'raw' or 'windowed'")
+            df = df.rename(columns={'Hit': 'target'})
 
-    def _load_raw_data(self) -> pd.DataFrame:
-        """Load and preprocess raw time series data."""
-        base_path = Path(self.config.data_path)
+        # Convert GAZE_IA to coordinates if it exists
+        if 'GAZE_IA' in df.columns:
+            invalid_ia = '?-1'
+            df['GAZE_IA'] = df['GAZE_IA'].replace(self.config.invalid_value, invalid_ia)
+            df['GAZE_IA_X'] = df['GAZE_IA'].apply(
+                lambda x: self.letter_to_num(str(x)[0]) if str(x)[0].isalpha() else self.config.invalid_value
+            ).astype(np.int8)
+            df['GAZE_IA_Y'] = df['GAZE_IA'].apply(
+                lambda x: int(str(x)[1:]) if str(x)[1:].isdigit() else self.config.invalid_value
+            ).astype(np.int8)
+            df = df.drop('GAZE_IA', axis=1)
 
-        if isinstance(self.config.participant_id, (int, str)):
-            # Single participant
-            file_path = base_path / f"{self.config.participant_id}_Formatted_Sample.csv"
-            if not file_path.exists():
-                raise FileNotFoundError(f"No data file found for participant {self.config.participant_id}")
+        # Convert numeric columns
+        numeric_conversions = {
+            'RECORDING_SESSION_LABEL': np.int8,
+            'TRIAL_INDEX': np.int8,
+            'SAMPLE_START_TIME': np.int32,
+            'SAMPLE_INDEX': np.int32,
+            'Pupil_Size': np.float32,
+            'target': np.int8
+        }
 
-            self.logger.info(f"Loading data for participant {self.config.participant_id}")
-            df = pd.read_csv(file_path)
-            self.df = self._preprocess_data(df)
+        for col, dtype in numeric_conversions.items():
+            if col in df.columns:
+                df[col] = df[col].astype(dtype)
+                if col == 'Pupil_Size':
+                    df[col] = df[col].round(4)
 
-        elif isinstance(self.config.participant_id, (list, tuple)):
-            # Multiple specific participants
-            self.logger.info(f"Loading data for participants {self.config.participant_id}")
-            dfs = []
-            for participant_id in tqdm(self.config.participant_id, desc='Loading participant data'):
-                file_path = base_path / f"{participant_id}_Formatted_Sample.csv"
-                if not file_path.exists():
-                    raise FileNotFoundError(f"No data file found for participant {participant_id}")
-                df = pd.read_csv(file_path)
-                dfs.append(df)
+        # Convert boolean columns
+        bool_cols = ['IN_BLINK', 'IN_SACCADE', 'CURRENT_FIX_INDEX']
+        for col in bool_cols:
+            if col in df.columns:
+                df[col] = df[col].astype(np.int8)
 
-            self.df = pd.concat(dfs, ignore_index=True)
-            self.df = self._preprocess_data(self.df)
+        # Drop columns that exist
+        columns_to_drop = ['AILMENT_NUMBER', 'TARGET_ZONE', 'TARGET_XY', 'GAZE_XY','CURRENT_IMAGE','IN_SACCADE','Hit']
+        existing_columns_to_drop = [col for col in columns_to_drop if col in df.columns]
+        if existing_columns_to_drop:
+            df = df.drop(existing_columns_to_drop, axis=1)
 
-        else:
-            # Load all available participants
-            files = list(base_path.glob("*_Formatted_Sample.csv"))
-            if not files:
-                raise ValueError(f"No formatted sample files found in {base_path}")
+        # Print columns after dropping to debug
+        print("Columns after dropping:", df.columns.tolist())
 
-            self.logger.info("Loading data for all participants")
-            dfs = []
-            for file in tqdm(files, desc='Loading participant data'):
-                df = pd.read_csv(file)
-                dfs.append(df)
+        # Filter valid coordinates
+        return df[
+            (df['GAZE_IA_X'] >= 0) & (df['GAZE_IA_X'] <= 12) &
+            (df['GAZE_IA_Y'] >= 0) & (df['GAZE_IA_Y'] <= 12)
+            ].reset_index(drop=True)
 
-            self.df = pd.concat(dfs, ignore_index=True)
-            self.df = self._preprocess_data(self.df)
+    def create_rolling_windows(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, Dict]:
+        window_dir = Path(self.config.data_path).parent / 'window_data'
+        window_dir.mkdir(exist_ok=True)
+        exclude_columns = ['RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'target']
+        features = [col for col in df.columns if col not in exclude_columns]
+        global_trial_map = {}
+        window_offset = 0
+        chunk_size = 1000
 
-        self._print_data_info()
-        return self.df
+        for participant_id in tqdm(df['RECORDING_SESSION_LABEL'].unique()):
+            participant_dir = window_dir / f'participant_{participant_id}'
+            participant_dir.mkdir(exist_ok=True)
 
-    def _load_windowed_data(self) -> Tuple[np.ndarray, np.ndarray, Dict]:
-        """Load all participants' windowed data and combine."""
-        if not isinstance(self.config.participant_id, (list, tuple)):
-            self.config.participant_id = [self.config.participant_id]
+            participant_data = df[df['RECORDING_SESSION_LABEL'] == participant_id].copy()
+            trials = list(participant_data.groupby('TRIAL_INDEX'))
+            del participant_data
 
-        all_samples = []
-        all_labels = []
-        all_trial_maps = {}
-        window_idx_offset = 0
+            # Process trials in chunks
+            for chunk_start in range(0, len(trials), chunk_size):
+                chunk_trials = trials[chunk_start:chunk_start + chunk_size]
 
-        for participant_id in self.config.participant_id:
-            samples, labels, trial_map = self.load_participant_windows(
-                self.config.data_path,
-                participant_id,
-                self.config.window_size,
-                self.config.stride
-            )
+                for trial_idx, trial_data in chunk_trials:
+                    windows, labels, trial_map = self._process_trial(
+                        trial_data, features, window_offset, participant_id, trial_idx
+                    )
 
-            # Adjust window indices in trial map
-            adjusted_trial_map = {
-                (k + window_idx_offset): v
-                for k, v in trial_map.items()
+                    if len(windows) > 0:
+                        np.save(f"{participant_dir}/trial_{trial_idx}_windows.npy", windows)
+                        np.save(f"{participant_dir}/trial_{trial_idx}_labels.npy", labels)
+                        global_trial_map.update(trial_map)
+                        window_offset += len(windows)
+
+                    del windows, labels, trial_data
+                gc.collect()
+
+            del trials
+            gc.collect()
+
+        with open(f"{window_dir}/global_trial_map.pkl", 'wb') as f:
+            pickle.dump(global_trial_map, f)
+
+        return self._load_windows(window_dir)
+
+
+    def _process_trial(self, trial_data: pd.DataFrame, features: List[str],
+                       window_offset: int, participant_id: int, trial_idx: int) :
+        windows, labels, trial_map = [], [], {}
+        current_offset = 0
+
+        trial_data = trial_data.sort_values('SAMPLE_START_TIME')
+        for i in range(0, len(trial_data) - self.config.window_size + 1, self.config.stride):
+            window = trial_data.iloc[i:i + self.config.window_size]
+            window_data = np.round(window[features].values.astype(np.float32), 4)
+            has_target = bool(window['target'].any())
+
+            windows.append(window_data)
+            labels.append(int(has_target))
+
+            trial_map[window_offset + current_offset] = {
+                'participant': participant_id,
+                'trial': trial_idx,
+                'start_time': int(window['SAMPLE_START_TIME'].iloc[0]),
+                'end_time': int(window['SAMPLE_START_TIME'].iloc[-1]),
+                'has_target': has_target
             }
+            current_offset += 1
 
-            all_samples.append(samples)
-            all_labels.append(labels)
-            all_trial_maps.update(adjusted_trial_map)
+        return (np.array(windows, dtype=np.float32) if windows else np.array([]),
+                np.array(labels, dtype=np.int8) if labels else np.array([]),
+                trial_map)
 
-            window_idx_offset += len(samples)
+    def _load_windows(self, window_dir: Path) -> Tuple[np.ndarray, np.ndarray, Dict]:
+        """Load saved windows in chunks to avoid memory issues."""
+        all_samples, all_labels = [], []
 
-        return (np.concatenate(all_samples),
-                np.concatenate(all_labels),
-                all_trial_maps)
+        for participant_dir in sorted(window_dir.glob('participant_*')):
+            for trial_windows in sorted(participant_dir.glob('trial_*_windows.npy')):
+                trial_labels = trial_windows.parent / f"trial_{trial_windows.stem.split('_')[1]}_labels.npy"
+
+                samples = np.load(trial_windows)
+                labels = np.load(trial_labels)
+
+                all_samples.append(samples)
+                all_labels.append(labels)
+
+        with open(window_dir / 'global_trial_map.pkl', 'rb') as f:
+            global_trial_map = pickle.load(f)
+
+        return np.concatenate(all_samples), np.concatenate(all_labels), global_trial_map
+
+    def load_data(self, data_type: str = 'raw') -> Union[pd.DataFrame, Tuple[np.ndarray, np.ndarray, Dict]]:
+        """Load data either as raw DataFrame or processed windows."""
+        if data_type == 'raw':
+            base_path = Path(self.config.data_path)
+            if isinstance(self.config.participant_id, (int, str)):
+                file_path = base_path / f"{self.config.participant_id}_Formatted_Sample.csv"
+                if not file_path.exists():
+                    raise FileNotFoundError(f"No data file found for participant {self.config.participant_id}")
+                df = pd.read_csv(file_path)
+            else:
+                # Load all available participants
+                files = list(base_path.glob("*_Formatted_Sample.csv"))
+                if not files:
+                    raise ValueError(f"No formatted sample files found in {base_path}")
+                df = pd.concat([pd.read_csv(f) for f in tqdm(files, desc='Loading data')], ignore_index=True)
+
+            self.df = self._preprocess_data(df)
+            return self.df
+
+        elif data_type == 'windowed':
+            window_dir = Path(self.config.data_path).parent / 'window_data'
+            return self._load_windows(window_dir)
+
+        raise ValueError("data_type must be either 'raw' or 'windowed'")
 
     def get_participant_data(self, participant_id: int) -> pd.DataFrame:
         """Load and preprocess data for a specific participant."""
         file_path = Path(self.config.data_path) / f"{participant_id}_Formatted_Sample.csv"
-
         if not file_path.exists():
             raise FileNotFoundError(f"No data file found for participant {participant_id}")
 
         df = pd.read_csv(file_path)
-        self.df = self._preprocess_data(df)
-
-        self.logger.info(f"\nParticipant {participant_id} data:")
-        self.logger.info(f"Number of samples: {len(self.df)}")
-        self.logger.info("Class distribution:")
-        self.logger.info(self.df['target'].value_counts())
-
-        return self.df
-
-    def _preprocess_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Preprocess the time series formatted data."""
-        # Clean and handle missing values
-        df = df.replace(['.', np.nan], self.config.invalid_value)
-
-        # Drop unnecessary columns
-        columns_to_drop = ['TARGET_XY', 'GAZE_XY', 'TARGET_ZONE']
-        if self.config.remove_saccade:
-            columns_to_drop.extend(['IN_SACCADE'])
-
-        df = df.drop(columns=[col for col in columns_to_drop if col in df.columns])
-
-        # Convert GAZE_IA to numeric coordinates
-        invalid_ia = '?-1'
-        df['GAZE_IA'] = df['GAZE_IA'].replace(self.config.invalid_value, invalid_ia)
-        df['GAZE_IA_X'] = df['GAZE_IA'].apply(
-            lambda x: self.letter_to_num(str(x)[0]) if str(x)[0].isalpha() else self.config.invalid_value)
-        df['GAZE_IA_Y'] = df['GAZE_IA'].apply(
-            lambda x: int(str(x)[1:]) if str(x)[1:].isdigit() else self.config.invalid_value)
-        df = df.drop('GAZE_IA', axis=1)
-
-        # Convert boolean columns
-        bool_columns = ['IN_BLINK', 'CURRENT_FIX_INDEX']
-        if not self.config.remove_saccade:
-            bool_columns.append('IN_SACCADE')
-        for col in bool_columns:
-            if col in df.columns:
-                df[col] = df[col].astype(float).astype(bool)
-
-        # Convert numeric columns
-        df['RECORDING_SESSION_LABEL'] = df['RECORDING_SESSION_LABEL'].astype(np.int16)
-        df['TRIAL_INDEX'] = df['TRIAL_INDEX'].astype(np.int16)
-        df['SAMPLE_INDEX'] = df['SAMPLE_INDEX'].astype(np.int32)
-        df['SAMPLE_START_TIME'] = df['SAMPLE_START_TIME'].astype(np.int32)
-        df['Pupil_Size'] = df['Pupil_Size'].astype(float).astype(np.int16)
-
-        # Handle targets
-        df = df.rename(columns={'Hit': 'target'})
-        df['target'] = df['target'].astype(int)
-
-        if self.config.per_slice_target:
-            # Create slice-based targets using AILMENT_NUMBER
-            # Mark a slice as target if it has any non-NaN AILMENT_NUMBER
-            has_ailment = df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX',
-                                      'CURRENT_IMAGE'])['AILMENT_NUMBER'].transform(
-                lambda x: (x != self.config.invalid_value).any()
-            )
-            df['target'] = has_ailment.astype(int)
-
-        # Remove AILMENT_NUMBER and CURRENT_IMAGE after using them for target calculation
-        if 'AILMENT_NUMBER' in df.columns:
-            df = df.drop('AILMENT_NUMBER', axis=1)
-        if 'CURRENT_IMAGE' in df.columns:
-            df = df.drop('CURRENT_IMAGE', axis=1)
-
-        # Clean up coordinates outside grid
-        df = df[
-            (df['GAZE_IA_X'] >= 0) &
-            (df['GAZE_IA_X'] <= 12) &
-            (df['GAZE_IA_Y'] >= 0) &
-            (df['GAZE_IA_Y'] <= 12)
-            ].reset_index(drop=True)
-
-        return df
-
-    class TimeSeriesDataLoader(BaseDataLoader):
-        def _process_trial_parallel(self,
-                                    trial_data: Tuple[int, pd.DataFrame],
-                                    participant: int,
-                                    window_dir: Path,
-                                    features: List[str],
-                                    window_size: int,
-                                    stride: int) -> Tuple[int, Dict]:
-            """
-            Process and save a single trial's windows immediately.
-
-            Parameters:
-            -----------
-            trial_data : Tuple[int, pd.DataFrame]
-                Tuple of (trial_number, trial_dataframe)
-            participant : int
-                Participant ID
-            window_dir : Path
-                Directory to save window data
-            features : List[str]
-                List of feature columns
-            window_size : int
-                Size of each window
-            stride : int
-                Stride between windows
-
-            Returns:
-            --------
-            Tuple[int, Dict]
-                Number of windows created and trial mapping
-            """
-            trial, group = trial_data
-            group = group.sort_values('SAMPLE_START_TIME')
-
-            windows_list = []
-            labels_list = []
-            trial_map = {}
-            window_count = 0
-
-            for i in range(0, len(group) - window_size + 1, stride):
-                window = group.iloc[i:i + window_size]
-                window_data = window[features].values
-                windows_list.append(window_data)
-                labels_list.append(int(window['target'].any()))
-
-                # Create metadata for this window
-                trial_map[window_count] = {
-                    'participant': participant,
-                    'trial': trial,
-                    'window_number': window_count,
-                    'start_time': window['SAMPLE_START_TIME'].iloc[0],
-                    'end_time': window['SAMPLE_START_TIME'].iloc[-1],
-                    'start_idx': i,
-                    'end_idx': i + window_size,
-                    'has_target': bool(window['target'].any())
-                }
-                window_count += 1
-
-                # Save windows in batches to manage memory
-                if len(windows_list) >= 1000:  # Adjust batch size as needed
-                    self._save_window_batch(windows_list, labels_list, participant, trial,
-                                            window_count - len(windows_list), window_dir)
-                    windows_list = []
-                    labels_list = []
-
-            # Save any remaining windows
-            if windows_list:
-                self._save_window_batch(windows_list, labels_list, participant, trial,
-                                        window_count - len(windows_list), window_dir)
-
-            # Save trial mapping
-            trial_map_file = window_dir / f'participant_{participant}_trial_{trial}_map.npy'
-            np.save(str(trial_map_file), trial_map)
-
-            return window_count, trial_map
-
-        def _save_window_batch(self, windows: List[np.ndarray], labels: List[int],
-                               participant: int, trial: int, start_idx: int, window_dir: Path):
-            """Save a batch of windows to disk."""
-            if not windows:
-                return
-
-            samples = np.array(windows)
-            labels_arr = np.array(labels)
-
-            # Save with batch index
-            np.save(str(window_dir / f'participant_{participant}_trial_{trial}_start_{start_idx}_samples.npy'),
-                    samples)
-            np.save(str(window_dir / f'participant_{participant}_trial_{trial}_start_{start_idx}_labels.npy'),
-                    labels_arr)
-
-        def create_rolling_windows(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, Dict]:
-            """Create rolling windows using parallel processing, saving each trial separately."""
-            self.logger.info(f"Creating rolling windows with size {self.config.window_size} "
-                             f"and stride {self.config.stride}")
-
-            window_dir = Path(self.config.data_path).parent / 'window_data'
-            window_dir.mkdir(exist_ok=True)
-
-            features = [col for col in df.columns if col not in ['RECORDING_SESSION_LABEL',
-                                                                 'TRIAL_INDEX',
-                                                                 'target']]
-
-            global_trial_map = {}
-            total_windows = 0
-
-            participants = df['RECORDING_SESSION_LABEL'].unique()
-
-            for participant in tqdm(participants, desc="Processing participants"):
-                participant_data = df[df['RECORDING_SESSION_LABEL'] == participant]
-                trials = list(participant_data.groupby('TRIAL_INDEX'))
-
-                # Process trials in parallel
-                with ThreadPoolExecutor() as executor:
-                    futures = []
-                    for trial_data in trials:
-                        future = executor.submit(
-                            self._process_trial_parallel,
-                            trial_data=trial_data,
-                            participant=participant,
-                            window_dir=window_dir,
-                            features=features,
-                            window_size=self.config.window_size,
-                            stride=self.config.stride
-                        )
-                        futures.append(future)
-
-                    # Process results with progress bar
-                    for future in tqdm(futures, desc=f"Processing trials for participant {participant}", leave=False):
-                        n_windows, trial_map = future.result()
-                        # Adjust window indices for global mapping
-                        adjusted_map = {
-                            (k + total_windows): v
-                            for k, v in trial_map.items()
-                        }
-                        global_trial_map.update(adjusted_map)
-                        total_windows += n_windows
-
-            # Save feature list
-            feature_file = window_dir / f'features_w{self.config.window_size}.txt'
-            with open(str(feature_file), 'w') as f:
-                f.write('\n'.join(features))
-
-            # Save global trial mapping
-            np.save(
-                str(window_dir / f'all_participants_w{self.config.window_size}_s{self.config.stride}_trial_map.npy'),
-                global_trial_map)
-
-            self.logger.info(f"\nTotal windows created: {total_windows}")
-            self.logger.info(f"Data saved in: {window_dir}")
-
-            # Load and concatenate all files for return value
-            return self._concatenate_all_files(window_dir, total_windows, global_trial_map)
-
-        def _concatenate_all_files(self, window_dir: Path, total_windows: int,
-                                   global_trial_map: Dict) -> Tuple[np.ndarray, np.ndarray, Dict]:
-            """Concatenate all saved window files into final arrays."""
-            self.logger.info("Concatenating all window files...")
-
-            all_samples = []
-            all_labels = []
-
-            # Get all sample files sorted by participant and trial
-            sample_files = sorted(window_dir.glob('*_samples.npy'))
-            label_files = sorted(window_dir.glob('*_labels.npy'))
-
-            for sample_file, label_file in tqdm(zip(sample_files, label_files),
-                                                desc="Concatenating files",
-                                                total=len(sample_files)):
-                samples = np.load(str(sample_file))
-                labels = np.load(str(label_file))
-                all_samples.append(samples)
-                all_labels.append(labels)
-
-            return (np.concatenate(all_samples),
-                    np.concatenate(all_labels),
-                    global_trial_map)
-
-    def _log_dataset_info(self, samples, labels, features):
-        """Log information about the dataset."""
-        self.logger.info(f"\nOverall dataset shape:")
-        self.logger.info(f"Samples shape: {samples.shape}")
-        self.logger.info(f"Labels shape: {labels.shape}")
-        self.logger.info(f"\nFeatures used: {features}")
-        self.logger.info(f"\nClass distribution:")
-        unique_labels, counts = np.unique(labels, return_counts=True)
-        for label, count in zip(unique_labels, counts):
-            self.logger.info(f"Class {label}: {count} samples ({count / len(labels):.4f})")
-
-    @staticmethod
-    def load_participant_windows(data_path: str, participant_id: int, window_size: int, stride: int):
-        """Load pre-saved windowed data for a specific participant, including trial information."""
-        window_dir = Path(data_path).parent / 'window_data'
-
-        samples_file = window_dir / f'participant_{participant_id}_w{window_size}_s{stride}_samples.npy'
-        labels_file = window_dir / f'participant_{participant_id}_w{window_size}_s{stride}_labels.npy'
-        trial_map_file = window_dir / f'participant_{participant_id}_w{window_size}_s{stride}_trial_map.npy'
-
-        if not all(f.exists() for f in [samples_file, labels_file, trial_map_file]):
-            raise FileNotFoundError(f"Windowed data not found for participant {participant_id}")
-
-        samples = np.load(str(samples_file))
-        labels = np.load(str(labels_file))
-        trial_map = np.load(str(trial_map_file), allow_pickle=True).item()
-
-        return samples, labels, trial_map
-
-
-
+        return self._preprocess_data(df)
 class LegacyDataLoader(BaseDataLoader):
     """Handles loading and preprocessing of legacy eye tracking data format."""
 
     def load_data(self) -> pd.DataFrame:
         """Load and preprocess legacy format data."""
         try:
-            self.df = pd.read_csv(self.config.data_path)
+            self.df = IdentSubRec.get_df_for_training(data_file_path = self.config.data_path,approach_num=self.config.approach_num)
             # Add your legacy preprocessing steps here
             self._print_data_info()
             return self.df
@@ -612,6 +414,31 @@ class LegacyDataLoader(BaseDataLoader):
         self.logger.info(participant_df['target'].value_counts())
 
         return participant_df
+
+
+    def _print_data_info(self):
+            """Print information about the loaded data."""
+            if self.df is not None:
+                # Basic dataset info
+                self.logger.info("\nDataset Information:")
+                self.logger.info(f"Total samples: {len(self.df)}")
+
+                # Detailed target distribution
+                target_counts = self.df['target'].value_counts()
+                target_ratios = self.df['target'].value_counts(normalize=True)
+
+                self.logger.info("\nTarget Distribution:")
+                self.logger.info(f"Number of positive samples (1s): {target_counts.get(1, 0)}")
+                self.logger.info(f"Number of negative samples (0s): {target_counts.get(0, 0)}")
+                self.logger.info(f"Positive ratio: {target_ratios.get(1, 0):.4f}")
+                self.logger.info(f"Negative ratio: {target_ratios.get(0, 0):.4f}")
+                self.logger.info(f"Positive to Negative ratio: 1:{(target_counts.get(0, 0) / target_counts.get(1, 1)):.2f}")
+
+                # Feature info
+                self.logger.info("\nFeature columns:")
+                self.logger.info(self.config.feature_columns)
+
+
 
 
 def create_data_loader(data_format: str, config: DataConfig) -> BaseDataLoader:
@@ -674,11 +501,24 @@ if __name__ == "__main__":
         normalize=True,
         per_slice_target=True,
         participant_id=1,
-        window_size= 500
+        window_size= 500,
+        stride=5
     )
 
     # Using the new time series format
     loader_new = create_data_loader('time_series', config_new)
-    df_new = loader_new.load_data()
-    window_df =loader_new.create_rolling_windows(df_new[:1000])
-    print(window_df)
+    # df_new = loader_new.load_data(data_type = 'windowed')
+    window_df,labels,meta_data =loader_new.load_data(data_type = 'windowed')
+    # Add cleanup
+    window_dir = Path(loader_new.config.data_path).parent / 'window_data'
+
+
+    splitter = DataSplitter(window_df, labels, meta_data)
+
+    # Split by trials
+    (train_data_trial, train_labels_trial), (val_data_trial, val_labels_trial), (test_data_trial, test_labels_trial) = \
+        splitter.split_by_trials()
+
+    # Split within trials timeline
+    (train_data_time, train_labels_time), (val_data_time, val_labels_time), (test_data_time, test_labels_time) = \
+        splitter.split_within_trials()
