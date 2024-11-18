@@ -144,26 +144,70 @@ def create_time_series(time_series_df, interval='30ms', window_size=5, resample=
     return create_windows(grouped, window_size, feature_columns)
 
 
-def split_train_test_for_time_series(time_series_df, input_data_points, test_size=0.2, random_state=0,
-                                     split_columns=None):
+def split_train_test_for_time_series(df, input_columns, target_column='target',
+                                     split_columns=None,
+                                     split_type='random', test_size=0.2, random_state=0):
+    """
+    Split time series data into train and test sets using either random or temporal splitting.
+
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        Input DataFrame containing features and target
+    input_columns : list
+        List of column names to use as input features
+    target_column : str
+        Name of the target column
+    split_columns : list
+        Columns to use for grouping (e.g., ['RECORDING_SESSION_LABEL', 'TRIAL_INDEX'])
+    split_type : str
+        'random': Use GroupShuffleSplit to randomly split while preserving groups
+        'temporal': Split based on trial order (first N% train, last N% test)
+    test_size : float
+        Proportion of data for testing (0.0 to 1.0)
+    random_state : int
+        Random seed for reproducibility
+
+    Returns:
+    --------
+    train_df, test_df : pd.DataFrame
+        Split DataFrames containing both features and target
+    """
+    # Create group labels
     if split_columns is None:
         split_columns = ['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']
-    df = time_series_df
     df['group'] = df[split_columns].apply(
         lambda row: '_'.join(row.values.astype(str)), axis=1
     )
-    gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
-    split_indices = list(gss.split(X=df[input_data_points], y=df['target'], groups=df['group']))[0]
 
-    train_index, test_index = split_indices
+    if split_type == 'temporal':
+        # Get unique groups in order
+        unique_groups = df['group'].unique()
+        n_test_groups = int(len(unique_groups) * test_size)
 
-    x_train = df.iloc[train_index].drop(columns='target', errors='ignore')
-    x_test = df.iloc[test_index].drop(columns='target', errors='ignore')
+        # Split groups into train/test
+        train_groups = unique_groups[:-n_test_groups]
+        test_groups = unique_groups[-n_test_groups:]
 
-    y_train = df['target'].iloc[train_index]
-    y_test = df['target'].iloc[test_index]
+        # Create masks for train/test
+        train_mask = df['group'].isin(train_groups)
+        test_mask = df['group'].isin(test_groups)
 
-    train_df = pd.concat([x_train, y_train], axis=1)
-    test_df = pd.concat([x_test, y_test], axis=1)
+        # Split the data
+        train_df = df[train_mask]
+        test_df = df[test_mask]
+
+    else:  # random split
+        # Use GroupShuffleSplit
+        gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+        train_idx, test_idx = next(gss.split(
+            X=df[input_columns],
+            y=df[target_column],
+            groups=df['group']
+        ))
+
+        # Split the data
+        train_df = df.iloc[train_idx]
+        test_df = df.iloc[test_idx]
 
     return train_df, test_df

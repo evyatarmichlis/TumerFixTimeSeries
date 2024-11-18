@@ -10,7 +10,7 @@ from sklearn.utils.class_weight import compute_class_weight
 
 # Import our utility modules
 from utils.general_utils import seed_everything
-from utils.data_utils import create_time_series
+from utils.data_utils import create_time_series, split_train_test_for_time_series
 from utils.losses import WeightedCrossEntropyLoss
 from utils.gan_utils import generate_balanced_data_with_gan
 from utils.data_loader import load_eye_tracking_data, DataConfig
@@ -64,8 +64,7 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
 
     # 2. Data Preparation
     # Split train/test
-    train_df, test_df = train_test_split(df, test_size=0.2, random_state=0,
-                                         stratify=df['target'])
+    train_df, test_df = split_train_test_for_time_series(df, test_size=0.2, random_state=0)
     print("Original class distribution in test set:")
     print(test_df["target"].value_counts())
 
@@ -225,10 +224,11 @@ if __name__ == '__main__':
     # Load dataset
     name = 'GRU-AE'
     config = DataConfig(
-        data_path='/cs/usr/evyatar613/Desktop/josko_lab/Pycharm/TumerFixTimeSeries/data/Categorized_Fixation_Data_1_18.csv',
+        data_path='data/Formatted_Samples_ML',
         approach_num=6,
         normalize=True,
-        participant_id = 1
+        per_slice_target=True,
+        participant_id=1
     )
 
     # Define all parameters
