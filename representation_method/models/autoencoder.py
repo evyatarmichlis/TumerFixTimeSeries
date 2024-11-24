@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
 
 
 class CNNRecurrentEncoder(nn.Module):
@@ -22,9 +24,18 @@ class CNNRecurrentEncoder(nn.Module):
                                num_layers=num_layers,
                                batch_first=True)
 
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_size // 2, 1)
+        )
+        self.dropout1 = nn.Dropout(0.5)  # After CNN
+        self.dropout2 = nn.Dropout(0.5)  # After RNN
+
         self.encoded_length = None
 
     def forward(self, x):
+        # CNN encoding
         x = self.conv_encoder(x)
         self.encoded_length = x.size(2)
         x = x.permute(0, 2, 1)
@@ -55,16 +66,17 @@ class CNNRecurrentDecoder(nn.Module):
         self.conv_decoder = InceptionDecoder(num_filters=num_filters, depth=depth, encoder_channels=encoder_channels, input_length=input_length)
 
     def forward(self, x):
-
         outputs, hidden = self.rnn(x)
-        x = outputs.permute(0, 2, 1)
+
+        x = outputs.permute(0, 2, 1)  # [batch_size, channels, seq_length]
         x = self.conv_decoder(x)
         return x
-# ... (your existing decoder code)
 
 class CNNRecurrentAutoencoder(nn.Module):
     def __init__(self, in_channels, num_filters, depth, hidden_size, num_layers=1, rnn_type='GRU', input_length=None):
         super(CNNRecurrentAutoencoder, self).__init__()
+
+
         self.encoder = CNNRecurrentEncoder(
             in_channels=in_channels,
             num_filters=num_filters,
@@ -93,7 +105,7 @@ class CNNRecurrentAutoencoder(nn.Module):
 
 
 class InceptionModule(nn.Module):
-    def __init__(self, in_channels, out_channels, bottleneck_channels=32, kernel_sizes=[9, 19, 39]):
+    def __init__(self, in_channels, out_channels, bottleneck_channels=32, kernel_sizes=[19, 39, 59]):
         super(InceptionModule, self).__init__()
         self.bottleneck = nn.Conv1d(in_channels, bottleneck_channels, kernel_size=1, padding=0)
         self.conv_layers = nn.ModuleList()
@@ -108,7 +120,7 @@ class InceptionModule(nn.Module):
         )
         self.bn = nn.BatchNorm1d((len(kernel_sizes) + 1) * out_channels)
         self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(p=0.4)
+        self.dropout = nn.Dropout(p=0.5)
 
 
     def forward(self, x):
@@ -121,7 +133,6 @@ class InceptionModule(nn.Module):
         x = self.dropout(x)
         return x
 
-# ... (your existing inception module code)
 
 class InceptionEncoder(nn.Module):
     def __init__(self, in_channels, num_filters, depth):

@@ -1,0 +1,37 @@
+# Data parameters
+patch_len: 32
+stride: 8
+seq_len: 128
+train_ratio: 0.7
+val_ratio: 0.15
+test_ratio: 0.15
+
+# Model parameters
+n_layers: 3
+d_model: 128
+n_heads: 8
+d_ff: 256
+norm_type: 'BatchNorm'
+activation: 'gelu'
+attn_dropout: 0.1
+dropout: 0.1
+head_dropout: 0.1
+pos_encoding: 'learnable'
+
+# Training parameters
+batch_size: 32
+num_workers: 4
+learning_rate: 0.001
+weight_decay: 0.01
+epochs: 50
+patience: 10
+grad_clip: 1.0
+
+# Feature columns
+feature_columns:
+  - 'Pupil_Size'
+  - 'GAZE_IA_X'
+  - 'GAZE_IA_Y'
+  - 'CURRENT_FIX_INDEX'
+  - 'SAMPLE_START_TIME'
+  - 'IN_BLINK'

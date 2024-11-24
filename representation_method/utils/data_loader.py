@@ -501,24 +501,23 @@ if __name__ == "__main__":
         normalize=True,
         per_slice_target=True,
         participant_id=1,
-        window_size= 500,
+        window_size= 1000,
         stride=5
     )
 
     # Using the new time series format
     loader_new = create_data_loader('time_series', config_new)
-    # df_new = loader_new.load_data(data_type = 'windowed')
-    window_df,labels,meta_data =loader_new.load_data(data_type = 'windowed')
+    df_new = loader_new.load_data(data_type = 'raw')
+    # window_df,labels,meta_data =loader_new.create_rolling_windows(df_new)
     # Add cleanup
     window_dir = Path(loader_new.config.data_path).parent / 'window_data'
 
-
-    splitter = DataSplitter(window_df, labels, meta_data)
-
-    # Split by trials
-    (train_data_trial, train_labels_trial), (val_data_trial, val_labels_trial), (test_data_trial, test_labels_trial) = \
-        splitter.split_by_trials()
-
-    # Split within trials timeline
-    (train_data_time, train_labels_time), (val_data_time, val_labels_time), (test_data_time, test_labels_time) = \
-        splitter.split_within_trials()
+    # splitter = DataSplitter(window_df, labels, meta_data)
+    #
+    # # Split by trials
+    # (train_data_trial, train_labels_trial), (val_data_trial, val_labels_trial), (test_data_trial, test_labels_trial) = \
+    #     splitter.split_by_trials()
+    #
+    # # Split within trials timeline
+    # (train_data_time, train_labels_time), (val_data_time, val_labels_time), (test_data_time, test_labels_time) = \
+    #     splitter.split_within_trials()

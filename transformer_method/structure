@@ -1,0 +1,22 @@
+transformer_method/
+│
+├── main_transformer.py           # Main entry point
+├── config.py                    # Configuration classes and settings
+│
+├── models/
+│   ├── __init__.py
+│   ├── patch_tst.py            # PatchTST model implementation
+│   └── classifier.py           # PatchTSTClassifier implementation
+│
+├── data/
+│   ├── __init__.py
+│   ├── datasets.py             # Dataset classes
+│   └── splitter.py            # TrialSplitter class
+│
+├── utils/
+│   ├── __init__.py
+│   ├── visualization.py        # Plotting functions
+│   ├── metrics.py             # Evaluation metrics
+│   └── training.py            # Training utilities
+│
+└── README.md

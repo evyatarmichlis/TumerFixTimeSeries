@@ -7,20 +7,21 @@ import torch.optim as optim
 import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from torch.nn import CrossEntropyLoss
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from sklearn.utils.class_weight import compute_class_weight
 
 from data_process import IdentSubRec
+from representation_method.utils.visualization import analyze_embeddings_from_loader
 # Import our utility modules
 from utils.general_utils import seed_everything
 from utils.data_utils import create_time_series, split_train_test_for_time_series, DataSplitter
-from utils.losses import WeightedCrossEntropyLoss
+from utils.losses import WeightedCrossEntropyLoss, ContrastiveAutoencoderLoss
 from utils.gan_utils import generate_balanced_data_with_gan
 from utils.data_loader import load_eye_tracking_data, DataConfig, create_data_loader
 from models.autoencoder import CNNRecurrentAutoencoder, initialize_weights
 from models.classifier import CombinedModel
-from utils.trainers import AutoencoderTrainer, CombinedModelTrainer
-
+from utils.trainers import AutoencoderTrainer, CombinedModelTrainer, ContrastiveAutoencoderTrainer
 
 feature_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X', 'CURRENT_FIX_IA_Y',
                    'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT']
@@ -113,13 +114,13 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
 
         train_loader_ae = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         val_loader_ae = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-        optimizer = optim.AdamW(autoencoder.parameters(), lr=0.001, weight_decay=1e-4)
+        optimizer = optim.AdamW(autoencoder.parameters(), lr=0.001, weight_decay=0.01)
         # Train autoencoder
         autoencoder_trainer = AutoencoderTrainer(
             model=autoencoder,
             criterion=nn.MSELoss(),
             optimizer=optimizer,
-            scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=20),
+            scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5),
             device=device,
             save_path=method_dir,
             early_stopping_patience=20,
@@ -184,6 +185,7 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
 
     # Create trainer
     combined_trainer = CombinedModelTrainer(
+
         model=model,
         criterion=WeightedCrossEntropyLoss(),
         optimizer=optimizer,
@@ -225,68 +227,6 @@ def create_method_name(name,config, params):
         f"use_gan_{params['use_gan']}"
     )
 
-
-# if __name__ == '__main__':
-    # # Load dataset
-    # name = 'Evyatar'
-    # config = DataConfig(
-    #     data_path='data/Categorized_Fixation_Data_1_18.csv',
-    #     approach_num=6,
-    #     normalize=True,
-    #     per_slice_target=True,
-    #     participant_id=1
-    # )
-    #
-    # # Define all parameters
-    # params = {
-    #     'window_size': 50,
-    #     'classification_epochs': 20,
-    #     'batch_size': 32,
-    #     'ae_epochs': 100,
-    #     'depth': 4,
-    #     'num_filters': 32,
-    #     'lr': 0.001,
-    #     'mask_probability': 0.4,
-    #     'threshold': 0.9,
-    #     'participant': 1,
-    #     'use_gan': True,
-    #     'early_stopping_patience': 30,
-    #     'resample': False
-    # }
-    #
-    # # Load and filter data
-    # df = load_eye_tracking_data(data_path=config.data_path,approach_num=config.approach_num,participant_id=config.participant_id,data_format="legacy")
-    # # Create method name from parameters
-    # method_name = create_method_name(name,config, params)
-    #
-    # # Run training
-    # main_with_autoencoder(
-    #     df=df,
-    #     window_size=params['window_size'],
-    #     method=method_name,
-    #     classification_epochs=params['classification_epochs'],
-    #     batch_size=params['batch_size'],
-    #     ae_epochs=params['ae_epochs'],
-    #     depth=params['depth'],
-    #     num_filters=params['num_filters'],
-    #     lr=params['lr'],
-    #     mask_probability=params['mask_probability'],
-    #     threshold=params['threshold'],
-    #     use_gan=params['use_gan'],
-    #     early_stopping_patience=params['early_stopping_patience'],
-    #     resample=params['resample'],TRAIN=False
-    # )
-    #
-    #
-    # config_new = DataConfig(
-    #     data_path='data/Formatted_Samples_ML',
-    #     approach_num=6,
-    #     normalize=True,
-    #     per_slice_target=True,
-    #     participant_id=1,
-    #     window_size= 500,
-    #     stride=5
-    # )
 
 
 def prepare_dataloaders(X_train, Y_train, X_val, Y_val, X_test, Y_test, batch_size, use_gan=False):
@@ -338,18 +278,59 @@ def setup_autoencoder(input_shape, params, device):
 def train_autoencoder_model(autoencoder, train_loader, val_loader, params, device, save_path):
     """Setup and train autoencoder."""
     optimizer = optim.AdamW(autoencoder.parameters(), lr=params['lr'], weight_decay=1e-4)
-    trainer = AutoencoderTrainer(
-        model=autoencoder,
-        criterion=nn.MSELoss(),
-        optimizer=optimizer,
-        scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=20),
-        device=device,
-        save_path=save_path,
-        early_stopping_patience=20,
-        mask_probability=params['mask_probability']
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=20)
+    # trainer = AutoencoderTrainer(
+    #     model=autoencoder,
+    #     criterion=nn.MSELoss(),
+    #     optimizer=optimizer,
+    #     scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=20),
+    #     device=device,
+    #     save_path=save_path,
+    #     early_stopping_patience=10,
+    #     mask_probability=params['mask_probability']
+    # )
+
+    # trainer.train(train_loader,val_loader,epochs=params['ae_epochs'])
+    # Calculate weights for balanced sampling
+    labels = train_loader.dataset.tensors[1].numpy()  # Get labels from dataset
+    class_counts = np.bincount(labels)
+    weights = 1. / class_counts[labels]
+    weights = torch.FloatTensor(weights)
+
+    # Create balanced sampler
+    sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
+
+    # Create new train loader with balanced sampling
+    train_loader_balanced = DataLoader(
+        train_loader.dataset,
+        batch_size=train_loader.batch_size,
+        sampler=sampler,
+        num_workers=train_loader.num_workers,
+        pin_memory=train_loader.pin_memory
     )
 
-    trainer.train(train_loader, val_loader, epochs=params['ae_epochs'])
+    # Your existing code
+    criterion = nn.MSELoss()
+    loss_function = ContrastiveAutoencoderLoss(
+        criterion=criterion,
+        lambda_contrast=0.05,
+        temperature=0.5
+    )
+
+    # Create trainer with chosen loss
+    contrastive_trainer = ContrastiveAutoencoderTrainer(
+        model=autoencoder,
+        optimizer=optimizer,
+        loss_function=loss_function,
+        device=device,
+        scheduler=scheduler,
+        mask_probability=0.1,
+        save_path=save_path,
+        early_stopping_patience=5
+    )
+    #
+    # # Train with balanced loader
+    contrastive_trainer.train(train_loader, val_loader, epochs=params['ae_epochs'])
 
 
 def train_combined_model(autoencoder, train_loader, val_loader, test_loader, params, device, save_path):
@@ -359,14 +340,15 @@ def train_combined_model(autoencoder, train_loader, val_loader, test_loader, par
         {'params': model.encoder.parameters(), 'lr': params['lr'] * 0.1},
         {'params': model.classifier.parameters(), 'lr': params['lr']}
     ], weight_decay=1e-4)
-
+    classifier_dir = os.path.join(save_path, params['classifier'])
+    os.makedirs(classifier_dir, exist_ok=True)
     trainer = CombinedModelTrainer(
         model=model,
-        criterion=WeightedCrossEntropyLoss(),
+        criterion=CrossEntropyLoss(),
         optimizer=optimizer,
-        scheduler=optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10),
+        scheduler=optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3,verbose=True),
         device=device,
-        save_path=save_path,
+        save_path=classifier_dir,
         early_stopping_patience=5
     )
 
@@ -414,8 +396,29 @@ def main(data_config, params, use_legacy=False):
     autoencoder = setup_autoencoder(X_train.shape, params, device)
     if params['TRAIN']:
         train_autoencoder_model(autoencoder, train_loader, val_loader, params, device, method_dir)
+        analyze_embeddings_from_loader(
+            encoder=autoencoder.encoder,
+            loader=test_loader,
+            device=device,
+            method_dir=method_dir,
+            loader_name="Test"
+        )
+
     else:
-        autoencoder.load_state_dict(torch.load(os.path.join(method_dir, 'best_autoencoder.pth')))
+
+        checkpoint = torch.load(os.path.join(method_dir, 'best_autoencoder_checkpoint.pth'))
+        autoencoder.load_state_dict(checkpoint['model_state_dict'])
+        # path = r'C:\Users\Evyatar\PycharmProjects\TumorFixTimeSeriesUpdate\representation_method\results\new_data normal loss add regulaztion_approach_6_window_1000_depth_5_lr_0.0001_ae_epochs_50_class_epochs_20_mask_0.4_filters_4_batch_64_participant_1_thresh_0.9,use_gan_False\best_autoencoder_model.pth'
+        # autoencoder.load_state_dict(torch.load(os.path.join(method_dir, 'best_autoencoder_checkpoint.pth')))
+
+        analyze_embeddings_from_loader(
+            encoder=autoencoder.encoder,
+            loader=test_loader,
+            device=device,
+            method_dir=method_dir,
+            loader_name="Test"
+        )
+
 
     # Handle GAN augmentation if enabled
     if params['use_gan']:
@@ -425,8 +428,23 @@ def main(data_config, params, use_legacy=False):
             X_train_balanced, Y_train_balanced, X_val_scaled, Y_val, X_test_scaled, Y_test,
             params['batch_size'], True
         )
+    else:
+        X_train_balanced = X_train_scaled
+        Y_train_balanced = Y_train
+        X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32).permute(0, 2, 1)
+        X_val_tensor = torch.tensor(X_val_scaled, dtype=torch.float32).permute(0, 2, 1)
+        Y_train_tensor = torch.tensor(Y_train, dtype=torch.long)
+        Y_val_tensor = torch.tensor(Y_val, dtype=torch.long)
+        train_dataset = torch.utils.data.TensorDataset(X_train_tensor, Y_train_tensor)
+        val_dataset = torch.utils.data.TensorDataset(X_val_tensor, Y_val_tensor)
+        train_dataset = torch.utils.data.TensorDataset(X_train_tensor, Y_train_tensor)
+        val_dataset = torch.utils.data.TensorDataset(X_val_tensor, Y_val_tensor)
+        classes = np.unique(Y_train_balanced)
+        class_weights = compute_class_weight('balanced', classes=classes, y=Y_train_balanced)
+        samples_weight = np.array([class_weights[t] for t in Y_train_balanced])
+        sampler = WeightedRandomSampler(torch.from_numpy(samples_weight).float(), len(samples_weight))
+        train_loader = DataLoader(train_dataset, batch_size=params['batch_size'], sampler=sampler)
 
-    # Train combined model
     train_combined_model(autoencoder, train_loader, val_loader, test_loader, params, device, method_dir)
 
 
@@ -452,26 +470,28 @@ if __name__ == '__main__':
             normalize=True,
             per_slice_target=True,
             participant_id=1,
-            window_size=500,
-            stride=5
+            window_size=1000,
+            stride=1
         )
 
     params = {
-        'name': 'new_data',
-        'window_size': 50,
+        'name': 'new_data cont loss add more lambda to cont',
+        'window_size': 1000,
         'classification_epochs': 20,
-        'batch_size': 32,
-        'ae_epochs': 100,
-        'depth': 4,
-        'num_filters': 32,
-        'lr': 0.001,
+        'batch_size': 64,
+        'ae_epochs': 50,
+        'depth': 5,
+        'num_filters': 4,
+        'lr': 0.0001,
         'mask_probability': 0.4,
         'threshold': 0.9,
         'participant': 1,
         'use_gan': False,
         'early_stopping_patience': 30,
         'resample': False,
-        'TRAIN': True
+        'TRAIN': True,
+        "classifier":"add dropout =0.1"
     }
 
     main(config, params, use_legacy)
+

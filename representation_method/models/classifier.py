@@ -35,6 +35,7 @@ class ComplexCNNClassifier(nn.Module):
         self.initial_conv = nn.Conv1d(128, 64, kernel_size=7, padding=3)
         self.initial_bn = nn.BatchNorm1d(64)
         self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(0.1)
 
         self.layer1 = self._make_layer(ResidualBlock, 64, 64, 2, 1)
         self.layer2 = self._make_layer(ResidualBlock, 64, 128, 2, 2)
@@ -53,11 +54,23 @@ class ComplexCNNClassifier(nn.Module):
 
     def forward(self, x):
         x = self.relu(self.initial_bn(self.initial_conv(x)))
+        x = self.dropout(x)
+
         x = self.layer1(x)
+        x = self.dropout(x)
+
         x = self.layer2(x)
+        x = self.dropout(x)
+
         x = self.layer3(x)
+        x = self.dropout(x)
+
         x = self.layer4(x)
+        x = self.dropout(x)
+
         x = self.gap(x).squeeze(-1)
+        x = self.dropout(x)
+
         x = self.fc(x)
         return x
 

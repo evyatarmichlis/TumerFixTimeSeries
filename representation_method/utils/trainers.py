@@ -8,7 +8,10 @@ import torch.optim as optim
 import numpy as np
 from tqdm import tqdm
 import matplotlib
-matplotlib.use('TkAgg')
+
+from representation_method.utils.losses import ContrastiveAutoencoderLoss
+
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report, confusion_matrix
 
@@ -117,6 +120,7 @@ class AutoencoderTrainer(BaseTrainer):
 
         return total_loss / len(train_loader)
 
+
     def validate(self, val_loader):
         """Validate the model"""
         self.model.eval()
@@ -126,8 +130,8 @@ class AutoencoderTrainer(BaseTrainer):
             for inputs, _ in val_loader:
                 inputs = inputs.to(self.device)
                 inputs = self.apply_mask(inputs)
-                outputs = self.model(inputs)
-                loss = self.criterion(outputs, inputs)
+                output = self.model(inputs)
+                loss = self.criterion(output, inputs)
                 total_loss += loss.item()
 
         return total_loss / len(val_loader)
@@ -245,17 +249,19 @@ class AutoencoderTrainer(BaseTrainer):
                 with open(os.path.join(self.save_path, 'training_history.json'), 'w') as f:
                     json.dump(history, f)
 
-    def _plot_training_curves(self, train_losses, val_losses):
-        """Plot and save training curves"""
+    def _plot_training_curves(self, train_losses, val_losses, title="Loss", suffix=""):
+        """Plot and save training curves with custom title and suffix"""
         plt.figure(figsize=(10, 5))
-        plt.plot(train_losses, label='Training Loss')
-        plt.plot(val_losses, label='Validation Loss')
+        plt.plot(train_losses, label='Training')
+        plt.plot(val_losses, label='Validation')
         plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('Training and Validation Loss')
+        plt.ylabel(title)
+        plt.title(f'Training and Validation {title}')
         plt.legend()
-        plt.savefig(os.path.join(self.save_path, 'training_curves.png'))
+        plt.savefig(os.path.join(self.save_path, f'training_curves{suffix}.png'))
         plt.close()
+
+
 
 
 class CombinedModelTrainer(BaseTrainer):
@@ -271,9 +277,7 @@ class CombinedModelTrainer(BaseTrainer):
         correct = 0
         total = 0
 
-        pbar = tqdm(enumerate(train_loader), total=len(train_loader),
-                    desc='Training', leave=False)
-        for i, (inputs, labels) in pbar:
+        for i, (inputs, labels) in enumerate(train_loader):
             inputs = inputs.to(self.device)
             labels = labels.to(self.device)
             weights = torch.tensor(window_weights[i], dtype=torch.float32).to(
@@ -296,11 +300,7 @@ class CombinedModelTrainer(BaseTrainer):
             total += batch_total
             correct += batch_correct
 
-            # Update progress bar
-            pbar.set_postfix({
-                'batch_loss': f'{loss.item():.4f}',
-                'batch_acc': f'{100. * batch_correct / batch_total:.2f}%'
-            })
+
 
         return total_loss / len(train_loader), correct / total
 
@@ -312,10 +312,8 @@ class CombinedModelTrainer(BaseTrainer):
         correct = 0
         total = 0
 
-        pbar = tqdm(enumerate(val_loader), total=len(val_loader),
-                    desc='Validating', leave=False)
         with torch.no_grad():
-            for i, (inputs, labels) in pbar:
+            for i, (inputs, labels) in enumerate(val_loader):
                 inputs = inputs.to(self.device)
                 labels = labels.to(self.device)
                 weights = torch.tensor(window_weights[i], dtype=torch.float32).to(
@@ -334,11 +332,6 @@ class CombinedModelTrainer(BaseTrainer):
                 total += batch_total
                 correct += batch_correct
 
-                # Update progress bar
-                pbar.set_postfix({
-                    'batch_loss': f'{loss.item():.4f}',
-                    'batch_acc': f'{100. * batch_correct / batch_total:.2f}%'
-                })
 
         return total_loss / len(val_loader), correct / total
 
@@ -446,6 +439,7 @@ class CombinedModelTrainer(BaseTrainer):
         plt.title('Metrics vs Threshold')
         plt.legend()
         plt.grid(True)
+        plt.savefig(os.path.join(self.save_path, 'optimal_threshold.png'))
 
         return best_result['threshold'], best_result, results
 
@@ -500,7 +494,7 @@ class CombinedModelTrainer(BaseTrainer):
         patience_counter = 0
 
         # Main epoch progress bar
-        epoch_pbar = tqdm(range(epochs), desc='Training Progress')
+        epoch_pbar = tqdm(range(epochs), desc='Training Progress',leave=False)
         for epoch in epoch_pbar:
             train_loss, train_acc = self.train_epoch(train_loader, window_weights_train)
             val_loss, val_acc = self.validate(val_loader, window_weights_val)
@@ -535,13 +529,13 @@ class CombinedModelTrainer(BaseTrainer):
 
 
         if self.save_path:
-            self._plot_training_curves(train_losses, val_losses, train_accs, val_accs)
+            self._plot_training_curves(train_losses, val_losses, train_accs, val_accs,'classifer')
 
         print("\nFinding optimal threshold...")
         best_threshold, best_f1, _ = self.find_optimal_threshold(val_loader)
 
         return best_threshold
-    def _plot_training_curves(self, train_losses, val_losses, train_accs, val_accs):
+    def _plot_training_curves(self, train_losses, val_losses, train_accs, val_accs,name ='classifer'):
         """Plot and save training curves"""
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
 
@@ -562,5 +556,225 @@ class CombinedModelTrainer(BaseTrainer):
         ax2.legend()
 
         plt.tight_layout()
-        plt.savefig(os.path.join(self.save_path, 'training_curves.png'))
+        plt.savefig(os.path.join(self.save_path, f'training_curves_{name}.png'))
         plt.close()
+
+
+class ContrastiveAutoencoderTrainer(AutoencoderTrainer):
+    """Trainer class for contrastive autoencoder"""
+
+    def __init__(self, model, optimizer, loss_function, device,
+                 scheduler=None, mask_probability=0.1, save_path=None,
+                 early_stopping_patience=5):
+        # Pass loss_function as criterion to match parent's signature
+        super().__init__(
+            model=model,
+            criterion=loss_function,  # Use loss_function as criterion
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=device,
+            mask_probability=mask_probability,
+            save_path=save_path,
+            early_stopping_patience=early_stopping_patience
+        )
+
+    def train_epoch(self, train_loader):
+        """Train for one epoch with contrastive loss"""
+        self.model.train()
+        total_loss = 0
+        total_recon_loss = 0
+        total_contrast_loss = 0
+
+        for inputs, labels in train_loader:
+            inputs = inputs.to(self.device)
+            labels = labels.to(self.device)
+            inputs = self.apply_mask(inputs)
+
+            self.optimizer.zero_grad()
+            encoder_output = self.model.encoder(inputs)  # This returns (outputs, hidden)
+
+            reconstructed = self.model(inputs)
+
+            loss, recon_loss, contrast_loss = self.criterion.calculate_loss(
+                reconstructed,
+                inputs,
+                encoder_output,  # Pass the full encoder output (outputs, hidden)
+                labels
+            )
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
+
+            total_loss += loss.item()
+            total_recon_loss += recon_loss.item()
+            total_contrast_loss += contrast_loss.item()
+
+        avg_loss = total_loss / len(train_loader)
+        avg_recon_loss = total_recon_loss / len(train_loader)
+        avg_contrast_loss = total_contrast_loss / len(train_loader)
+
+        return avg_loss, avg_recon_loss, avg_contrast_loss
+
+    def validate(self, val_loader):
+        """Validate with contrastive loss"""
+        self.model.eval()
+        total_loss = 0
+        total_recon_loss = 0
+        total_contrast_loss = 0
+
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                inputs = inputs.to(self.device)
+                labels = labels.to(self.device)
+                inputs = self.apply_mask(inputs)
+
+                # Get encoder outputs and reconstruction
+                encoder_output = self.model.encoder(inputs)  # This returns (outputs, hidden)
+
+                reconstructed = self.model(inputs)
+
+                loss, recon_loss, contrast_loss = self.criterion.calculate_loss(
+                    reconstructed,
+                    inputs,
+                    encoder_output,  # Pass the full encoder output (outputs, hidden)
+                    labels
+                )
+
+                total_loss += loss.item()
+                total_recon_loss += recon_loss.item()
+                total_contrast_loss += contrast_loss.item()
+
+        avg_loss = total_loss / len(val_loader)
+        avg_recon_loss = total_recon_loss / len(val_loader)
+        avg_contrast_loss = total_contrast_loss / len(val_loader)
+
+        return avg_loss, avg_recon_loss, avg_contrast_loss
+
+    def train(self, train_loader, val_loader, epochs):
+        """
+        Main training loop with improved checkpointing and monitoring
+        """
+        train_losses = []
+        val_losses = []
+        train_recon_losses = []
+        val_recon_losses = []
+        train_contrast_losses = []
+        val_contrast_losses = []
+        patience_counter = 0
+        start_time = time.time()
+
+        # Initialize tracking variables
+        self.best_val_loss = float('inf')
+        best_epoch = -1
+        last_epoch = 0
+
+        print(f"Starting training for {epochs} epochs...")
+
+        try:
+            for epoch in range(epochs):
+                last_epoch = epoch
+                epoch_start_time = time.time()
+
+                # Training phase
+                self.model.train()
+                train_loss, train_recon, train_contrast = self.train_epoch(train_loader)
+
+                # Debug print
+
+                train_losses.append(float(train_loss))
+                train_recon_losses.append(float(train_recon))
+                train_contrast_losses.append(float(train_contrast))
+
+                # Validation phase
+                self.model.eval()
+                val_loss, val_recon, val_contrast = self.validate(val_loader)
+
+                # Debug print
+
+                val_losses.append(float(val_loss))
+                val_recon_losses.append(float(val_recon))
+                val_contrast_losses.append(float(val_contrast))
+
+                # Make sure val_loss is a float for comparison
+                val_loss_float = float(val_loss)
+
+                # Calculate epoch time
+                epoch_time = time.time() - epoch_start_time
+
+                # Print progress
+                print(f"\nEpoch {epoch + 1}/{epochs} - Time: {epoch_time:.2f}s")
+                print(f"Train - Total: {train_loss:.4f}, Recon: {train_recon:.4f}, Contrast: {train_contrast:.4f}")
+                print(f"Val - Total: {val_loss:.4f}, Recon: {val_recon:.4f}, Contrast: {val_contrast:.4f}")
+
+                # Learning rate scheduling
+                if self.scheduler is not None:
+                    self.scheduler.step(val_loss_float)
+
+                # Check for best model
+                if val_loss_float < self.best_val_loss:
+                    self.best_val_loss = val_loss_float
+                    best_epoch = epoch
+                    patience_counter = 0
+
+                    if self.save_path:
+                        self.save_checkpoint(
+                            self.save_path,
+                            epoch=epoch,
+                            best=True,
+                            model_type="autoencoder"
+                        )
+                else:
+                    patience_counter += 1
+                    print(f"Validation loss did not improve. Best: {self.best_val_loss:.4f} "
+                          f"at epoch {best_epoch + 1}. Patience: {patience_counter}/{self.early_stopping_patience}")
+
+                    if patience_counter >= self.early_stopping_patience:
+                        print(f"\nEarly stopping triggered after {epoch + 1} epochs")
+                        break
+
+                # Save periodic checkpoint
+                if self.save_path and (epoch + 1) % 10 == 0:
+                    self.save_checkpoint(
+                        self.save_path,
+                        epoch=epoch,
+                        model_type="autoencoder"
+                    )
+
+                print("-" * 80)
+
+        except Exception as e:
+            print(f"\nError during training: {str(e)}")
+            import traceback
+            traceback.print_exc()
+
+        finally:
+            total_time = time.time() - start_time
+            print("\nTraining completed!")
+            print(f"Total time: {total_time:.2f}s")
+            print(f"Epochs completed: {last_epoch + 1}")
+            print(f"Best val loss: {self.best_val_loss:.4f} at epoch {best_epoch + 1}")
+
+            if self.save_path and len(train_losses) > 0:
+                # Save plots and history
+                self._plot_training_curves(train_losses, val_losses, "Total Loss")
+                self._plot_training_curves(train_recon_losses, val_recon_losses, "Reconstruction Loss", suffix="_recon")
+                self._plot_training_curves(train_contrast_losses, val_contrast_losses, "Contrastive Loss",
+                                           suffix="_contrast")
+
+                history = {
+                    'train_losses': train_losses,
+                    'val_losses': val_losses,
+                    'train_recon_losses': train_recon_losses,
+                    'val_recon_losses': val_recon_losses,
+                    'train_contrast_losses': train_contrast_losses,
+                    'val_contrast_losses': val_contrast_losses,
+                    'best_epoch': best_epoch,
+                    'best_val_loss': float(self.best_val_loss),
+                    'total_epochs': last_epoch + 1,
+                    'total_time': total_time
+                }
+
+                with open(os.path.join(self.save_path, 'training_history.json'), 'w') as f:
+                    json.dump(history, f)
+
+            return train_losses, val_losses
