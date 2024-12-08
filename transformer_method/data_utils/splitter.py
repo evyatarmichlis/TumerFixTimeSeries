@@ -8,20 +8,7 @@ import json
 
 from keras.src.utils.config import Config
 
-
-@dataclass
-class SplitConfig:
-    """Configuration for data splitting"""
-    train_ratio: float = 0.7
-    val_ratio: float = 0.15
-    test_ratio: float = 0.15
-    time_column: str = 'SAMPLE_START_TIME'
-    trial_column: str = 'RECORDING_SESSION_LABEL'
-    random_seed: Optional[int] = None
-
-    def __post_init__(self):
-        assert np.isclose(self.train_ratio + self.val_ratio + self.test_ratio, 1.0), \
-            "Split ratios must sum to 1"
+from transformer_method.configs.config import SplitConfig
 
 
 class TrialSplitter:
@@ -35,14 +22,14 @@ class TrialSplitter:
     - Provides split statistics
     """
 
-    def __init__(self, config:Config):
+    def __init__(self, config:SplitConfig):
         """
         Initialize the splitter with configuration.
 
         Args:
             config: Either a SplitConfig object or a dictionary with configuration parameters
         """
-        self.config = config if isinstance(config, SplitConfig) else SplitConfig(**config)
+        self.config = config
         self.split_indices = {}
         self._setup_logging()
 
@@ -106,9 +93,62 @@ class TrialSplitter:
         train_df = pd.concat(train_dfs, ignore_index=True)
         val_df = pd.concat(val_dfs, ignore_index=True)
         test_df = pd.concat(test_dfs, ignore_index=True)
+        train_df.drop(columns=self.config.time_column, inplace=True)
+        val_df.drop(columns=self.config.time_column, inplace=True)
+        test_df.drop(columns=self.config.time_column, inplace=True)
 
         # Log split statistics
         self._log_split_statistics(split_info)
+
+        return train_df, val_df, test_df
+
+    def split_by_trials(self, df: pd.DataFrame,seed = 42) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """
+        Split DataFrame by trials maintaining temporal order with 70/15/15 split.
+        """
+        self.logger.info("\nSplitting data by trials...")
+        np.random.seed(seed)
+        # Get unique trials in temporal order
+        trials = df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']].drop_duplicates()
+
+        # Calculate split indices
+        n_trials = len(trials)
+        train_idx = int(0.7 * n_trials)
+        val_idx = int(0.85 * n_trials)
+
+        # Split trials maintaining order
+        train_trials = trials.iloc[:train_idx]
+        val_trials = trials.iloc[train_idx:val_idx]
+        test_trials = trials.iloc[val_idx:]
+
+        # Create splits maintaining temporal order
+        train_mask = df.set_index(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']).index.isin(
+            train_trials.set_index(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']).index
+        )
+        val_mask = df.set_index(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']).index.isin(
+            val_trials.set_index(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']).index
+        )
+        test_mask = df.set_index(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']).index.isin(
+            test_trials.set_index(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']).index
+        )
+
+        train_df = df[train_mask].copy()
+        val_df = df[val_mask].copy()
+        test_df = df[test_mask].copy()
+
+        # Log split information
+        self.logger.info("\nSplit Statistics:")
+        self.logger.info(f"Total trials: {n_trials}")
+        self.logger.info(f"Train trials: {len(train_trials)} ({len(train_trials) / n_trials:.1%})")
+        self.logger.info(f"Val trials: {len(val_trials)} ({len(val_trials) / n_trials:.1%})")
+        self.logger.info(f"Test trials: {len(test_trials)} ({len(test_trials) / n_trials:.1%})")
+
+        for name, split_df in [('Train', train_df), ('Val', val_df), ('Test', test_df)]:
+            total = len(split_df)
+            class_1_count = (split_df['target'] == 1).sum()
+            self.logger.info(f"\n{name}:")
+            self.logger.info(f"Total samples: {total}")
+            self.logger.info(f"Class 1 samples: {class_1_count} ({class_1_count / total:.1%})")
 
         return train_df, val_df, test_df
 
@@ -153,47 +193,8 @@ class TrialSplitter:
         self.logger.info(f"Val Samples: {total_val} ({total_val / total_samples:.1%})")
         self.logger.info(f"Test Samples: {total_test} ({total_test / total_samples:.1%})")
 
-        # Per-trial statistics
-        trial_stats = pd.DataFrame.from_dict(
-            {trial: {
-                'samples': info['total_samples'],
-                'train_ratio': info['train_samples'] / info['total_samples'],
-                'val_ratio': info['val_samples'] / info['total_samples'],
-                'test_ratio': info['test_samples'] / info['total_samples']
-            }
-                for trial, info in split_info['trials'].items()},
-            orient='index'
-        )
 
-        self.logger.info("\nPer-Trial Statistics:")
-        self.logger.info(f"\nSample Distribution:\n{trial_stats.describe()}")
 
-    def get_split_summary(self) -> dict:
-        """
-        Get a summary of the current split configuration and statistics.
-
-        Returns:
-            Dictionary containing split configuration and statistics
-        """
-        if not self.split_indices:
-            return {"status": "No splits performed yet"}
-
-        summary = {
-            "config": vars(self.config),
-            "splits": {
-                "n_trials": len(self.split_indices),
-                "trials": {}
-            }
-        }
-
-        for trial, indices in self.split_indices.items():
-            summary["splits"]["trials"][trial] = {
-                "train_samples": indices["train"][1] - indices["train"][0],
-                "val_samples": indices["val"][1] - indices["val"][0],
-                "test_samples": indices["test"][1] - indices["test"][0]
-            }
-
-        return summary
 
 
 def create_temporal_splits(

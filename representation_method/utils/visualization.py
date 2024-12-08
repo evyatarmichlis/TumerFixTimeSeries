@@ -6,7 +6,7 @@ import os
 import matplotlib
 import torch
 from scipy.stats import gaussian_kde
-
+from tqdm import tqdm
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -14,6 +14,28 @@ import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.metrics import confusion_matrix, silhouette_score, davies_bouldin_score
+import umap
+
+import signal
+from contextlib import contextmanager
+import time
+
+
+@contextmanager
+def timeout(seconds):
+    """Simple timeout context manager using signal"""
+
+    def signal_handler(signum, frame):
+        raise TimeoutError(f"Timed out after {seconds} seconds")
+
+    # Set the signal handler
+    signal.signal(signal.SIGALRM, signal_handler)
+    signal.alarm(seconds)  # Start the timer
+
+    try:
+        yield
+    finally:
+        signal.alarm(0)  # Disable the alarm
 
 
 def analyze_embeddings_from_loader(encoder, loader, device, method_dir, loader_name="data", sample_ratio=0.1):
@@ -254,3 +276,293 @@ def plot_pca_tsne_visualization(features, labels, save_dir, prefix=''):
     plt.close()
 
 
+def analyze_vae_embeddings_from_loader(vae_model, loader, device, method_dir, loader_name="data", n_iterations=5,
+                                       sample_ratio=0.1, perplexity=30):
+    """
+    Analyze embeddings with multiple iterations of sampling and averaged metrics.
+
+    Args:
+        vae_model: The VAE model
+        loader: DataLoader
+        device: torch device
+        method_dir: Output directory
+        loader_name: Name for the analysis
+        n_iterations: Number of sampling iterations
+        sample_ratio: Ratio of majority class to sample
+        perplexity: t-SNE perplexity parameter
+    """
+    print(f"\nAnalyzing {loader_name} embeddings...")
+    embedding_dir = os.path.join(method_dir, f'embedding_analysis_{loader_name}')
+    os.makedirs(embedding_dir, exist_ok=True)
+
+    # Collect all embeddings first
+    vae_model.eval()
+    all_embeddings = []
+    all_labels = []
+    with torch.no_grad():
+        for batch, labels in loader:
+            batch = batch.to(device)
+            mu, _ = vae_model.encode(batch)
+            all_embeddings.append(mu.cpu())
+            all_labels.append(labels)
+
+    embeddings = torch.cat(all_embeddings, dim=0).numpy()
+    labels = torch.cat(all_labels, dim=0).numpy()
+
+    # Initialize arrays to store metrics
+    silhouette_scores = []
+    davies_bouldin_scores = []
+    tsne_results = []
+
+    # Get indices for each class
+    class_0_indices = np.where(labels == 0)[0]
+    class_1_indices = np.where(labels == 1)[0]
+    num_samples = int(len(class_0_indices) * sample_ratio)
+
+    print(f"Running {n_iterations} iterations with {num_samples} samples from majority class...")
+
+    for i in tqdm(range(n_iterations)):
+        # Sample from majority class
+        sampled_class_0_indices = np.random.choice(class_0_indices, num_samples, replace=False)
+        selected_indices = np.concatenate([sampled_class_0_indices, class_1_indices])
+
+        iter_embeddings = embeddings[selected_indices]
+        iter_labels = labels[selected_indices]
+
+        # Compute t-SNE with optimized parameters
+        tsne = TSNE(
+            n_components=2,
+            method='barnes_hut',  # Faster approximation method
+        )
+        embeddings_2d = tsne.fit_transform(iter_embeddings)
+
+        # Calculate metrics
+        sil_score = silhouette_score(embeddings_2d, iter_labels)
+        db_score = davies_bouldin_score(embeddings_2d, iter_labels)
+
+        silhouette_scores.append(sil_score)
+        davies_bouldin_scores.append(db_score)
+        tsne_results.append((embeddings_2d, iter_labels))
+
+    # Calculate statistics
+    avg_silhouette = np.mean(silhouette_scores)
+    std_silhouette = np.std(silhouette_scores)
+    avg_davies = np.mean(davies_bouldin_scores)
+    std_davies = np.std(davies_bouldin_scores)
+
+    # Find median result based on silhouette score
+    median_idx = np.argsort(silhouette_scores)[len(silhouette_scores) // 2]
+    median_embeddings_2d, median_labels = tsne_results[median_idx]
+
+    # Save analysis results
+    with open(os.path.join(embedding_dir, 'embedding_analysis.txt'), 'w') as f:
+        f.write(f"{loader_name} Embedding Analysis Results\n")
+        f.write(f"========================\n")
+        f.write(f"Analysis Parameters:\n")
+        f.write(f"Number of iterations: {n_iterations}\n")
+        f.write(f"Sample ratio: {sample_ratio}\n")
+        f.write(f"Perplexity: {perplexity}\n\n")
+        f.write(f"Clustering Metrics (mean ± std):\n")
+        f.write(f"Silhouette Score: {avg_silhouette:.3f} ± {std_silhouette:.3f}\n")
+        f.write(f"Davies-Bouldin Score: {avg_davies:.3f} ± {std_davies:.3f}\n\n")
+
+        # Class distribution
+        f.write(f"Class Distribution:\n")
+        f.write(f"Original majority class (0): {len(class_0_indices)}\n")
+        f.write(f"Sampled majority class (0): {num_samples}\n")
+        f.write(f"Minority class (1): {len(class_1_indices)}\n")
+
+    # Create visualization with median result
+    plt.figure(figsize=(15, 5))
+
+    # Plot 1: Scatter plot of median embeddings
+    plt.subplot(131)
+    scatter = plt.scatter(median_embeddings_2d[:, 0], median_embeddings_2d[:, 1],
+                          c=median_labels, cmap='coolwarm', alpha=0.6)
+    plt.colorbar(scatter)
+    plt.title(f"Median t-SNE Result\nSilhouette: {silhouette_scores[median_idx]:.3f}")
+    plt.xlabel("t-SNE 1")
+    plt.ylabel("t-SNE 2")
+
+    # Plot 2: Metrics Distribution
+    plt.subplot(132)
+    plt.boxplot([silhouette_scores, davies_bouldin_scores],
+                labels=['Silhouette', 'Davies-Bouldin'])
+    plt.title("Metrics Distribution")
+
+    # Plot 3: Latent Space Norms
+    plt.subplot(133)
+    for label in [0, 1]:
+        mask = labels == label
+        norms = np.linalg.norm(embeddings[mask], axis=1)
+        plt.hist(norms, bins=30, alpha=0.5, label=f'Class {label}',
+                 density=True)
+    plt.title("Latent Space Norms")
+    plt.xlabel("L2 Norm")
+    plt.ylabel("Density")
+    plt.legend()
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(embedding_dir, 'vae_embedding_visualization.png'))
+    plt.close()
+
+    print(f"\nResults Summary:")
+    print(f"Silhouette Score: {avg_silhouette:.3f} ± {std_silhouette:.3f}")
+    print(f"Davies-Bouldin Score: {avg_davies:.3f} ± {std_davies:.3f}")
+
+    return embeddings, median_embeddings_2d, median_labels, {
+        'silhouette_scores': silhouette_scores,
+        'davies_bouldin_scores': davies_bouldin_scores,
+        'avg_silhouette': avg_silhouette,
+        'avg_davies': avg_davies
+    }
+
+
+def analyze_vae_embeddings_with_umap(vae_model, loader, device, method_dir, loader_name="data",
+                                     n_iterations=10, sample_ratio=0.2, n_neighbors=15, min_dist=0.1):
+    """
+    Analyze embeddings using UMAP with multiple iterations of sampling and averaged metrics.
+
+    Args:
+        vae_model: The VAE model
+        loader: DataLoader
+        device: torch device
+        method_dir: Output directory
+        loader_name: Name for the analysis
+        n_iterations: Number of sampling iterations
+        sample_ratio: Ratio of majority class to sample
+        n_neighbors: UMAP n_neighbors parameter
+        min_dist: UMAP min_dist parameter
+    """
+    print(f"\nAnalyzing {loader_name} embeddings with UMAP...")
+    embedding_dir = os.path.join(method_dir, f'embedding_analysis_umap_{loader_name}')
+    os.makedirs(embedding_dir, exist_ok=True)
+
+    # Collect all embeddings
+    vae_model.eval()
+    all_embeddings = []
+    all_labels = []
+    with torch.no_grad():
+        for batch, labels in loader:
+            batch = batch.to(device)
+            mu, _ = vae_model.encode(batch)
+            all_embeddings.append(mu.cpu())
+            all_labels.append(labels)
+
+    embeddings = torch.cat(all_embeddings, dim=0).numpy()
+    labels = torch.cat(all_labels, dim=0).numpy()
+
+    # Initialize arrays for metrics
+    silhouette_scores = []
+    davies_bouldin_scores = []
+    umap_results = []
+
+    # Get indices for each class
+    class_0_indices = np.where(labels == 0)[0]
+    class_1_indices = np.where(labels == 1)[0]
+    num_samples = int(len(class_0_indices) * sample_ratio)
+
+    print(f"Running {n_iterations} iterations with {num_samples} samples from majority class...")
+
+    for i in tqdm(range(n_iterations)):
+        # Sample from majority class
+        sampled_class_0_indices = np.random.choice(class_0_indices, num_samples, replace=False)
+        selected_indices = np.concatenate([sampled_class_0_indices, class_1_indices])
+
+        iter_embeddings = embeddings[selected_indices]
+        iter_labels = labels[selected_indices]
+
+        # Compute UMAP
+        reducer = umap.UMAP(
+            n_neighbors=n_neighbors,
+            min_dist=min_dist,
+            n_components=2,
+            # random_state=42 + i
+        )
+        try:
+            with timeout(60):
+                embeddings_2d = reducer.fit_transform(iter_embeddings)
+        except TimeoutError:
+            print(f"\nWarning: Iteration {i + 1} timed out after {300} seconds")
+            continue
+        # Calculate metrics
+        sil_score = silhouette_score(embeddings_2d, iter_labels)
+        db_score = davies_bouldin_score(embeddings_2d, iter_labels)
+
+        silhouette_scores.append(sil_score)
+        davies_bouldin_scores.append(db_score)
+        umap_results.append((embeddings_2d, iter_labels))
+
+    # Calculate statistics
+    avg_silhouette = np.mean(silhouette_scores)
+    std_silhouette = np.std(silhouette_scores)
+    avg_davies = np.mean(davies_bouldin_scores)
+    std_davies = np.std(davies_bouldin_scores)
+
+    # Find median result based on silhouette score
+    median_idx = np.argsort(silhouette_scores)[len(silhouette_scores) // 2]
+    median_embeddings_2d, median_labels = umap_results[median_idx]
+
+    # Save analysis results
+    with open(os.path.join(embedding_dir, 'umap_analysis.txt'), 'w') as f:
+        f.write(f"{loader_name} UMAP Analysis Results\n")
+        f.write(f"========================\n")
+        f.write(f"Analysis Parameters:\n")
+        f.write(f"Number of iterations: {n_iterations}\n")
+        f.write(f"Sample ratio: {sample_ratio}\n")
+        f.write(f"UMAP n_neighbors: {n_neighbors}\n")
+        f.write(f"UMAP min_dist: {min_dist}\n\n")
+        f.write(f"Clustering Metrics (mean ± std):\n")
+        f.write(f"Silhouette Score: {avg_silhouette:.3f} ± {std_silhouette:.3f}\n")
+        f.write(f"Davies-Bouldin Score: {avg_davies:.3f} ± {std_davies:.3f}\n\n")
+
+        # Save all iterations' scores
+        f.write("\nDetailed Scores per Iteration:\n")
+        for i in range(n_iterations):
+            f.write(f"Iteration {i + 1}:\n")
+            f.write(f"  Silhouette: {silhouette_scores[i]:.3f}\n")
+            f.write(f"  Davies-Bouldin: {davies_bouldin_scores[i]:.3f}\n")
+
+    # Create visualization
+    plt.figure(figsize=(15, 5))
+
+    # Plot 1: Scatter plot of median embeddings
+    plt.subplot(131)
+    scatter = plt.scatter(median_embeddings_2d[:, 0], median_embeddings_2d[:, 1],
+                          c=median_labels, cmap='coolwarm', alpha=0.6)
+    plt.colorbar(scatter)
+    plt.title(f"Median UMAP Result\nSilhouette: {silhouette_scores[median_idx]:.3f}")
+    plt.xlabel("UMAP 1")
+    plt.ylabel("UMAP 2")
+
+    # Plot 2: Metrics Distribution
+    plt.subplot(132)
+    plt.boxplot([silhouette_scores, davies_bouldin_scores],
+                labels=['Silhouette', 'Davies-Bouldin'])
+    plt.title("Metrics Distribution")
+
+    # Plot 3: Score Progression
+    plt.subplot(133)
+    plt.plot(silhouette_scores, label='Silhouette', marker='o')
+    plt.plot(davies_bouldin_scores, label='Davies-Bouldin', marker='s')
+    plt.title("Scores Across Iterations")
+    plt.xlabel("Iteration")
+    plt.ylabel("Score")
+    plt.legend()
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(embedding_dir, 'umap_visualization.png'))
+    plt.close()
+
+    print(f"\nResults Summary:")
+    print(f"Silhouette Score: {avg_silhouette:.3f} ± {std_silhouette:.3f}")
+    print(f"Davies-Bouldin Score: {avg_davies:.3f} ± {std_davies:.3f}")
+
+    return embeddings, median_embeddings_2d, median_labels, {
+        'silhouette_scores': silhouette_scores,
+        'davies_bouldin_scores': davies_bouldin_scores,
+        'avg_silhouette': avg_silhouette,
+        'std_silhouette': std_silhouette,
+        'avg_davies': avg_davies,
+        'std_davies': std_davies
+    }

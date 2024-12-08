@@ -6,9 +6,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+from sympy.abc import alpha
 from tqdm import tqdm
 import matplotlib
 
+from plots_helper import labels
 from representation_method.utils.losses import ContrastiveAutoencoderLoss
 
 matplotlib.use('Agg')
@@ -778,3 +780,263 @@ class ContrastiveAutoencoderTrainer(AutoencoderTrainer):
                     json.dump(history, f)
 
             return train_losses, val_losses
+
+import torch.nn.functional as F
+
+class VAETrainer(BaseTrainer):
+    """Trainer class specifically for VAE"""
+
+    def __init__(self, model,criterion, optimizer, scheduler, device,l2_alpha =0.1, beta=0.1,margin=1,triplet_weight=1,distance_metric='L2',loss_type='normal',
+                 save_path=None, early_stopping_patience=10):
+        super().__init__(model,criterion, optimizer, scheduler, device, save_path, early_stopping_patience)
+        self.l2_alpha = l2_alpha
+        self.beta = beta  # Weight for KL divergence loss
+        self.margin = margin
+        self.best_val_loss = float('inf')
+        self.triplet_weight = triplet_weight
+        self.distance_metric = distance_metric
+        self.loss_type = loss_type
+
+    def compute_loss(self, x, recon_x, mu, logvar):
+        """Compute VAE loss: reconstruction + KL divergence"""
+        # Reconstruction loss (MSE for time series)
+        recon_loss = F.mse_loss(recon_x, x, reduction='sum')
+
+        # KL divergence loss
+        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+
+        return recon_loss + self.beta * kl_loss, recon_loss, kl_loss
+
+
+    def choose_triplet_loss(self, x, recon_x, mu, logvar, labels):
+        if self.loss_type == 'normal':
+            return self.compute_triplet_loss(x, recon_x, mu, logvar, labels)
+        elif self.loss_type == 'dual':
+            return self.compute_dual_triplet_loss(x, recon_x, mu, logvar, labels)
+        else:
+            return -1
+
+    def compute_triplet_loss(self, x, recon_x, mu, logvar, labels):
+        """Compute VAE loss: reconstruction + KL divergence + triplet loss"""
+        # Original losses
+        recon_loss = F.mse_loss(recon_x, x, reduction='sum')
+        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        # Create minority mask as tensor
+        minority_mask = (labels == 1)
+        triplet_loss = torch.tensor(0.0, device=mu.device)
+
+        if torch.any(minority_mask):  # Use torch.any() instead of .any()
+            # Normalize embeddings
+            embeddings = F.normalize(mu, p=2, dim=1)
+            # Compute pairwise distances
+            if self.distance_metric == "L2":
+                dist_matrix = torch.cdist(embeddings, embeddings)
+            elif self.distance_metric == "cosine":
+                cos_sim_matrix = torch.mm(embeddings, embeddings.t())
+                # Convert to distances (1 - similarity)
+                dist_matrix = 1 - cos_sim_matrix
+            # Get hardest positive and negative for minority class
+            minority_indices = torch.where(minority_mask)[0]
+            for anchor_idx in minority_indices:
+                pos_mask = (labels == labels[anchor_idx]) & (
+                            torch.arange(len(labels), device=labels.device) != anchor_idx)
+                neg_mask = labels != labels[anchor_idx]
+                if torch.any(pos_mask) and torch.any(neg_mask):
+                    # Get hardest positive and negative
+                    pos_dist = dist_matrix[anchor_idx][pos_mask].mean()
+                    neg_dist = dist_matrix[anchor_idx][neg_mask].min()
+                    triplet_loss += torch.relu(pos_dist - neg_dist +  self.margin)
+        total_loss = self.l2_alpha *recon_loss + self.beta * kl_loss + self.triplet_weight * triplet_loss
+        return total_loss, recon_loss, kl_loss , triplet_loss
+
+    def compute_adaptive_margin(self,dist_matrix, labels):
+        intra_class_dist = dist_matrix[labels.unsqueeze(0) == labels.unsqueeze(1)].mean()
+        inter_class_dist = dist_matrix[labels.unsqueeze(0) != labels.unsqueeze(1)].mean()
+        return (inter_class_dist - intra_class_dist) * 0.5
+
+
+    def compute_dual_triplet_loss(self, x, recon_x, mu, logvar, labels):
+        recon_loss = F.mse_loss(recon_x, x, reduction='sum')
+        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        embeddings = F.normalize(mu, p=2, dim=1)
+        if self.distance_metric == "L2":
+            dist_matrix = torch.cdist(embeddings, embeddings)
+        elif self.distance_metric == "cosine":
+            cos_sim_matrix = torch.mm(embeddings, embeddings.t())
+            dist_matrix = 1 - cos_sim_matrix
+
+        triplet_loss = torch.tensor(0.0, device=mu.device)
+
+        # Compute adaptive margin
+        margin = self.margin
+
+        for class_label in [0, 1]:
+            class_indices = torch.where(labels == class_label)[0]
+            for anchor_idx in class_indices:
+                pos_mask = (labels == labels[anchor_idx]) & (
+                            torch.arange(len(labels), device=labels.device) != anchor_idx)
+                neg_mask = labels != labels[anchor_idx]
+
+                if torch.any(pos_mask) and torch.any(neg_mask):
+                    pos_dist = dist_matrix[anchor_idx][pos_mask].mean()
+                    neg_dist = dist_matrix[anchor_idx][neg_mask].min()
+                    triplet_loss += torch.relu(pos_dist - neg_dist + margin)
+
+        total_loss = recon_loss + self.beta * kl_loss + self.triplet_weight * triplet_loss
+        return total_loss, recon_loss, kl_loss, triplet_loss
+
+    def train_epoch(self, train_loader):
+        """Train for one epoch"""
+        self.model.train()
+        total_loss = 0
+        total_recon_loss = 0
+        total_kl_loss = 0
+        total_triplet_loss = 0
+        for inputs,labels in train_loader:
+            inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+            # Forward pass
+            recon_batch, mu, logvar = self.model(inputs)
+
+            # Compute loss
+            loss, recon_loss, kl_loss,triplet_loss = self.choose_triplet_loss(inputs, recon_batch, mu, logvar,labels)
+
+            # Backward pass
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            total_loss += loss.item()
+            total_recon_loss += recon_loss.item()
+            total_kl_loss += kl_loss.item()
+            total_triplet_loss += triplet_loss.item()
+
+        avg_loss = total_loss / len(train_loader.dataset)
+        avg_recon = total_recon_loss / len(train_loader.dataset)
+        avg_kl = total_kl_loss / len(train_loader.dataset)
+        avg_trip= total_triplet_loss / len(train_loader.dataset)
+
+        return avg_loss, avg_recon, avg_kl,avg_trip
+
+    def validate(self, val_loader):
+        """Validate the model"""
+        self.model.eval()
+        total_loss = 0
+        total_recon_loss = 0
+        total_kl_loss = 0
+        total_triplet_loss = 0
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+                # Forward pass
+                recon_batch, mu, logvar = self.model(inputs)
+
+                # Compute loss
+                loss, recon_loss, kl_loss,triplet_loss  = self.choose_triplet_loss(inputs, recon_batch, mu, logvar,labels)
+
+                total_loss += loss.item()
+                total_recon_loss += recon_loss.item()
+                total_kl_loss += kl_loss.item()
+                total_triplet_loss += triplet_loss.item()
+
+        avg_loss = total_loss / len(val_loader.dataset)
+        avg_recon = total_recon_loss / len(val_loader.dataset)
+        avg_kl = total_kl_loss / len(val_loader.dataset)
+        avg_trip= total_triplet_loss / len(val_loader.dataset)
+
+        return avg_loss, avg_recon, avg_kl,avg_trip
+
+    def train(self, train_loader, val_loader, epochs):
+        """Main training loop"""
+        train_losses = []
+        val_losses = []
+        train_recon_losses = []
+        val_recon_losses = []
+        train_kl_losses = []
+        val_kl_losses = []
+        train_triplet_losses = []
+        val_triplet_losses = []
+        patience_counter = 0
+
+        print(f"Starting training for {epochs} epochs...")
+
+        try:
+            for epoch in range(epochs):
+                # Training phase
+                train_loss, train_recon, train_kl,train_triplet = self.train_epoch(train_loader)
+                train_losses.append(train_loss)
+                train_recon_losses.append(train_recon)
+                train_kl_losses.append(train_kl)
+                train_triplet_losses.append(train_triplet)
+                # Validation phase
+                val_loss, val_recon, val_kl,val_triplet = self.validate(val_loader)
+                val_losses.append(val_loss)
+                val_recon_losses.append(val_recon)
+                val_kl_losses.append(val_kl)
+                val_triplet_losses.append(val_triplet)
+                # Print progress
+                print(f"\nEpoch {epoch + 1}/{epochs}")
+                print(f"Train - Total: {train_loss:.4f}, Recon: {train_recon:.4f}, KL: {train_kl:.4f}, Triplet:{train_triplet:.4f}")
+                print(f"Val - Total: {val_loss:.4f}, Recon: {val_recon:.4f}, KL: {val_kl:.4f}, Triplet:{val_triplet:.4f}")
+
+                # Learning rate scheduling
+                if self.scheduler:
+                    self.scheduler.step(val_loss)
+
+                # Early stopping check
+                if val_loss < self.best_val_loss:
+                    self.best_val_loss = val_loss
+                    patience_counter = 0
+                    if self.save_path:
+                        self.save_model(self.save_path, epoch, best=True)
+                else:
+                    patience_counter += 1
+                    print(f"Validation loss did not improve. Best: {self.best_val_loss:.4f}")
+                    if patience_counter >= self.early_stopping_patience:
+                        print(f"\nEarly stopping triggered after {epoch + 1} epochs")
+                        break
+
+                print("-" * 80)
+
+        except KeyboardInterrupt:
+            print("\nTraining interrupted by user")
+
+        finally:
+            if self.save_path:
+                # Plot and save training curves
+                self._plot_training_curves(
+                    train_losses, val_losses,
+                    train_recon_losses, val_recon_losses,
+                    train_kl_losses, val_kl_losses
+                )
+
+        return train_losses, val_losses
+
+    def _plot_training_curves(self, train_losses, val_losses,
+                              train_recon_losses, val_recon_losses,
+                              train_kl_losses, val_kl_losses):
+        """Plot and save training curves"""
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
+
+        # Total loss
+        ax1.plot(train_losses, label='Train')
+        ax1.plot(val_losses, label='Val')
+        ax1.set_title('Total Loss')
+        ax1.legend()
+
+        # Reconstruction loss
+        ax2.plot(train_recon_losses, label='Train')
+        ax2.plot(val_recon_losses, label='Val')
+        ax2.set_title('Reconstruction Loss')
+        ax2.legend()
+
+        # KL loss
+        ax3.plot(train_kl_losses, label='Train')
+        ax3.plot(val_kl_losses, label='Val')
+        ax3.set_title('KL Divergence')
+        ax3.legend()
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.save_path, 'training_curves.png'))
+        plt.close()

@@ -88,3 +88,45 @@ class CombinedModel(nn.Module):
         x = outputs.permute(0, 2, 1)
         logits = self.classifier(x)
         return logits
+
+
+class TVAEClassifier(nn.Module):
+    def __init__(self, vae_model, hidden_dim=128, num_classes=2, dropout=0.3):
+        super().__init__()
+        self.vae_model = vae_model
+
+        # Freeze VAE encoder initially
+        for param in self.vae_model.parameters():
+            param.requires_grad = False
+
+        # Get encoder output dimension from the VAE model
+        self.encoder_dim = self.vae_model.latent_dim * 2  # Assuming bidirectional encoder
+
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.Linear(self.encoder_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_classes)
+        )
+
+        self.training_phase = 'frozen_encoder'  # or 'fine_tuning'
+
+    def forward(self, x):
+        # Get VAE encoder outputs
+        mu, logvar = self.vae_model.encode(x)
+
+        # Concatenate mean and logvar
+        features = torch.cat((mu, logvar), dim=1)
+
+        # Pass features through classifier
+        logits = self.classifier(features)
+
+        return logits, features
+
+    def unfreeze_encoder(self):
+        """Unfreeze VAE encoder for fine-tuning"""
+        for param in self.vae_model.parameters():
+            param.requires_grad = True
+        self.training_phase = 'fine_tuning'

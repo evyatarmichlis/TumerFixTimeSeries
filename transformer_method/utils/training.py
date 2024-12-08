@@ -5,16 +5,37 @@ import torch
 from pathlib import Path
 import json
 
+
 def setup_logging(log_file):
-    """Setup logging configuration"""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler()
-        ]
-    )
+    """
+    Setup logging configuration and return logger instance.
+
+    Args:
+        log_file: Path to log file
+
+    Returns:
+        logging.Logger: Configured logger instance
+    """
+    log_file = Path(log_file)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    logger = logging.getLogger('experiment_logger')
+    logger.setLevel(logging.INFO)
+
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+
+    file_handler = logging.FileHandler(str(log_file))
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    return logger
 
 def seed_everything(seed):
     """Set seeds for reproducibility"""

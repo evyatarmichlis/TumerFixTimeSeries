@@ -25,37 +25,20 @@ class DataConfig:
     augment: bool = False
     join_train_test: bool = False
     normalize: bool = True
-    remove_surrounding_hits: int = 0
-    update_surrounding_hits: int = 0
     per_slice_target: bool = False
-    remove_saccade: bool = True
-    window_size: int = 100  # New parameter for rolling window size
-    stride: int = 1  # New parameter for window stride
-    feature_columns: List[str] = None
+    window_size: int = 32
+    stride: int = 8
     invalid_value: int = -1
 
     def __post_init__(self):
-
-        if self.feature_columns is None and not  self.remove_saccade:
-            self.feature_columns = [
-                'Pupil_Size',
-                'GAZE_IA_X',
-                'GAZE_IA_Y',
-                'CURRENT_FIX_INDEX',
-                'SAMPLE_START_TIME',
-                'IN_BLINK',
-                'IN_SACCADE'
-            ]
-        else:
-            self.feature_columns = [
-                'Pupil_Size',
-                'GAZE_IA_X',
-                'GAZE_IA_Y',
-                'CURRENT_FIX_INDEX',
-                'SAMPLE_START_TIME',
-                'IN_BLINK',
-            ]
-
+        # Updated feature columns with new normalized features
+        self.feature_columns = [
+            'Pupil_Size',
+            'CURRENT_FIX_INDEX',
+            'relative_x',
+            'relative_y',
+            'gaze_velocity'
+        ]
 
 
 class BaseDataLoader(ABC):
@@ -195,11 +178,50 @@ class TimeSeriesDataLoader(BaseDataLoader):
     @staticmethod
     def letter_to_num(letter: str) -> int:
         return ord(letter.upper()) - ord('A') + 1
+    def _normalize_pupil_size(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Normalize pupil size to 0-1 range"""
+        # Ensure we're not dividing by zero
+        df['Pupil_Size'] = df['Pupil_Size'].apply(lambda x: float(x))
+        min_pupil = df['Pupil_Size'].min()
+        max_pupil = df['Pupil_Size'].max()
 
+        if max_pupil > min_pupil:
+            df['Pupil_Size'] = (df['Pupil_Size'] - min_pupil) / (max_pupil - min_pupil)
+        else:
+            self.logger.warning("Could not normalize Pupil_Size: min equals max")
+        df['Pupil_Size'] = df['Pupil_Size'].clip(1e-6, 1 - 1e-6)
+        df['Pupil_Size'] = df['Pupil_Size'].astype(np.float32)
+        return df
+
+    def _add_gaze_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add relative gaze coordinates and velocity features by recording session and trial"""
+        grouping_cols = ['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']
+
+        # Calculate relative X and Y positions
+        df['relative_x'] = df.groupby(grouping_cols)['GAZE_IA_X'].transform(lambda x: x - x.mean())
+        df['relative_y'] = df.groupby(grouping_cols)['GAZE_IA_Y'].transform(lambda x: x - x.mean())
+
+        # Calculate gaze velocity
+        df['gaze_velocity'] = df.groupby(grouping_cols).apply(
+            lambda group: np.sqrt(
+                group['GAZE_IA_X'].diff() ** 2 +
+                group['GAZE_IA_Y'].diff() ** 2
+            )
+        ).reset_index(level=[0, 1], drop=True)
+
+        # Fill NaN values in velocity
+        df['gaze_velocity'] = df['gaze_velocity'].fillna(0)
+
+        # Convert to float32 for memory efficiency
+        df['relative_x'] = df['relative_x'].astype(np.float32)
+        df['relative_y'] = df['relative_y'].astype(np.float32)
+        df['gaze_velocity'] = df['gaze_velocity'].astype(np.float32)
+
+        return df
     def _preprocess_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Optimize data types and preprocessing for memory efficiency."""
-        # Print columns before dropping to debug
-        print("Columns before dropping:", df.columns.tolist())
+        self.logger.info("Starting data preprocessing...")
+        df = df.copy()
 
         # Initial cleanup
         df = df.replace(['.', np.nan], self.config.invalid_value)
@@ -215,54 +237,56 @@ class TimeSeriesDataLoader(BaseDataLoader):
         else:
             df = df.rename(columns={'Hit': 'target'})
 
-        # Convert GAZE_IA to coordinates if it exists
+        # Convert GAZE_IA to coordinates if needed
         if 'GAZE_IA' in df.columns:
-            invalid_ia = '?-1'
-            df['GAZE_IA'] = df['GAZE_IA'].replace(self.config.invalid_value, invalid_ia)
             df['GAZE_IA_X'] = df['GAZE_IA'].apply(
-                lambda x: self.letter_to_num(str(x)[0]) if str(x)[0].isalpha() else self.config.invalid_value
-            ).astype(np.int8)
+                lambda x: ord(str(x)[0].upper()) - ord('A') if str(x)[0].isalpha()
+                else self.config.invalid_value
+            ).astype(np.float32)
+
             df['GAZE_IA_Y'] = df['GAZE_IA'].apply(
-                lambda x: int(str(x)[1:]) if str(x)[1:].isdigit() else self.config.invalid_value
-            ).astype(np.int8)
+                lambda x: int(str(x)[1:]) if str(x)[1:].isdigit()
+                else self.config.invalid_value
+            ).astype(np.float32)
+
             df = df.drop('GAZE_IA', axis=1)
+
+        # Normalize pupil size
+        df = self._normalize_pupil_size(df)
+
+        # Add normalized gaze features
+        df = self._add_gaze_features(df)
 
         # Convert numeric columns
         numeric_conversions = {
             'RECORDING_SESSION_LABEL': np.int8,
             'TRIAL_INDEX': np.int8,
-            'SAMPLE_START_TIME': np.int32,
-            'SAMPLE_INDEX': np.int32,
-            'Pupil_Size': np.float32,
+            'CURRENT_FIX_INDEX': np.float32,
             'target': np.int8
         }
 
         for col, dtype in numeric_conversions.items():
             if col in df.columns:
                 df[col] = df[col].astype(dtype)
-                if col == 'Pupil_Size':
-                    df[col] = df[col].round(4)
 
-        # Convert boolean columns
-        bool_cols = ['IN_BLINK', 'IN_SACCADE', 'CURRENT_FIX_INDEX']
-        for col in bool_cols:
-            if col in df.columns:
-                df[col] = df[col].astype(np.int8)
-
-        # Drop columns that exist
-        columns_to_drop = ['AILMENT_NUMBER', 'TARGET_ZONE', 'TARGET_XY', 'GAZE_XY','CURRENT_IMAGE','IN_SACCADE','Hit']
+        # Drop unnecessary columns
+        columns_to_drop = [
+            'AILMENT_NUMBER', 'TARGET_ZONE', 'TARGET_XY', 'GAZE_XY',
+            'CURRENT_IMAGE', 'IN_SACCADE', 'Hit', 'GAZE_IA_X', 'GAZE_IA_Y'
+        ]
         existing_columns_to_drop = [col for col in columns_to_drop if col in df.columns]
         if existing_columns_to_drop:
             df = df.drop(existing_columns_to_drop, axis=1)
 
-        # Print columns after dropping to debug
-        print("Columns after dropping:", df.columns.tolist())
+        # Keep only required feature columns plus metadata columns
+        required_columns = (
+                self.config.feature_columns +
+                ['RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'target', 'SAMPLE_START_TIME']
+        )
+        df = df[required_columns]
 
-        # Filter valid coordinates
-        return df[
-            (df['GAZE_IA_X'] >= 0) & (df['GAZE_IA_X'] <= 12) &
-            (df['GAZE_IA_Y'] >= 0) & (df['GAZE_IA_Y'] <= 12)
-            ].reset_index(drop=True)
+        self.logger.info(f"Final columns: {df.columns.tolist()}")
+        return df
 
     def create_rolling_windows(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, Dict]:
         window_dir = Path(self.config.data_path).parent / 'window_data'

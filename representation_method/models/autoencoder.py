@@ -221,3 +221,86 @@ def initialize_weights(m):
     elif isinstance(m, nn.BatchNorm1d):
         nn.init.ones_(m.weight)
         nn.init.zeros_(m.bias)
+
+
+class TimeSeriesVAE(nn.Module):
+    def __init__(self, input_dim, hidden_dim=64, latent_dim=32, num_layers=2):
+        super().__init__()
+
+        # Save dimensions
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+
+        # Encoder
+        self.encoder_rnn = nn.GRU(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True
+        )
+
+        # VAE components
+        self.mu_layer = nn.Linear(hidden_dim * 2, latent_dim)
+        self.logvar_layer = nn.Linear(hidden_dim * 2, latent_dim)
+
+        # Decoder
+        self.decoder_init = nn.Linear(latent_dim, hidden_dim)
+        self.decoder_rnn = nn.GRU(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=1,
+            batch_first=True
+        )
+        self.output_layer = nn.Linear(hidden_dim, input_dim)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def encode(self, x):
+        # x shape: [batch, features, time] -> need [batch, time, features]
+        x = x.transpose(1, 2)
+
+        # Encode sequence
+        _, hidden = self.encoder_rnn(x)
+        # Concat bidirectional hidden states
+        hidden = torch.cat((hidden[-2, :, :], hidden[-1, :, :]), dim=1)
+
+        # Get latent parameters
+        mu = self.mu_layer(hidden)
+        logvar = self.logvar_layer(hidden)
+
+        return mu, logvar
+
+    def decode(self, z, seq_len):
+        # Initialize decoder state
+        hidden = self.decoder_init(z).unsqueeze(0)
+
+        # Create initial input
+        batch_size = z.size(0)
+        decoder_input = torch.zeros(batch_size, seq_len, self.input_dim).to(z.device)
+
+        # Generate sequence
+        output, _ = self.decoder_rnn(decoder_input, hidden)
+        output = self.output_layer(output)
+
+        # Return in same format as input [batch, features, time]
+        return output.transpose(1, 2)
+
+    def forward(self, x):
+        # Save original sequence length
+        seq_len = x.size(2)  # Assuming input is [batch, features, time]
+
+        # Encode
+        mu, logvar = self.encode(x)
+
+        # Sample latent vector
+        z = self.reparameterize(mu, logvar)
+
+        # Decode
+        recon = self.decode(z, seq_len)
+
+        return recon, mu, logvar
