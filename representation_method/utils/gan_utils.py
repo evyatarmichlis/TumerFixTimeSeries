@@ -3,14 +3,16 @@ Utilities for TimeGAN training and data generation.
 """
 
 import os
+from pathlib import Path
+
 import numpy as np
 import scipy
 
-from TimeGan.timegan import timegan
+from gans.timegan import timegan, weighted_timegan
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 import matplotlib
-matplotlib.use('TkAgg')
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -22,7 +24,7 @@ def validate_synthetic_data(original_data, synthetic_data, save_dir):
     Args:
         original_data: Original minority class data (numpy array or list of shape [n_samples, seq_len, n_features])
         synthetic_data: Generated synthetic data (same shape as original_data)
-        save_dir: Directory to save validation results and plots
+        save_dir: Directory to save validation results_old and plots
     """
     if isinstance(original_data, list):
         original_data = np.array(original_data)
@@ -247,51 +249,79 @@ def create_gan_directory(method_dir):
     except Exception as e:
         print(f"Error creating directories: {str(e)}")
         return None
+# def train_time_gan(X_minority, device, method_dir, params):
+#     """
+#     Train TimeGAN and generate synthetic data.
+#
+#     Args:
+#         X_minority: Minority class samples
+#         device: PyTorch device
+#         method_dir: Directory to save results_old
+#         params: GAN parameters
+#
+#     Returns:
+#         Generated synthetic data
+#     """
+#     print("Training TimeGAN...")
+#
+#     # Prepare data
+#     ori_data = np.asarray(X_minority)
+#     gan_dir = create_gan_directory(method_dir)
+#     # Set up parameters
+#     parameters = {'module': params.get('module', 'gru'), 'hidden_dim': params.get('hidden_dim', 24),
+#                   'num_layers': params.get('num_layers', 3), 'iterations': 10000,
+#                   'batch_size': params.get('batch_size', 128), 'metric_iterations': params.get('metric_iterations', 10),
+#                   'save_dir': gan_dir}
+#
+#     # Save parameters
+#
+#     with open(os.path.join(gan_dir, 'timegan_params.txt'), 'w') as f:
+#         for key, value in parameters.items():
+#             f.write(f"{key}: {value}\n")
+#
+#
+#
+#     print("Original data shape:", ori_data.shape)
+#     generated_data = weighted_timegan(ori_data, parameters)
+#
+#     return generated_data
+
+
 def train_time_gan(X_minority, device, method_dir, params):
-    """
-    Train TimeGAN and generate synthetic data.
-
-    Args:
-        X_minority: Minority class samples
-        device: PyTorch device
-        method_dir: Directory to save results
-        params: GAN parameters
-
-    Returns:
-        Generated synthetic data
-    """
+    """Modified train_time_gan to handle larger sample generation"""
     print("Training TimeGAN...")
-
-    # Prepare data
     ori_data = np.asarray(X_minority)
     gan_dir = create_gan_directory(method_dir)
-    # Set up parameters
+    root_dir = Path(__file__).resolve().parent  # Go up 3 levels
+    gan_path = os.path.join(root_dir, "results",
+                                         'dynamic windowing with diffs normal AE_approach_8_participant_9use_gan_True',
+                                         'GAN','final_model')
     parameters = {
         'module': params.get('module', 'gru'),
-        'hidden_dim': params.get('hidden_dim', 24),
-        'num_layers': params.get('num_layers', 3),
-        'iterations': params.get('iterations', 10000),
-        'batch_size': params.get('batch_size', 128),
+        'hidden_dim': params.get('hidden_dim', 48),  # Increased hidden dimension
+        'num_layers': params.get('num_layers', 4),  # Increased layers
+        'iterations': 15000,  # Increased iterations
+        'batch_size': 32,
         'metric_iterations': params.get('metric_iterations', 10),
-        'save_dir': gan_dir
+        'save_dir': gan_dir,
+        'no':params.get("num_samples_needed",1000),  # Pass this to control generation
+        'load_dir':gan_path
     }
 
-    # Save parameters
-
-    parameters['iterations'] = 10000
-    with open(os.path.join(gan_dir, 'timegan_params.txt'), 'w') as f:
-        for key, value in parameters.items():
-            f.write(f"{key}: {value}\n")
-
-
-
     print("Original data shape:", ori_data.shape)
-    generated_data = timegan(ori_data, parameters)
+    # Generate 3x needed samples and trim later
+    generated_data = weighted_timegan(ori_data, parameters)
+
+    # Ensure enough samples are generated
+    if len(generated_data) < params.get('num_samples_needed', len(generated_data)):
+        print("First generation didn't produce enough samples, generating more...")
+        additional_data = weighted_timegan(ori_data, parameters)
+        generated_data.extend(additional_data)
 
     return generated_data
 
 
-def generate_balanced_data_with_gan(X_train_scaled, Y_train, window_weight_train, method_dir, device):
+def generate_balanced_data_with_gan(X_train_scaled, Y_train, method_dir, device):
     """
     Generate synthetic data using TimeGAN to balance the dataset.
 
@@ -299,7 +329,7 @@ def generate_balanced_data_with_gan(X_train_scaled, Y_train, window_weight_train
         X_train_scaled: Scaled training data
         Y_train: Training labels
         window_weight_train: Window weights
-        method_dir: Directory to save results
+        method_dir: Directory to save results_old
         device: PyTorch device
 
     Returns:
@@ -321,9 +351,11 @@ def generate_balanced_data_with_gan(X_train_scaled, Y_train, window_weight_train
         'module': 'gru',
         'hidden_dim': 24,
         'num_layer': 3,
-        'iterations': 1000,
+        'iterations': 10000,
         'batch_size': 128,
-        'metric_iterations': 10
+        'metric_iterations': 10,
+        'num_samples_needed': num_synthetic_needed  # Pass this to control generation
+
     }
 
     # Generate synthetic data
@@ -338,13 +370,13 @@ def generate_balanced_data_with_gan(X_train_scaled, Y_train, window_weight_train
     # Combine data
     X_balanced = np.concatenate([X_train_scaled, synthetic_data])
     Y_balanced = np.concatenate([Y_train, np.ones(len(synthetic_data))])
-    weights_balanced = np.concatenate([window_weight_train, np.ones(len(synthetic_data))])
+    # weights_balanced = np.concatenate([window_weight_train, np.ones(len(synthetic_data))])
 
     # Validate synthetic data
     gan_validation_dir = os.path.join(method_dir, 'gan_validation')
     os.makedirs(gan_validation_dir, exist_ok=True)
     validate_synthetic_data(X_minority, synthetic_data, gan_validation_dir)
 
-    return X_balanced, Y_balanced, weights_balanced
+    return X_balanced, Y_balanced
 
 

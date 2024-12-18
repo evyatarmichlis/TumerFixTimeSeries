@@ -412,3 +412,286 @@ def timegan(ori_data, parameters):
     synthetic_data = model.generate_samples(no, ori_time, max_seq_len)
 
     return synthetic_data
+
+
+class EyeTrackingTimeGAN(TimeGAN):
+    def __init__(self, parameters):
+        super().__init__(parameters)
+
+        # Define feature weights for eye tracking data - will be used in the recovery phase
+        self.feature_weights = tf.constant([
+            2.0,  # Pupil_Size - highest importance
+            3.0,  # CURRENT_FIX_DURATION - second highest
+            # 1.0,  # CURRENT_FIX_IA_X
+            # 1.0,  # CURRENT_FIX_IA_Y
+            # 1.0,  # CURRENT_FIX_INDEX
+            # 1.0, # CURRENT_FIX_COMPONENT_COUNT
+            5.0,  # Pupil_Size_Max_Diff
+            5.0  # CURRENT_FIX_DURATION_Max_Diff
+        ], dtype=tf.float32)
+
+        # Expand dimensions for broadcasting
+        self.feature_weights = tf.reshape(self.feature_weights, (1, 1, -1))
+
+        # Create uniform weights for hidden states (since they're embeddings)
+        self.hidden_weights = tf.ones((1, 1, self.hidden_dim), dtype=tf.float32)
+
+    @tf.function
+    def weighted_mse_loss(self, y_true, y_pred, is_hidden=False):
+        """Weighted MSE loss that emphasizes important features"""
+        squared_diff = tf.square(y_true - y_pred)
+        if is_hidden:
+            # For hidden states, use uniform weights
+            weighted_diff = squared_diff * self.hidden_weights
+        else:
+            # For features, use feature importance weights
+            weighted_diff = squared_diff * self.feature_weights
+        return tf.reduce_mean(weighted_diff)
+
+    @tf.function
+    def train_supervisor(self, X, Z, T):
+        """Modified supervisor training with weighted loss"""
+        with tf.GradientTape() as tape:
+            E_hat = self.generator(Z, training=True)
+            H_hat = self.supervisor(E_hat, training=True)
+            H = self.embedder(X, training=True)
+            G_loss_S = self.weighted_mse_loss(H[:, 1:, :], H_hat[:, :-1, :], is_hidden=True)
+
+        gradients = tape.gradient(G_loss_S,
+                              self.generator.trainable_variables +
+                              self.supervisor.trainable_variables)
+        self.g_optimizer.apply_gradients(
+            zip(gradients,
+                self.generator.trainable_variables +
+                self.supervisor.trainable_variables))
+        return G_loss_S
+
+    @tf.function
+    def train_embedder(self, X, T):
+        """Modified embedder training with weighted loss"""
+        with tf.GradientTape() as tape:
+            H = self.embedder(X, training=True)
+            X_tilde = self.recovery(H, training=True)
+
+            E_loss_T0 = self.weighted_mse_loss(X, X_tilde, is_hidden=False)
+            E_loss = 10 * tf.sqrt(E_loss_T0)
+
+        gradients = tape.gradient(E_loss,
+                                  self.embedder.trainable_variables +
+                                  self.recovery.trainable_variables)
+        self.e_optimizer.apply_gradients(
+            zip(gradients,
+                self.embedder.trainable_variables +
+                self.recovery.trainable_variables))
+        return E_loss
+
+    @tf.function
+    def train_generator(self, X, Z, T):
+        """Modified generator training with weighted reconstruction"""
+        with tf.GradientTape() as tape:
+            E_hat = self.generator(Z, training=True)
+            H_hat = self.supervisor(E_hat, training=True)
+            H = self.embedder(X, training=True)
+
+            Y_fake = self.discriminator(H_hat, training=True)
+            Y_fake_e = self.discriminator(E_hat, training=True)
+
+            G_loss_U = tf.reduce_mean(tf.keras.losses.binary_crossentropy(
+                tf.ones_like(Y_fake), Y_fake, from_logits=True))
+            G_loss_U_e = tf.reduce_mean(tf.keras.losses.binary_crossentropy(
+                tf.ones_like(Y_fake_e), Y_fake_e, from_logits=True))
+
+            G_loss_S = self.weighted_mse_loss(H[:, 1:, :], H_hat[:, :-1, :], is_hidden=True)
+
+            X_hat = self.recovery(H_hat, training=True)
+
+            X_weighted = X * self.feature_weights
+            X_hat_weighted = X_hat * self.feature_weights
+
+            G_loss_V1 = tf.reduce_mean(tf.abs(
+                tf.sqrt(tf.nn.moments(X_hat_weighted, [0])[1] + 1e-6) -
+                tf.sqrt(tf.nn.moments(X_weighted, [0])[1] + 1e-6)))
+            G_loss_V2 = tf.reduce_mean(tf.abs(
+                tf.nn.moments(X_hat_weighted, [0])[0] -
+                tf.nn.moments(X_weighted, [0])[0]))
+
+            G_loss_V = G_loss_V1 + G_loss_V2
+
+            G_loss = (G_loss_U +
+                      self.gamma * G_loss_U_e +
+                      100 * tf.sqrt(G_loss_S) +
+                      100 * G_loss_V)
+
+        gradients = tape.gradient(G_loss,
+                                  self.generator.trainable_variables +
+                                  self.supervisor.trainable_variables)
+        self.g_optimizer.apply_gradients(
+            zip(gradients,
+                self.generator.trainable_variables +
+                self.supervisor.trainable_variables))
+        return G_loss, G_loss_U, G_loss_S, G_loss_V
+
+    def generate_samples(self, n_samples, ori_time, max_seq_len):
+        """Generate synthetic samples using the trained model."""
+        z_dim = self.parameters['feature_dim']
+        batch_size = 1000  # Generate in batches to avoid memory issues
+        generated_data = []
+        remaining_samples = n_samples
+
+        while remaining_samples > 0:
+            # Determine batch size for this iteration
+            current_batch = min(batch_size, remaining_samples)
+
+            # Generate random noise
+            Z_mb = random_generator(current_batch, z_dim, ori_time[:current_batch], max_seq_len)
+            Z_mb = tf.convert_to_tensor(Z_mb, dtype=tf.float32)
+
+            # Generate synthetic data
+            E_hat = self.generator(Z_mb)
+            H_hat = self.supervisor(E_hat)
+            generated_data_raw = self.recovery(H_hat).numpy()
+
+            # Process each sample in the batch
+            for i in range(current_batch):
+                # Use median sequence length from original data for consistency
+                median_len = int(np.median(ori_time))
+                temp = generated_data_raw[i, :median_len, :]
+
+                # Denormalize
+                if self.min_val is not None and self.max_val is not None:
+                    temp = temp * (self.max_val - self.min_val)
+                    temp = temp + self.min_val
+
+                generated_data.append(temp)
+
+            remaining_samples -= current_batch
+            print(f"Generated {len(generated_data)} samples out of {n_samples} needed")
+
+        return generated_data
+
+def weighted_timegan(ori_data, parameters):
+    """Modified TimeGAN function using weighted loss for eye tracking data"""
+    # Initialize parameters
+    no, seq_len, dim = np.asarray(ori_data).shape
+    no  = parameters["no"]
+    parameters['feature_dim'] = dim
+
+    # Create EyeTrackingTimeGAN instance instead of regular TimeGAN
+    model = EyeTrackingTimeGAN(parameters)
+    model.compile()
+
+    ori_time, max_seq_len = extract_time(ori_data)
+
+
+    if parameters.get('load_dir') and os.path.exists(parameters['load_dir']):
+        print(f"Loading existing model from {parameters['load_dir']}")
+        if model.load_model(parameters['load_dir']):
+            print("Model loaded successfully")
+            # Generate synthetic data using loaded model
+            synthetic_data = model.generate_samples(no, ori_time, max_seq_len)
+            return synthetic_data
+        else:
+            print("Failed to load model, falling back to training")
+
+
+    # Rest of the training process remains the same as original timegan function
+    # but uses the weighted loss implementations
+
+    model.min_val = np.min(np.min(ori_data, axis=0), axis=0)
+    model.max_val = np.max(np.max(ori_data, axis=0), axis=0)
+    ori_data = (ori_data - model.min_val) / (model.max_val - model.min_val + 1e-7)
+
+    # Training parameters
+    iterations = parameters['iterations']
+    batch_size = parameters['batch_size']
+    z_dim = dim
+
+    print('Start Embedding Network Training with Feature Weighting')
+    # ... rest of training code same as original timegan ...
+
+    for itt in range(iterations):
+        # Set mini-batch
+        X_mb, T_mb = batch_generator(ori_data, ori_time, batch_size)
+        X_mb = tf.convert_to_tensor(X_mb, dtype=tf.float32)
+
+        # Train embedder
+        step_e_loss = model.train_embedder(X_mb, T_mb)
+
+        # Record history and save checkpoint
+        if itt % 1000 == 0:
+            print(f'step: {itt}/{iterations}, e_loss: {np.round(np.sqrt(step_e_loss), 4)}')
+            model.training_history['embedding_losses'].append(float(np.sqrt(step_e_loss)))
+            model.training_history['iterations'].append(itt)
+
+            # Save checkpoint if directory specified
+            if parameters.get('save_dir'):
+                checkpoint_dir = os.path.join(parameters['save_dir'], f'embedding_checkpoint_{itt}')
+                model.save_model(checkpoint_dir)
+
+    print('Start Training with Supervised Loss Only')
+    for itt in range(iterations):
+        # Set mini-batch
+        X_mb, T_mb = batch_generator(ori_data, ori_time, batch_size)
+        X_mb = tf.convert_to_tensor(X_mb, dtype=tf.float32)
+        Z_mb = random_generator(batch_size, z_dim, T_mb, max_seq_len)
+        Z_mb = tf.convert_to_tensor(Z_mb, dtype=tf.float32)
+
+        # Train supervisor
+        step_g_loss_s = model.train_supervisor(X_mb, Z_mb, T_mb)
+
+        if itt % 1000 == 0:
+            print(f'step: {itt}/{iterations}, s_loss: {np.round(np.sqrt(step_g_loss_s), 4)}')
+            model.training_history['supervisor_losses'].append(float(np.sqrt(step_g_loss_s)))
+
+            # Save checkpoint if directory specified
+            if parameters.get('save_dir'):
+                checkpoint_dir = os.path.join(parameters['save_dir'], f'supervisor_checkpoint_{itt}')
+                model.save_model(checkpoint_dir)
+
+    print('Start Joint Training')
+    for itt in range(iterations):
+        # Generator training (2 times per iteration)
+        for kk in range(2):
+            X_mb, T_mb = batch_generator(ori_data, ori_time, batch_size)
+            X_mb = tf.convert_to_tensor(X_mb, dtype=tf.float32)
+            Z_mb = random_generator(batch_size, z_dim, T_mb, max_seq_len)
+            Z_mb = tf.convert_to_tensor(Z_mb, dtype=tf.float32)
+
+            # Train generator
+            step_g_loss, step_g_loss_u, step_g_loss_s, step_g_loss_v = model.train_generator(X_mb, Z_mb, T_mb)
+            step_e_loss = model.train_embedder(X_mb, T_mb)
+
+        # Discriminator training
+        X_mb, T_mb = batch_generator(ori_data, ori_time, batch_size)
+        X_mb = tf.convert_to_tensor(X_mb, dtype=tf.float32)
+        Z_mb = random_generator(batch_size, z_dim, T_mb, max_seq_len)
+        Z_mb = tf.convert_to_tensor(Z_mb, dtype=tf.float32)
+
+        step_d_loss = model.train_discriminator(X_mb, Z_mb, T_mb)
+
+        # Record history and save checkpoint
+        if itt % 1000 == 0:
+            print(f'step: {itt}/{iterations}, d_loss: {np.round(step_d_loss, 4)}, '
+                  f'g_loss_u: {np.round(step_g_loss_u, 4)}, '
+                  f'g_loss_s: {np.round(np.sqrt(step_g_loss_s), 4)}, '
+                  f'g_loss_v: {np.round(step_g_loss_v, 4)}, '
+                  f'e_loss: {np.round(np.sqrt(step_e_loss), 4)}')
+
+            model.training_history['discriminator_losses'].append(float(step_d_loss))
+            model.training_history['generator_losses'].append(float(step_g_loss))
+
+            # Save checkpoint if directory specified
+            if parameters.get('save_dir'):
+                checkpoint_dir = os.path.join(parameters['save_dir'], f'joint_checkpoint_{itt}')
+                model.save_model(checkpoint_dir)
+
+    # Save final model if directory specified
+    if parameters.get('save_dir'):
+        final_dir = os.path.join(parameters['save_dir'], 'final_model')
+        model.save_model(final_dir)
+
+    # Generate synthetic data
+    print("Generating synthetic data...")
+    synthetic_data = model.generate_samples(no, ori_time, max_seq_len)
+
+    return synthetic_data

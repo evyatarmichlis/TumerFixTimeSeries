@@ -380,12 +380,12 @@ def main(df, window_size=5, method='', resample=False,epochs=100,batch_size=32):
         random_state=0
     )
     print("Number of True and False in y_test:")
-    # print(test_df.value_counts())
+    print(test_df["target"].value_counts())
     # Step 2: Create time series data for training and testing
     X_train, Y_train, window_weight_train = create_time_series(train_df, interval, window_size=window_size, resample=resample)
     X_test, Y_test, window_weights_test = create_time_series(test_df, interval, window_size=window_size, resample=resample)
     print("Number of True and False in y_test:")
-    # print(pd.Series(Y_test).value_counts())
+    print(pd.Series(Y_test).value_counts())
     # Step 3: Compute class weights for handling class imbalance
     class_weights_dict = get_class_weights(Y_train)
     print(class_weights_dict)
@@ -448,7 +448,8 @@ if __name__ == '__main__':
         print(f"############################LABEL {label}#########################")
 
         new_df = df[df['RECORDING_SESSION_LABEL'] == label]
-        main(df,50,f"test_all_ids_{label}",False)
+        main(new_df,50,f"test_all_ids_{label}",False)
+        break
     #first results without adding class balance to the model:
     #Weighted Precision: 0.9716223333336166
     # Weighted Recall: 0.9608698687517453
