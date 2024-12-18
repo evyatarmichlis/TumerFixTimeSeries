@@ -286,7 +286,7 @@ def print_metrics(precision_weighted, recall_weighted, f1_weighted, precision_ma
     print(f"Macro F1-score: {f1_macro}")
 
 def evaluate_and_save_model(model, X_test, Y_test, device, method):
-    """Evaluate the model and save results."""
+    """Evaluate the model and save results_old."""
     model.eval()
     with torch.no_grad():
         X_test = torch.tensor(X_test, dtype=torch.float32).to(device)

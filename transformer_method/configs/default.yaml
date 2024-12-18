@@ -1,0 +1,86 @@
+
+
+# Output parameters
+output_dir: 'outputs'
+experiment_name: 'transformer_method'
+
+
+# Data parameters
+patch_len: 1
+stride: 1
+seq_len: 4096
+train_ratio: 0.7
+val_ratio: 0.15
+test_ratio: 0.15
+
+# Model parameters
+n_layers: 2
+d_model: 64
+n_heads: 4
+d_ff: 128
+norm_type: 'BatchNorm'
+activation: 'gelu'
+attn_dropout: 0.5
+dropout: 0.5
+head_dropout: 0.5
+pos_encoding: 'learnable'
+
+# Training parameters
+batch_size: 16
+num_workers: 4
+learning_rate: 0.0001
+weight_decay: 0.01
+epochs: 20
+patience: 10
+grad_clip: 1.0
+
+# Feature columns
+feature_columns:
+    - 'Pupil_Size'
+    - 'CURRENT_FIX_INDEX'
+    - 'relative_x'
+    - 'relative_y'
+    - 'gaze_velocity'
+
+data:
+  data_path: 'data/Formatted_Samples_ML'
+  file_pattern: '*_Formatted_Sample.csv'
+  participant_ids: ['1']
+  invalid_value: -1
+  per_slice_target: false
+  coordinate_range: [0, 12]
+  feature_columns:
+    - Pupil_Size
+#    - GAZE_IA_X
+#    - GAZE_IA_Y
+    - CURRENT_FIX_INDEX
+    - relative_x
+    - relative_y
+    - gaze_velocity
+
+
+  numeric_conversions:
+    RECORDING_SESSION_LABEL: int8
+    TRIAL_INDEX: int8
+    SAMPLE_START_TIME: int32
+    SAMPLE_INDEX: int32
+    Pupil_Size: float32
+    target: int8
+  bool_columns:
+    - IN_BLINK
+    - IN_SACCADE
+    - CURRENT_FIX_INDEX
+  columns_to_drop:
+    - AILMENT_NUMBER
+    - TARGET_ZONE
+    - TARGET_XY
+    - GAZE_XY
+    - CURRENT_IMAGE
+    - IN_SACCADE
+    - Hit
+    - SAMPLE_INDEX
+    - IS_BLINK
+  target_column:
+    target
+  target_mapping:
+    'Hit': 'target'

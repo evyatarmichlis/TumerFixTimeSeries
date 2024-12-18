@@ -18,7 +18,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 
 import cnn_time_series
-from TimeGan.timegan import timegan
+from TimeGanOriginal.timegan import timegan
 from cnn_time_series import create_time_series, validate_model, plot_confusion_matrix
 from data_process import IdentSubRec
 
@@ -819,11 +819,11 @@ def validate_synthetic_data(original_data, synthetic_data, save_dir):
     Args:
         original_data: Original minority class data (numpy array of shape [n_samples, seq_len, n_features])
         synthetic_data: Generated synthetic data (same shape as original_data)
-        save_dir: Directory to save validation results and plots
+        save_dir: Directory to save validation results_old and plots
     """
     os.makedirs(save_dir, exist_ok=True)
 
-    # Open a file to write statistical results
+    # Open a file to write statistical results_old
     with open(os.path.join(save_dir, 'validation_metrics.txt'), 'w') as f:
         f.write("Synthetic Data Validation Metrics\n")
         f.write("================================\n\n")
@@ -978,7 +978,7 @@ def train_time_gan(X_minority, device, method_dir, params):
     Args:
         X_minority: Minority class samples to learn from
         device: torch device
-        method_dir: Directory to save results
+        method_dir: Directory to save results_old
         params: GAN parameters
 
     Returns:
@@ -1083,7 +1083,7 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
     seed_everything(0)
     interval = '30ms'
 
-    method_dir = os.path.join('results', method)
+    method_dir = os.path.join('results_old', method)
     os.makedirs(method_dir, exist_ok=True)
 
     hyperparameters = {

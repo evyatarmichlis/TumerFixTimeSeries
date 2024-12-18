@@ -583,9 +583,9 @@ class IdentSubRec:
                 self.clf.fit(x_train, y_train)
                 y_pred = self.clf.predict(x_test)
 
-                # Group results by RECORDING_SESSION_LABEL:
+                # Group results_old by RECORDING_SESSION_LABEL:
                 if group_by_participants := False:
-                    print_and_log('Grouping results by \'RECORDING_SESSION_LABEL\'')
+                    print_and_log('Grouping results_old by \'RECORDING_SESSION_LABEL\'')
                     results_df = pd.DataFrame({
                         'prediction': y_pred,
                         'RECORDING_SESSION_LABEL': self.df['RECORDING_SESSION_LABEL'].iloc[test_index],
