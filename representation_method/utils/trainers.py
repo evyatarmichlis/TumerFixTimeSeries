@@ -1880,7 +1880,7 @@ class EnsembleTrainer:
         return model, best_val_loss,best_minority_f1
 
     def train_ensemble(self, train_dataset, val_loader, batch_size, epochs, criterion,
-                       optimizer_class, optimizer_params, majority_weight=0.01):
+                       optimizer_class, optimizer_params, majority_weight=0.5):
         """Train the ensemble of models using weighted sampling"""
         self.models = []
         self.best_val_losses = []
@@ -1891,10 +1891,10 @@ class EnsembleTrainer:
             optimizer = optimizer_class(model.parameters(), **optimizer_params)
 
             # Create weighted loader for this model
-            # train_loader = self.create_weighted_loader(
-            #     train_dataset, batch_size, majority_weight)
-            train_loader = self.create_undersampled_loader(
-                train_dataset, batch_size)
+            train_loader = self.create_weighted_loader(
+                train_dataset, batch_size, majority_weight)
+            # train_loader = self.create_undersampled_loader(
+            #     train_dataset, batch_size)
 
             # Train model
             trained_model, best_val_loss,minority_f1 = self.train_single_model(
@@ -1990,11 +1990,14 @@ class EnsembleTrainer:
         for _, labels in test_loader:
             true_labels.extend(labels.cpu().numpy())
 
-        for weight in [1.2, 1.5, 2.0, 2.5,5]:
+        for weight in [1,1.2, 1.5, 2.0, 2.5,5]:
             predictions = self.predict(test_loader, minority_weight=weight)
-            f1 = f1_score(true_labels, predictions, average='binary')
+
+            results = self._calculate_metrics(true_labels, predictions)
+            for k,v in results.items():
+                print(k)
+                print(v)
             print(f"\nMinority Weight: {weight}")
-            print(f"F1 Score: {f1:.4f}")
             print(confusion_matrix(true_labels, predictions))
 
         accuracy = accuracy_score(true_labels, predictions)
@@ -2016,3 +2019,17 @@ class EnsembleTrainer:
                 f.write(f"Actual 0   {cm[0, 0]:<10} {cm[0, 1]:<10}\n")
                 f.write(f"Actual 1   {cm[1, 0]:<10} {cm[1, 1]:<10}\n")
         return accuracy, f1
+
+    def _calculate_metrics(self, labels, predictions):
+        """Calculate comprehensive metrics including minority class F1"""
+        accuracy = accuracy_score(labels, predictions)
+        minority_precision = precision_score(labels, predictions, pos_label=1)
+        minority_recall = recall_score(labels, predictions, pos_label=1)
+        minority_f1 = f1_score(labels, predictions, pos_label=1)
+
+        return {
+            'acc': accuracy,
+            'minority_precision': minority_precision,
+            'minority_recall': minority_recall,
+            'minority_f1': minority_f1
+        }

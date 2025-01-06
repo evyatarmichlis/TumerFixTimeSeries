@@ -418,20 +418,7 @@ class LegacyDataLoader(BaseDataLoader):
         """Load and preprocess legacy format data."""
         try:
             self.df = IdentSubRec.get_df_for_training(data_file_path = self.config.data_path,approach_num=self.config.approach_num)
-            #
-            # self.df['Pupil_Size_Diff_1'] = self.df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX'])[
-            #     'Pupil_Size'].diff()
-            # self.df['Pupil_Size_Diff_2'] = self.df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX'])[
-            #     'Pupil_Size'].diff(2)
-            # self.df['CURRENT_FIX_DURATION_1'] = self.df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX'])[
-            #     'CURRENT_FIX_DURATION'].diff()
-            # self.df['CURRENT_FIX_DURATION_2'] = self.df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX'])[
-            #     'CURRENT_FIX_DURATION'].diff(2)
-            # self.df['Pupil_Size_Diff_1'] = self.df['Pupil_Size_Diff_1'].fillna(0)
-            # self.df['Pupil_Size_Diff_2'] = self.df['Pupil_Size_Diff_2'].fillna(0)
-            # self.df['CURRENT_FIX_DURATION_1'] = self.df['CURRENT_FIX_DURATION_1'].fillna(0)
-            # self.df['CURRENT_FIX_DURATION_2'] = self.df['CURRENT_FIX_DURATION_2'].fillna(0)
-            # Add your legacy preprocessing steps here
+            self.df = self._add_gaze_features(self.df)
             self.df = self._normalize_pupil_size(self.df)
             self._print_data_info()
             return self.df
@@ -441,6 +428,31 @@ class LegacyDataLoader(BaseDataLoader):
             self.logger.error(f"Error loading legacy data: {str(e)}")
             raise
 
+    def _add_gaze_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add relative gaze coordinates and velocity features by recording session and trial"""
+        grouping_cols = ['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']
+
+        # Calculate relative X and Y positions
+        df['relative_x'] = df.groupby(grouping_cols)['CURRENT_FIX_IA_X'].transform(lambda x: x - x.mean())
+        df['relative_y'] = df.groupby(grouping_cols)['CURRENT_FIX_IA_Y'].transform(lambda x: x - x.mean())
+
+        # Calculate gaze velocity
+        df['gaze_velocity'] = df.groupby(grouping_cols).apply(
+            lambda group: np.sqrt(
+                group['CURRENT_FIX_IA_X'].diff() ** 2 +
+                group['CURRENT_FIX_IA_Y'].diff() ** 2
+            )
+        ).reset_index(level=[0, 1], drop=True)
+
+        # Fill NaN values in velocity
+        df['gaze_velocity'] = df['gaze_velocity'].fillna(0)
+
+        # Convert to float32 for memory efficiency
+        df['relative_x'] = df['relative_x'].astype(np.float32)
+        df['relative_y'] = df['relative_y'].astype(np.float32)
+        df['gaze_velocity'] = df['gaze_velocity'].astype(np.float32)
+
+        return df
     def get_participant_data(self, participant_id: int) -> pd.DataFrame:
         """Get data for a specific participant from legacy format."""
         if self.df is None:

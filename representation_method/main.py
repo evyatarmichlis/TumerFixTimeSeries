@@ -82,10 +82,9 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
 
     # 2. Data Preparation
     # Split train/test
-    max_consecutive = find_max_consecutive_hits(df)
-    window_size = max_consecutive + 4
+    # max_consecutive = find_max_consecutive_hits(df)
+    # window_size = max_consecutive + 4
     # Add buffer
-    window_size = 200
     print(f"window_size is {window_size}")
     train_df, test_df = split_train_test_for_time_series(df, test_size=0.2, random_state=0)
     train_df, val_df = split_train_test_for_time_series(train_df, test_size=0.2, random_state=0)
@@ -124,7 +123,7 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
         autoencoder =CNNRecurrentAutoencoder(
             in_channels=len(feature_columns)+2,  # Number of input features
             num_filters=32,  # Match the old model's filter count
-            depth=3,  # - original 4
+            depth=2,  # - original 4
             hidden_size=128,  # Match the old hidden size
             num_layers=1,
             rnn_type='GRU',
@@ -323,6 +322,7 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
         )
 
         # Train ensemble
+
         ensemble_trainer.train_ensemble(
             train_dataset=train_dataset,
             val_loader=val_loader,
@@ -330,10 +330,10 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
             epochs=50,
             criterion=nn.CrossEntropyLoss(),
             optimizer_class=optim.Adam,
-            optimizer_params={'lr': 0.001}
+            optimizer_params={'lr': 0.001},majority_weight=weights[0]
         )
-        report, cm, threshold = ensemble_trainer.evaluate(test_loader)
-
+        accuracy, f1= ensemble_trainer.evaluate(test_loader)
+        return accuracy,f1
     model = EnhancedCombinedModel(autoencoder, num_classes=2).to(device)
     # TVAEClassifier
     # optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -708,7 +708,7 @@ if __name__ == '__main__':
         )
 
     params = {
-        'name': 'dynamic windowing with diffs assemble - focal loss 0.75',
+        'name': 'dynamic windowing with diffs assemble - keep only target samples',
         'window_size': 200,
         'classification_epochs': 200,
         'batch_size': 32,
@@ -721,7 +721,7 @@ if __name__ == '__main__':
         'use_gan': False,
         'early_stopping_patience': 10,
         'resample': False,
-        'TRAIN': False,
+        'TRAIN': True,
         "classifier": "add dropout =0.1",
         "margin":0.1,
         "distance_metric":'cosine',

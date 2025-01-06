@@ -12,12 +12,13 @@ import torch
 import torch.nn as nn
 import numpy as np
 from typing import List, Dict, Tuple, Any
-from sklearn.preprocessing import KBinsDiscretizer, StandardScaler
+from sklearn.preprocessing import KBinsDiscretizer
 
 from transformers import AutoModel, AutoConfig, AutoModelForSequenceClassification
 
 from representation_method.utils.general_utils import seed_everything
 from scan_classifer.model_interpertaer import TransformerInterpreter
+
 
 class PreTrainedEyeTrackingTransformer(nn.Module):
     """
@@ -32,7 +33,7 @@ class PreTrainedEyeTrackingTransformer(nn.Module):
             n_heads: int = 8,
             n_layers: int = 6,
             dropout: float = 0.5,
-            max_len: int = 1700,
+            max_len: int = 1024,
             pretrained_model: str = "bert-base-uncased"
     ):
         super().__init__()
@@ -55,9 +56,8 @@ class PreTrainedEyeTrackingTransformer(nn.Module):
         config = AutoConfig.from_pretrained(pretrained_model)
         config.num_attention_heads = n_heads
         config.hidden_size = d_model
-        config.num_hidden_layers = n_layers
         config.dropout = dropout
-        config.attn_implementation = "eager"
+        config.num_hidden_layers = n_layers
         if pretrained_model != "xlnet-base-cased":
             config.max_position_embeddings = max_len
 
@@ -88,10 +88,11 @@ class PreTrainedEyeTrackingTransformer(nn.Module):
         x = torch.cat(embeddings, dim=-1)  # [batch_size, seq_len, d_model]
 
         # Add positional embeddings
-        # x = x + self.pos_embedding[:, :seq_len, :]
+        x = x + self.pos_embedding[:, :seq_len, :]
 
         # Create attention mask (all tokens are valid)
-        attention_mask = (x != -1).any(dim=-1).float()  # [batch_size, seq_len]
+        attention_mask = torch.ones((batch_size, seq_len), device=x.device)
+
         # Pass through transformer
         outputs = self.transformer(
             inputs_embeds=x,
@@ -110,9 +111,6 @@ class PreTrainedEyeTrackingTransformer(nn.Module):
         #
         # # Classification
         # return self.classifier(x)
-
-
-
 class EyeTrackingTokenizer:
     def __init__(self, n_bins: int = 20, strategy: str = 'quantile'):
         self.n_bins = n_bins
@@ -149,24 +147,6 @@ class EyeTrackingTokenizer:
             tokens_list.append(tokens)
         return np.column_stack(tokens_list)  # Will maintain sequence length
 
-
-class ScanDataset(Dataset):
-    def __init__(self, sequences, labels, sequence_ids, target_positions=None, max_length=1700):
-        self.sequences = sequences # Now directly stores the tensor
-        self.labels = torch.tensor(labels, dtype=torch.long)
-        self.sequence_ids = sequence_ids
-        self.target_positions = target_positions if target_positions else [[] for _ in range(len(sequences))]
-
-        # Pad sequences if needed
-        if self.sequences.size(1) > max_length:
-            self.sequences = self.sequences[:, :max_length, :]
-
-    def __len__(self):
-        return len(self.sequences)
-
-    def __getitem__(self, idx):
-        return self.sequences[idx], self.labels[idx], self.sequence_ids[idx], self.target_positions[idx]
-
 class EyeTrackingDataset(Dataset):
     def __init__(
         self,
@@ -174,7 +154,7 @@ class EyeTrackingDataset(Dataset):
         labels: np.ndarray,
         sequence_ids: List[Tuple[int, int]],
         target_positions: List[List[int]] = None,  # Optional to maintain backward compatibility
-        max_length: int = 1700
+        max_length: int = 512
     ):
         self.tokens = torch.LongTensor(tokens)
         self.labels = torch.LongTensor(labels)
@@ -210,7 +190,6 @@ def create_model(vocab_size: int, n_features: int, d_model: int = 256, pretraine
         pretrained_model=pretrained_model
     )
 
-
     # Configure model to output attention weights
     model.transformer.config.output_attentions = True
     print(f"\nModel Architecture:")
@@ -227,53 +206,32 @@ def create_model(vocab_size: int, n_features: int, d_model: int = 256, pretraine
 def prepare_data(df: pd.DataFrame, feature_columns: List[str], test_size: float = 0.15, val_size: float = 0.15, seed=0):
     # Group by trial and prepare data
     scans_data = []
-    scans_labels = []
-    target_positions = []
+    scans_labels = []  # For scan type (normal vs abnormal)
+    target_positions = []  # For target locations within sequences
     scans_ids = []
     sequence_lengths = []
     sequence_ids = []
 
-    # Analysis counters
-    total_scans = 0
-    abnormal_scans = 0
-    scans_with_targets = 0
-    abnormal_with_targets = 0
-    normal_with_targets = 0
-    target_counts = []
-
     # Group by RECORDING_SESSION_LABEL and TRIAL_INDEX
     for (participant_id, trial_id), group in df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']):
-        if len(group) == 1:
+        if len(group) ==1:
             continue
-
-        total_scans += 1
         sequence_ids.append((participant_id, trial_id))
         scans_data.append(group[feature_columns].values)
         sequence_lengths.append(len(group))
 
         # Store scan type label (normal vs abnormal)
         label = (group['SCAN_TYPE'] != 'NORMAL').any().astype(int)
-        # label = (group['target'] == 1).any().astype(int)  # 1 if any target exists in scan, 0 otherwise
-        if label == 1:
-            abnormal_scans += 1
         scans_labels.append(label)
 
-        # Store and analyze target positions
-        has_targets = False
+        # Store target positions
         if 'target' in group.columns:
+            # Get indices where target == 1 relative to sequence start
             target_pos = group.index[group['target'] == 1].tolist()
+            # Convert to sequence-relative positions
             seq_start = group.index[0]
             target_pos = [pos - seq_start for pos in target_pos]
             target_positions.append(target_pos)
-
-            if len(target_pos) > 0:
-                has_targets = True
-                scans_with_targets += 1
-                target_counts.append(len(target_pos))
-                if label == 1:
-                    abnormal_with_targets += 1
-                else:
-                    normal_with_targets += 1
         else:
             target_positions.append([])
 
@@ -316,20 +274,19 @@ def prepare_data(df: pd.DataFrame, feature_columns: List[str], test_size: float 
         pad_length = max_length - len(sequence)
         if pad_length > 0:
             # Pad with zeros
-            padded = np.pad(sequence, ((0, pad_length), (0, 0)), mode='constant', constant_values=-1)
+            padded = np.pad(sequence, ((0, pad_length), (0, 0)), mode='constant', constant_values=0)
             return padded
         return sequence
 
     def create_dataset(indices, scans_data, scans_labels, sequence_ids, tokenizer, feature_columns, max_seq_length,target_positions):
         sequences = [scans_data[i] for i in indices]
         sequence_labels = scans_labels[indices]
-        sequence_ids = [sequence_ids[i] for i in indices]
+        sequence_ids = [sequence_ids[i] for i in indices]  # Track sequence IDs
+
         print(f"\nCreating dataset:")
         print(f"Number of sequences: {len(sequences)}")
         print(f"Number of labels: {len(sequence_labels)}")
-        print("Trials in this dataset:")
-        trails =  set(sorted([trial_id for participant_id, trial_id in sequence_ids]))
-        print(trails)
+
         # First pad sequences
         padded_sequences = [pad_sequence(seq, max_seq_length) for seq in sequences]
 
@@ -363,40 +320,88 @@ def prepare_data(df: pd.DataFrame, feature_columns: List[str], test_size: float 
         # sequence_ids and target_positions are already lists, so we can use them as is
 
         return tokens, labels, list(sequence_ids), list(target_positions)
+
+    unique_trials = list(set((rec, trial) for rec, trial in sequence_ids))
+    groups = [rec for rec, _ in unique_trials]  # Use recording IDs as groups
+
     splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
-    train_val_idx, test_idx = next(splitter.split(np.arange(len(scans_ids)), groups=scans_ids))
-
-
-    scans_ids_trainval = np.array(scans_ids)[train_val_idx]
-
-    val_size_adjusted = val_size / (1 - test_size)
-
-    val_splitter = GroupShuffleSplit(n_splits=1, test_size=val_size_adjusted, random_state=seed)
-    train_idx_temp, val_idx_temp = next(val_splitter.split(
-        np.arange(len(train_val_idx)),
-        groups=scans_ids_trainval
+    train_val_indices, test_indices = next(splitter.split(
+        X=np.arange(len(unique_trials)),
+        groups=groups
     ))
-    train_idx = train_val_idx[train_idx_temp]
-    val_idx = train_val_idx[val_idx_temp]
+    train_val_trials = [unique_trials[i] for i in train_val_indices]
+    test_trials = [unique_trials[i] for i in test_indices]
+    val_size_adjusted = val_size / (1 - test_size)
+    val_splitter = GroupShuffleSplit(n_splits=1, test_size=val_size_adjusted, random_state=seed + 1)
+    train_indices, val_indices = next(val_splitter.split(
+        X=np.arange(len(train_val_trials)),
+        groups=[rec for rec, _ in train_val_trials]
+    ))
 
-    train_groups = set(np.array(scans_ids)[train_idx])
-    val_groups = set(np.array(scans_ids)[val_idx])
+    train_trials = [train_val_trials[i] for i in train_indices]
+    val_trials = [train_val_trials[i] for i in val_indices]
 
-    print("No overlap between train and val groups:",
-          len(train_groups.intersection(val_groups)) == 0)
+    # Convert trials to indices
+    def get_indices_for_trials(trials_set):
+        indices = []
+        for idx, (rec, trial) in enumerate(sequence_ids):
+            if (rec, trial) in trials_set:
+                indices.append(idx)
+        return np.array(indices)
+
+    train_idx = get_indices_for_trials(set(train_trials))
+    val_idx = get_indices_for_trials(set(val_trials))
+    test_idx = get_indices_for_trials(set(test_trials))
+
+    # Add overlap checks
+    print("\n===== SPLIT OVERLAP CHECKS =====")
+    print(f"Train-Val overlap: {len(set(train_idx) & set(val_idx))} trials")
+    print(f"Train-Test overlap: {len(set(train_idx) & set(test_idx))} trials")
+    print(f"Val-Test overlap: {len(set(val_idx) & set(test_idx))} trials")
+
+    def print_split_info(name, indices, sequence_ids, labels):
+        print(f"\n{name} Split Summary:")
+        print("-" * 50)
+
+        # Get unique recording-trial combinations
+        split_sequences = [sequence_ids[i] for i in indices]
+        split_labels = [labels[i] for i in indices]
+
+        # Get unique recordings and their trials
+        recordings = {}
+        for (rec_id, trial_id) in split_sequences:
+            if rec_id not in recordings:
+                recordings[rec_id] = set()
+            recordings[rec_id].add(trial_id)
+
+        # Print summary
+        print(f"Recordings ({len(recordings)}): {sorted(recordings.keys())}")
+        print("\nTrials per recording:")
+        for rec_id in sorted(recordings.keys()):
+            print(f"Recording {rec_id}: {sorted(list(recordings[rec_id]))}")
+
+        # Overall statistics
+        total_positive = sum(split_labels)
+        total_sequences = len(split_labels)
+        print(f"\nOverall Statistics:")
+        print(f"Total sequences: {total_sequences}")
+        print(f"Positive ratio: {total_positive / total_sequences:.3f} ({total_positive}/{total_sequences})")
+
+    print("\n===== DETAILED SPLIT INFORMATION =====")
+    print_split_info("Training", train_idx, sequence_ids, scans_labels)
+    print_split_info("Validation", val_idx, sequence_ids, scans_labels)
+    print_split_info("Test", test_idx, sequence_ids, scans_labels)
+
+    print("\n===== SPLIT OVERLAP CHECKS =====")
+    train_trials = set((rec_id, trial_id) for rec_id, trial_id in [sequence_ids[i] for i in train_idx])
+    val_trials = set((rec_id, trial_id) for rec_id, trial_id in [sequence_ids[i] for i in val_idx])
+    test_trials = set((rec_id, trial_id) for rec_id, trial_id in [sequence_ids[i] for i in test_idx])
+
+    print(f"Train-Val overlap: {len(train_trials & val_trials)} trials")
+    print(f"Train-Test overlap: {len(train_trials & test_trials)} trials")
+    print(f"Val-Test overlap: {len(val_trials & test_trials)} trials")
+
     # Create dataloaders
-    train_groups = set(np.array(scans_ids)[train_idx])
-    val_groups = set(np.array(scans_ids)[val_idx])
-    test_groups = set(np.array(scans_ids)[test_idx])
-
-    # Print results
-
-    print("Train trial IDs:", train_groups)
-    print("Val trial IDs:", val_groups)
-    print("Test trial IDs:", test_groups)
-    print("No overlap between train and val:", len(train_groups.intersection(val_groups)) == 0)
-    print("No overlap between train and test:", len(train_groups.intersection(test_groups)) == 0)
-    print("No overlap between val and test:", len(val_groups.intersection(test_groups)) == 0)
     train_dataset = create_dataset(train_idx,scans_data, scans_labels, sequence_ids, tokenizer, feature_columns, max_seq_length,target_positions)
     val_dataset = create_dataset(val_idx,scans_data, scans_labels, sequence_ids, tokenizer, feature_columns, max_seq_length,target_positions)
     test_dataset = create_dataset(test_idx,scans_data, scans_labels, sequence_ids, tokenizer, feature_columns, max_seq_length,target_positions)
@@ -413,58 +418,50 @@ def prepare_data(df: pd.DataFrame, feature_columns: List[str], test_size: float 
     print(
         f"Test - Positive: {test_dataset.labels.sum()}, Negative: {len(test_dataset.labels) - test_dataset.labels.sum()}")
 
-    train_loader = DataLoader(train_dataset, batch_size=6, shuffle=True, collate_fn=custom_collate)
-    val_loader = DataLoader(val_dataset, batch_size=6,collate_fn=custom_collate)
-    test_loader = DataLoader(test_dataset, batch_size=6, collate_fn=custom_collate)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=custom_collate)
+    val_loader = DataLoader(val_dataset, batch_size=32,collate_fn=custom_collate)
+    test_loader = DataLoader(test_dataset, batch_size=32, collate_fn=custom_collate)  # Missing batch size
 
     return train_loader, val_loader, test_loader, tokenizer
 
-
 def analyze_attention(attentions, target_positions, tolerance=50, top_k=10):
-    try:
-        num_heads = attentions.shape[0]
-        seq_len = attentions.shape[1]
+    """
+    Analyzes if ANY of the top-k attention peaks coincide with target positions,
+    counting each target only ONCE per head.
 
-        if seq_len == 0 or num_heads == 0:
-            print(f"Invalid attention shape: heads={num_heads}, seq_len={seq_len}")
-            return None
+    Args:
+        attentions: Attention weights tensor (num_heads, seq_len, seq_len).
+        target_positions: List of target positions in the sequence.
+        tolerance: The tolerance range.
+        top_k: Number of top attention peaks to consider.
 
-        if not target_positions:
-            print("No target positions provided")
-            return None
+    Returns:
+        A dictionary containing analysis results.
+    """
+    num_heads = attentions.shape[0]
+    seq_len = attentions.shape[1]
+    results = {
+        "coincidences": 0,
+        "total_targets": len(target_positions),
+        "total_tokens": seq_len,
+        "top_k": top_k
+    }
 
-        results = {
-            "coincidences": 0,
-            "total_targets": len(target_positions),
-            "total_tokens": seq_len,
-            "top_k": top_k,
-            "attention_shape": [num_heads, seq_len]
-        }
+    for head_index in range(num_heads):
+        head_attention = attentions[head_index]
+        token_attentions = head_attention.mean(dim=0)
+        top_k_indices = heapq.nlargest(top_k, range(len(token_attentions)), token_attentions.cpu().numpy().__getitem__)
 
-        targets_covered = set()
+        targets_covered_in_head = set()  # Keep track of targets covered by this head
 
-        for head_index in range(num_heads):
-            head_attention = attentions[head_index]
-            token_attentions = head_attention.mean(dim=0)
+        for attention_argmax in top_k_indices:
+            for target_pos in target_positions:
+                if abs(attention_argmax - target_pos) <= tolerance and target_pos not in targets_covered_in_head:
+                    results["coincidences"] += 1
+                    targets_covered_in_head.add(target_pos)  # Mark target as covered
+                    break  # Move to the next top-k index
 
-            if torch.isnan(token_attentions).any():
-                print(f"NaN values detected in attention scores for head {head_index}")
-                continue
-
-            top_k_indices = heapq.nlargest(top_k, range(len(token_attentions)),
-                                           token_attentions.cpu().numpy().__getitem__)
-
-            for attention_argmax in top_k_indices:
-                for target_pos in target_positions:
-                    if abs(attention_argmax - target_pos) <= tolerance and target_pos not in targets_covered:
-                        results["coincidences"] += 1
-                        targets_covered.add(target_pos)
-
-        return results
-
-    except Exception as e:
-        print(f"Error in analyze_attention: {str(e)}")
-        return None
+    return results
 
 def main(method_dir,seed):
     # Load data
@@ -506,17 +503,16 @@ def main(method_dir,seed):
 
     # Training setup
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
 
     best_val_loss = float('inf')
-    patience = 10
+    patience = 20
     patience_counter = 0
 
     results_dir = f"transformer_results/{method_dir}"
     os.makedirs(results_dir, exist_ok=True)
-    best_model = None
-    best_val_acc = 0
+
     for epoch in range(50):
         # Training
         model.train()
@@ -544,7 +540,7 @@ def main(method_dir,seed):
         val_total = 0
 
         with torch.no_grad():
-            for tokens, labels,_,_ in val_loader:
+            for tokens, labels,_,_ in test_loader:
                 tokens, labels = tokens.to(device), labels.to(device)
                 outputs = model(tokens)
                 loss = criterion(outputs, labels)
@@ -561,11 +557,10 @@ def main(method_dir,seed):
               f'Acc: {100. * val_correct / val_total:.2f}%')
 
         # Early stopping
-        if  val_correct / val_total > best_val_acc:
-            best_val_acc = val_correct / val_total
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
             patience_counter = 0
             torch.save(model.state_dict(), f'{results_dir}/best_model.pt')
-            best_model  = model
         else:
             patience_counter += 1
             if patience_counter >= patience:
@@ -574,7 +569,6 @@ def main(method_dir,seed):
 
         scheduler.step()
 
-    model = best_model
     test_loss = 0
     test_correct = 0
     test_total = 0
@@ -585,69 +579,44 @@ def main(method_dir,seed):
     with torch.no_grad():
         total_coincidences = 0
         total_targets = 0
-        total_scans_with_targets = 0
-        total_valid_positions = 0
-        scans_with_no_positions = 0
-        scans_with_invalid_positions = 0
-        scans_with_null_results = 0
-
-        for tokens, labels, _, target_positions in test_loader:
+        for tokens, labels,_,target_positions  in test_loader:
             tokens, labels = tokens.to(device), labels.to(device)
-            outputs, attentions = model(tokens, output_attentions=True)
-
-            # Calculate loss
+            outputs, attentions = model(tokens,output_attentions=True)
             loss = criterion(outputs, labels)
             test_loss += loss.item()
-
             _, predicted = outputs.max(1)
-
-            # Collect true labels and predictions
-            true_labels.extend(labels.cpu().numpy())
-            predicted_labels.extend(predicted.cpu().numpy())
-
             test_total += labels.size(0)
             test_correct += predicted.eq(labels).sum().item()
 
-            for i in range(labels.shape[0]):
-                target_positions_in_seq = target_positions[i]
-                token_seq = tokens[i]
+            true_labels.extend(labels.cpu().numpy())
+            predicted_labels.extend(predicted.cpu().numpy())
+            last_layer_attentions = attentions[-1]
 
-                if len(target_positions_in_seq) == 0:
-                    scans_with_no_positions += 1
-                    continue
-
-                max_token_index = token_seq.shape[0] - 1
-                valid_target_positions = [pos for pos in target_positions_in_seq if 0 <= pos <= max_token_index]
-
-                if not valid_target_positions:
-                    scans_with_invalid_positions += 1
-                    continue
-
-                last_layer_attentions = attentions[-1]
-                sequence_attentions = last_layer_attentions[i]
-                results = analyze_attention(sequence_attentions, valid_target_positions,
-                                            tolerance=100, top_k=len(valid_target_positions))
-
-                if results is None:
-                    scans_with_null_results += 1
-                    continue
-
-                all_results.append(results)
-                total_coincidences += results.get("coincidences", 0)
-                total_targets += results.get("total_targets", 0)
-
-        print(f"\nDetailed Filtering Summary:")
-        print(f"Total scans with targets: {total_scans_with_targets}")
-        print(f"Scans with no target positions: {scans_with_no_positions}")
-        print(f"Scans with invalid target positions: {scans_with_invalid_positions}")
-        print(f"Scans with null results: {scans_with_null_results}")
-        print(f"Successfully processed scans: {len(all_results)}")
-        print(f"Total valid positions analyzed: {total_valid_positions}")
-
-    # Calculate metrics
-    true_labels = np.array(true_labels)
-    predicted_labels = np.array(predicted_labels)
-
+        #     for batch_index in range(tokens.shape[0]):
+        #         target_positions_in_seq = target_positions[batch_index]
+        #         if len(target_positions_in_seq) > 0:  # check if there are any targets
+        #             sequence_attentions = last_layer_attentions[batch_index]
+        #             results = analyze_attention(sequence_attentions, target_positions_in_seq, tolerance=50, top_k=10)
+        #             all_results.append(results)
+        #             total_coincidences += results["coincidences"]
+        #             total_targets += results["total_targets"]
+        #             print(f"Batch: {batch_index}")
+        #             print(f"Coincidences: {results['coincidences']}")
+        #             print(f"Total Targets: {results['total_targets']}")
+        #             print(f"Top K: {results['top_k']}")
+        #             print(f"Total Tokens: {results['total_tokens']}")
+        #             coincidence_rate = (results['coincidences'] / (
+        #                         results['total_targets']  * results['top_k'])) * 100
+        #             print(f"Coincidence Rate:{coincidence_rate:.2f}%")
+        #     # Get both logits and attentions
+        #
+        # if total_targets > 0:
+        #     total_coincidence_rate = (total_coincidences / (
+        #                 total_targets * results["total_heads"] * results['top_k'])) * 100
+        #     print(f"Total Coincidence Rate:{total_coincidence_rate:.2f}%")
+        # else:
+        #     print(f"No targets found in the validation set.")
+    # Calculate F1 score and recall
     f1 = f1_score(true_labels, predicted_labels, average='weighted')
     recall = recall_score(true_labels, predicted_labels, average='weighted')
     accuracy = 100. * test_correct / test_total

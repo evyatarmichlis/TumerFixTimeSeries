@@ -2,6 +2,7 @@
 Utilities for data processing and window creation.
 """
 import os
+from typing import List, Tuple, Dict
 
 import numpy as np
 import pandas as pd
@@ -28,46 +29,94 @@ def find_max_consecutive_hits(df: pd.DataFrame) -> int:
     return max_consecutive
 
 
-def create_dynamic_time_series(df: pd.DataFrame, feature_columns=None, save_dir=None,
-                               load_existing=False,participant_id=1,split_type='train',window_size = 10):
-    """
-    Create time series windows with dynamic sizing based on maximum consecutive hits.
-
-    Args:
-        df: Input DataFrame
-        feature_columns: List of feature columns (default: pupil size and fixation duration)
-        save_dir: Directory to save results
-        load_existing: Whether to load existing processed data
-
-    Returns:
-        Tuple of (samples, labels)
-    """
+def create_dynamic_time_series_with_indices(df: pd.DataFrame, feature_columns: List[str],
+                                            window_size: int, stride: int = 1):
+    windows = []
+    labels = []
+    window_metadata = []
     if feature_columns is None:
-        feature_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X',
-                           'CURRENT_FIX_IA_Y', 'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT']
-        # feature_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION']
+        feature_columns = [
+            'Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X',
+            'CURRENT_FIX_IA_Y', 'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT'
+        ]
     key_features = ['Pupil_Size', 'CURRENT_FIX_DURATION']
-    # Try loading existing files if requested
+
+    for (participant_id, trial_id), trial_df in df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']):
+
+        for start_idx in range(0, len(trial_df) - window_size + 1, stride):
+            end_idx = start_idx + window_size
+            window = trial_df.iloc[start_idx:end_idx]
+            target_array = window['target'].values
+            diff_features = []
+            for feature in key_features:
+                values = trial_df[feature].iloc[start_idx:end_idx].values
+                if len(values) > 1:  # Need at least 2 points for diff
+                    max_diff = np.abs(np.max(np.abs(np.diff(values))))
+                else:
+                    max_diff = 0
+                diff_features.append(max_diff)
+
+            diff_features = np.array(diff_features)
+            diff_features = np.tile(diff_features, (window_size, 1))
+            window_features = window[feature_columns].values
+
+            window_with_diffs = np.concatenate([window_features, diff_features], axis=1)
+
+            window_target_positions = np.where(target_array == 1)[0]
+
+            windows.append(window_with_diffs)
+            labels.append(int(len(window_target_positions) > 0))
+            window_metadata.append({
+                'participant_id': participant_id,
+                'trial_id': trial_id,
+                'window_start': start_idx,
+                'window_end': end_idx,
+                'relative_target_positions': window_target_positions,
+                'absolute_target_positions': [window_target_positions[i]+ start_idx for i in range(len(window_target_positions))] ,
+                'trial_length': len(trial_df)
+            })
+
+    return np.array(windows), np.array(labels), window_metadata
+
+
+def create_dynamic_time_series(df: pd.DataFrame, feature_columns=None, save_dir=None,
+                               load_existing=False, participant_id=1, split_type='train',
+                               window_size=10, pad_value=0):
+    if feature_columns is None:
+        feature_columns = [
+            'Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X',
+            'CURRENT_FIX_IA_Y', 'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT'
+        ]
+
+    key_features = ['Pupil_Size', 'CURRENT_FIX_DURATION']
+
+    # Try loading existing files
     if load_existing and save_dir:
         samples_path = os.path.join(save_dir, f'{participant_id}_dynamic_samples_{split_type}.npy')
         labels_path = os.path.join(save_dir, f'{participant_id}_dynamic_labels_{split_type}.npy')
-        if all(os.path.exists(f) for f in [samples_path, labels_path]):
-            return np.load(samples_path), np.load(labels_path)
-
-    # Find maximum consecutive hits for entire dataset
-
+        locations_path = os.path.join(save_dir, f'{participant_id}_target_locations_{split_type}.npy')
+        if all(os.path.exists(f) for f in [samples_path, labels_path, locations_path]):
+            return (np.load(samples_path), np.load(labels_path), np.load(locations_path))
 
     samples = []
     labels = []
+    target_locations = []
 
     # Process each trial
-    for (_, trial_idx), trial_df in df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']):
-        if len(trial_df) < window_size:
-            continue
+    trial_groups = df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX'])
+    target_trials = [(idx, group) for idx, group in trial_groups if group['target'].any()]
+    print(f"Found {len(target_trials)} trials containing targets out of {len(list(trial_groups))} total trials")
 
-        # Create sliding windows
-        for start in range(0, len(trial_df) - window_size + 1):
-            window = trial_df.iloc[start:start + window_size]
+    for (_, trial_idx), trial_df in trial_groups:
+        trial_length = len(trial_df)
+        trial_df = trial_df.reset_index(drop=True)
+        for start_idx in range(0, trial_length - window_size + 1):
+            end_idx = start_idx + window_size
+            window = trial_df.iloc[start_idx:end_idx]
+
+            # Find targets within this window and make positions relative to window start
+            target_array = window['target'].values
+            window_target_positions = np.where(target_array == 1)[0]
 
             window_features = window[feature_columns].values
 
@@ -81,23 +130,27 @@ def create_dynamic_time_series(df: pd.DataFrame, feature_columns=None, save_dir=
             diff_features = np.tile(diff_features, (len(window), 1))
 
             combined_features = np.concatenate([window_features, diff_features], axis=1)
-            label = int(window['target'].any())
+            label = int(len(window_target_positions) > 0)
+
             samples.append(combined_features)
             labels.append(label)
+            target_locations.append(window_target_positions)
 
     samples = np.array(samples)
     labels = np.array(labels)
+    target_locations = np.array(target_locations, dtype=object)
 
+    # Save processed data
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
-        if participant_id == None:
+        if participant_id is None:
             participant_id = 100
 
         np.save(os.path.join(save_dir, f'{participant_id}_dynamic_samples_{split_type}.npy'), samples)
         np.save(os.path.join(save_dir, f'{participant_id}_dynamic_labels_{split_type}.npy'), labels)
+        np.save(os.path.join(save_dir, f'{participant_id}_target_locations_{split_type}.npy'), target_locations)
 
-    return samples, labels
-
+    return samples, labels, target_locations
 
 def resample_func(time_series_df, interval, feature_columns=None):
     if feature_columns is None:
