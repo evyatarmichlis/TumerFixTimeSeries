@@ -101,16 +101,23 @@ class CNNRecurrentAutoencoder(nn.Module):
             num_layers=num_layers,
             rnn_type=rnn_type
         )
-
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size, 64),
+            nn.ReLU(),
+            nn.Dropout(p=0.2),
+            nn.Linear(64, 2)
+        )
     def forward(self, x):
         encoded_outputs, hidden = self.encoder(x)
         reconstructed_outputs = self.decoder(encoded_outputs)
-        return reconstructed_outputs
+        hidden_for_class = hidden[-1] if hidden.dim() == 3 else hidden
+        logits = self.classifier(hidden_for_class)
+        return reconstructed_outputs,logits
 
 
 class InceptionModule(nn.Module):
     def __init__(self, in_channels, out_channels, bottleneck_channels=32,
-                 kernel_sizes=[1, 3, 5]):  # Match the old kernel sizes 9, 19, 39]
+                 kernel_sizes=[5, 15, 35]):  # Match the old kernel sizes 9, 19, 39]
         super().__init__()
         self.bottleneck = nn.Conv1d(in_channels, bottleneck_channels, kernel_size=1, padding=0)
         self.conv_layers = nn.ModuleList()

@@ -94,12 +94,18 @@ class AutoencoderTrainer(BaseTrainer):
     """Trainer class for autoencoder"""
 
     def __init__(self, model, criterion, optimizer, scheduler, device,
-                 mask_probability=0.1, save_path=None,early_stopping_patience=5):
+                 mask_probability=0.1, save_path=None,early_stopping_patience=5,recon_criterion = None,
+                 cls_criterion = None,
+                 recon_weight = 0.5,
+                 cls_weight = 0.5):
         super().__init__(model, criterion, optimizer, scheduler, device, save_path,early_stopping_patience)
         self.mask_probability = mask_probability
         self.best_val_loss = float('inf')
         self.early_stopping_patience = early_stopping_patience
-
+        self.recon_criterion = recon_criterion
+        self.cls_criterion = cls_criterion
+        self.recon_weight = recon_weight
+        self.cls_weight = cls_weight
     def apply_mask(self, inputs):
         """Apply random masking to inputs"""
         if self.mask_probability > 0:
@@ -113,14 +119,21 @@ class AutoencoderTrainer(BaseTrainer):
         self.model.train()
         total_loss = 0
 
-        for inputs, _ in train_loader:
+        for inputs, labels  in train_loader:
             inputs = inputs.to(self.device)
+            labels = labels.to(self.device)
+
             inputs = self.apply_mask(inputs)
 
             self.optimizer.zero_grad()
-            outputs = self.model(inputs)
-            loss = self.criterion(outputs, inputs)
+            # outputs = self.model(inputs)
+            recon, logits = self.model(inputs)
+            recon_loss = self.recon_criterion(recon, inputs)
 
+            # Compute classification loss
+            cls_loss = self.cls_criterion(logits, labels)
+            # loss = self.criterion(outputs, inputs)
+            loss = self.recon_weight * recon_loss + self.cls_weight * cls_loss
             loss.backward()
             self.optimizer.step()
 
@@ -135,11 +148,18 @@ class AutoencoderTrainer(BaseTrainer):
         total_loss = 0
 
         with torch.no_grad():
-            for inputs, _ in val_loader:
+            for inputs, labels in val_loader:
+                labels = labels.to(self.device)
                 inputs = inputs.to(self.device)
                 inputs = self.apply_mask(inputs)
-                output = self.model(inputs)
-                loss = self.criterion(output, inputs)
+                recon, logits = self.model(inputs)
+                # loss = self.criterion(output, inputs)
+                recon_loss = self.recon_criterion(recon, inputs)
+
+                # Compute classification loss
+                cls_loss = self.cls_criterion(logits, labels)
+                # loss = self.criterion(outputs, inputs)
+                loss = self.recon_weight * recon_loss + self.cls_weight * cls_loss
                 total_loss += loss.item()
 
         return total_loss / len(val_loader)
@@ -157,7 +177,7 @@ class AutoencoderTrainer(BaseTrainer):
         self.best_val_loss = float('inf')
         best_epoch = -1
 
-        print(f"Starting training for {epochs} epochs...")
+        # print(f"Starting training for {epochs} epochs...")
 
         try:
             for epoch in range(epochs):
@@ -178,15 +198,14 @@ class AutoencoderTrainer(BaseTrainer):
                     old_lr = self.optimizer.param_groups[0]['lr']
                     self.scheduler.step(val_loss)
                     new_lr = self.optimizer.param_groups[0]['lr']
-                    if old_lr != new_lr:
-                        print(f"Learning rate adjusted from {old_lr:.2e} to {new_lr:.2e}")
+                    # if old_lr != new_lr:
+                    #     print(f"Learning rate adjusted from {old_lr:.2e} to {new_lr:.2e}")
 
                 # Calculate epoch time
                 epoch_time = time.time() - epoch_start_time
-
-                # Print progress
-                print(f"\nEpoch {epoch + 1}/{epochs} - Time: {epoch_time:.2f}s")
-                print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+                #
+                # print(f"\nEpoch {epoch + 1}/{epochs} - Time: {epoch_time:.2f}s")
+                # print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
 
                 # Save periodic checkpoint (every 10 epochs)
                 if self.save_path and (epoch + 1) % 10 == 0:
@@ -201,7 +220,7 @@ class AutoencoderTrainer(BaseTrainer):
                     self.best_val_loss = val_loss
                     best_epoch = epoch
                     patience_counter = 0
-                    print(f"New best model! Validation loss improved to {val_loss:.4f}")
+                    # print(f"New best model! Validation loss improved to {val_loss:.4f}")
 
                     if self.save_path:
                         # Save both checkpoint and model state
@@ -219,15 +238,15 @@ class AutoencoderTrainer(BaseTrainer):
                         )
                 else:
                     patience_counter += 1
-                    print(f"Validation loss did not improve. Best: {self.best_val_loss:.4f} "
-                          f"at epoch {best_epoch + 1}. Patience: {patience_counter}/{self.early_stopping_patience}")
+                    # print(f"Validation loss did not improve. Best: {self.best_val_loss:.4f} "
+                    #       f"at epoch {best_epoch + 1}. Patience: {patience_counter}/{self.early_stopping_patience}")
 
                     if patience_counter >= self.early_stopping_patience:
                         print(f"\nEarly stopping triggered after {epoch + 1} epochs")
                         print(f"Best validation loss: {self.best_val_loss:.4f} at epoch {best_epoch + 1}")
                         break
 
-                print("-" * 80)  # Separator between epochs
+                # print("-" * 80)  # Separator between epochs
 
         except KeyboardInterrupt:
             print("\nTraining interrupted by user")
@@ -547,6 +566,7 @@ class CombinedModelTrainer(BaseTrainer):
         best_threshold, best_f1, _ = self.find_optimal_threshold(val_loader)
 
         return best_threshold
+
     def _plot_training_curves(self, train_losses, val_losses, train_accs, val_accs,name ='classifer'):
         """Plot and save training curves"""
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
@@ -1746,6 +1766,29 @@ class TripletAutoencoderTrainer(BaseTrainer):
         return train_losses, val_losses
 
 
+def calculate_weights_and_ratios(labels):
+    # Get class counts
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    majority_count = counts[np.argmax(counts)]
+    minority_count = counts[np.argmin(counts)]
+
+    # Calculate imbalance ratio
+    imbalance_ratio = majority_count / minority_count
+
+    # Set parameters
+    undersample_ratio = min(1.0, 1.0 / imbalance_ratio)  # Cap at 1.0 (retain all majority samples)
+    minority_weight = imbalance_ratio
+    majority_weight = 1.0  # Base weight for majority
+
+    print(f"Class Distribution: {dict(zip(unique_labels, counts))}")
+    print(f"Imbalance Ratio: {imbalance_ratio:.2f}")
+    print(f"Selected Parameters - undersample_ratio: {undersample_ratio}, "
+          f"minority_weight: {minority_weight}, majority_weight: {majority_weight}")
+
+    return undersample_ratio, minority_weight, majority_weight
+
+
+
 class EnsembleTrainer:
     def __init__(self,
                  base_model_class,
@@ -1765,8 +1808,9 @@ class EnsembleTrainer:
         self.save_path = save_path
         self.models = []
         self.best_val_losses = []
+        self.best_threshold = []
 
-    def create_weighted_loader(self, dataset, batch_size, majority_weight=0.1):
+    def create_weighted_loader(self, dataset, batch_size, majority_weight=0.5):
         """Create a DataLoader with weighted sampling (lower weight for majority class)"""
         # Extract labels from TensorDataset
         labels = dataset.tensors[1].cpu().numpy()
@@ -1791,6 +1835,68 @@ class EnsembleTrainer:
         )
 
         return DataLoader(dataset, batch_size=batch_size, sampler=sampler)
+
+
+    def create_hybrid_loader(
+            self,
+            dataset: TensorDataset,
+            batch_size: int,
+            undersample_ratio: float = 0.5,
+            minority_weight: float = 2.0
+    ) -> DataLoader:
+
+        data = dataset.tensors[0].cpu().numpy()
+        labels = dataset.tensors[1].cpu().numpy()
+        undersample_ratio, minority_weight, majority_weight = calculate_weights_and_ratios(labels)
+
+        # 2) Identify minority vs. majority
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        minority_label = unique_labels[np.argmin(counts)]
+        majority_label = unique_labels[np.argmax(counts)]
+
+        minority_indices = np.where(labels == minority_label)[0]
+        majority_indices = np.where(labels == majority_label)[0]
+
+        # 3) Undersample majority
+        #    e.g. keep 50% of the majority (undersample_ratio=0.5)
+        keep_count = int(len(majority_indices) * undersample_ratio)
+        sampled_majority_indices = np.random.choice(
+            majority_indices, size=keep_count, replace=False
+        )
+
+        combined_indices = np.concatenate([minority_indices, sampled_majority_indices])
+        np.random.shuffle(combined_indices)
+
+        reduced_data = data[combined_indices]
+        reduced_labels = labels[combined_indices]
+
+        # 5) Create weights for WeightedRandomSampler
+        #    - by default, 1.0 for majority
+        #    - higher weight (e.g., minority_weight) for minority
+        weights = np.ones(len(reduced_labels), dtype=np.float32)
+        weights[reduced_labels == minority_label] = minority_weight
+
+        # Normalize to sum=1 (recommended but not strictly required)
+        weights /= weights.sum()
+
+        sampler = WeightedRandomSampler(
+            weights=weights,
+            num_samples=len(weights),
+            replacement=True
+        )
+
+        # 6) Create a new TensorDataset & DataLoader
+        new_dataset = TensorDataset(
+            torch.FloatTensor(reduced_data),
+            torch.LongTensor(reduced_labels)
+        )
+
+        loader = DataLoader(
+            new_dataset,
+            batch_size=batch_size,
+            sampler=sampler
+        )
+        return loader
 
     def create_undersampled_loader(self, dataset, batch_size):
         """Create a DataLoader with undersampling of majority class"""
@@ -1830,7 +1936,6 @@ class EnsembleTrainer:
 
         return DataLoader(balanced_dataset, batch_size=batch_size, shuffle=True)
     def train_single_model(self, model, train_loader, val_loader, epochs, criterion, optimizer):
-        """Train a single model"""
         best_val_loss = float('inf')
         patience = 10
         patience_counter = 0
@@ -1876,33 +1981,35 @@ class EnsembleTrainer:
                 patience_counter += 1
                 if patience_counter >= patience:
                     break
+        best_threshold, best_f1, _ = self.find_optimal_threshold(val_loader,model)
 
-        return model, best_val_loss,best_minority_f1
+        return model, best_val_loss,best_minority_f1,best_threshold
 
     def train_ensemble(self, train_dataset, val_loader, batch_size, epochs, criterion,
-                       optimizer_class, optimizer_params, majority_weight=0.5):
+                       optimizer_class, optimizer_params, majority_weight=0.5,undersample_ratio=0.1, minority_weight=2.0):
         """Train the ensemble of models using weighted sampling"""
         self.models = []
         self.best_val_losses = []
 
-        for i in tqdm(range(self.n_models), desc="Training ensemble"):
+        for i in range(self.n_models):
             # Create new model instance
             model = self.base_model_class(**self.model_params).to(self.device)
             optimizer = optimizer_class(model.parameters(), **optimizer_params)
 
-            # Create weighted loader for this model
-            train_loader = self.create_weighted_loader(
-                train_dataset, batch_size, majority_weight)
-            # train_loader = self.create_undersampled_loader(
-            #     train_dataset, batch_size)
 
+            train_loader = self.create_hybrid_loader(
+                dataset=train_dataset,
+                batch_size=batch_size,
+                undersample_ratio=undersample_ratio,
+                minority_weight=minority_weight
+            )
             # Train model
-            trained_model, best_val_loss,minority_f1 = self.train_single_model(
+            trained_model, best_val_loss,minority_f1,best_threshold = self.train_single_model(
                 model, train_loader, val_loader, epochs, criterion, optimizer)
 
             self.models.append(trained_model)
             self.best_val_losses.append(best_val_loss)
-
+            self.best_threshold.append(best_threshold)
             print(f"Model {i+1}/{self.n_models} trained. Best val loss: {best_val_loss:.4f}, "
                   f"Minority class F1: {minority_f1:.4f}")
 
@@ -1938,8 +2045,9 @@ class EnsembleTrainer:
             all_probabilities.append(probabilities)
 
         # Convert to numpy arrays
-        all_predictions = np.array(all_predictions)  # shape: [n_models, n_samples]
-        all_probabilities = np.array(all_probabilities)  # shape: [n_models, n_samples, n_classes]
+        all_predictions = (np.array(all_predictions) >= np.array(self.best_threshold).mean()).astype(int)
+
+        # all_predictions = np.array(all_predictions)  # shape: [n_models, n_samples]
 
         # Apply weighted voting
         final_predictions = []
@@ -1990,7 +2098,7 @@ class EnsembleTrainer:
         for _, labels in test_loader:
             true_labels.extend(labels.cpu().numpy())
 
-        for weight in [1,1.2, 1.5, 2.0, 2.5,5]:
+        for weight in [1,1.5,2,3]:
             predictions = self.predict(test_loader, minority_weight=weight)
 
             results = self._calculate_metrics(true_labels, predictions)
@@ -2006,6 +2114,10 @@ class EnsembleTrainer:
         print(f"\nEnsemble Results:")
         print(f"Accuracy: {accuracy:.4f}")
         print(f"F1 Score: {f1:.4f}")
+        results = self._calculate_metrics(true_labels, predictions)
+        for k,v in results.items():
+            print(k)
+            print(v)
         cm= confusion_matrix(true_labels,predictions)
         print(cm)
         report = classification_report(true_labels, predictions)
@@ -2033,3 +2145,87 @@ class EnsembleTrainer:
             'minority_recall': minority_recall,
             'minority_f1': minority_f1
         }
+
+    def find_optimal_threshold(self, val_loader,model, n_thresholds=100, max_fp_tp_ratio=5.0, min_recall=0.3):
+        """
+        Find the optimal threshold based on validation set metrics, controlling FP/TP ratio.
+
+        Args:
+            val_loader: Validation data loader
+            n_thresholds: Number of threshold values to try
+            max_fp_tp_ratio: Maximum allowed ratio of FP/TP
+            min_recall: Minimum required recall to ensure we're not being too conservative
+
+        Returns:
+            float: Optimal threshold value
+            dict: Detailed metrics for the optimal threshold
+            list: All results_old for analysis
+        """
+        all_probs = []
+        all_labels = []
+
+        # Collect all predictions and labels
+        with torch.no_grad():
+            for inputs, labels in tqdm(val_loader, desc='Collecting predictions'):
+                inputs = inputs.to(self.device)
+                outputs = model(inputs)
+                probabilities = torch.sigmoid(outputs[:, 0]).cpu().numpy()
+                all_probs.extend(probabilities)
+                all_labels.extend(labels.numpy())
+
+        all_probs = np.array(all_probs)
+        all_labels = np.array(all_labels)
+
+        # Try different thresholds
+        thresholds = np.linspace(0.5, 0.95, n_thresholds)
+        results = []
+
+        for threshold in tqdm(thresholds, desc='Finding optimal threshold'):
+            predictions = (all_probs >= threshold).astype(int)
+
+            # Calculate metrics
+            tp = np.sum((predictions == 1) & (all_labels == 1))
+            fp = np.sum((predictions == 1) & (all_labels == 0))
+            fn = np.sum((predictions == 0) & (all_labels == 1))
+            tn = np.sum((predictions == 0) & (all_labels == 0))
+
+            # Calculate various metrics
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+            fp_tp_ratio = fp / tp if tp > 0 else float('inf')
+            specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+            f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+
+            results.append({
+                'threshold': threshold,
+                'f1': f1,
+                'precision': precision,
+                'recall': recall,
+                'specificity': specificity,
+                'fp_tp_ratio': fp_tp_ratio,
+                'tp': tp,
+                'fp': fp,
+                'fn': fn,
+                'tn': tn
+            })
+
+        # Filter results_old based on criteria
+        valid_results = [r for r in results if r['fp_tp_ratio'] <= max_fp_tp_ratio
+                         and r['recall'] >= min_recall]
+
+        if not valid_results:
+            print("No threshold satisfies the criteria. Consider relaxing constraints.")
+            # Return the result with the lowest FP/TP ratio that meets minimum recall
+            valid_results = [r for r in results if r['recall'] >= min_recall]
+            if valid_results:
+                best_result = min(valid_results, key=lambda x: x['fp_tp_ratio'])
+            else:
+                best_result = max(results, key=lambda x: x['f1'])
+        else:
+            # Among valid results_old, choose the one with highest F1 score
+            best_result = max(valid_results, key=lambda x: x['f1'])
+
+
+
+        return best_result['threshold'], best_result, results
+

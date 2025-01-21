@@ -2,15 +2,16 @@ import heapq
 import os
 import random
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 import matplotlib
 import pandas as pd
 import torch.nn as nn
 from sklearn.preprocessing import KBinsDiscretizer
-from transformers import XLNetModel, XLNetConfig
+from transformers import XLNetModel, XLNetConfig, BigBirdConfig, BigBirdModel
 from torch.utils.data import Dataset
 import seaborn as sns
+from transformers import LongformerConfig, LongformerModel, LongformerTokenizer
 
 import torch
 import numpy as np
@@ -25,6 +26,8 @@ from representation_method.utils.data_utils import create_dynamic_time_series, s
     create_dynamic_time_series_with_indices
 from representation_method.utils.general_utils import seed_everything
 
+
+TRAIN = True
 
 class EyeTrackingDataset(Dataset):
     def __init__(
@@ -120,7 +123,15 @@ class IntegratedEyeTrackingTransformer(nn.Module):
 
         # Initialize transformer backbone
         self.transformer = XLNetModel(config)
-
+        # config = BigBirdConfig.from_pretrained("google/bigbird-roberta-base")
+        # config.hidden_size = d_model
+        # config.num_attention_heads = n_heads
+        # config.num_hidden_layers = n_layers
+        # config.attention_type = "block_sparse"  # BigBird-specific
+        # config.block_size = 64  # Example block size
+        # config.num_random_blocks = 2  # Example random blocks
+        #
+        # self.transformer = BigBirdModel(config)
         # Self-supervised head
         self.reconstruction_head = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
@@ -222,7 +233,7 @@ def train_self_supervised(
         model: IntegratedEyeTrackingTransformer,
         train_loader: DataLoader,
         epochs: int = 50,
-        learning_rate: float = 1e-4,
+        learning_rate: float = 1e-5,
         device: str = 'cuda',
         patience: int = 5
 ):
@@ -244,7 +255,7 @@ def train_self_supervised(
 
         for batch in train_loader:
             windows = batch[0].to(device)
-            windows = windows.float()  # Convert targets to torch.float32
+            windows = windows.float()
             reconstructed = model(windows)
             # loss = criterion(reconstructed, windows)
             loss = random_mask_mse_loss(
@@ -253,7 +264,6 @@ def train_self_supervised(
                 mask_ratio=0.3,
                 mask_strategy='random'
             )
-            # Backward pass
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -291,27 +301,45 @@ class TargetLocalizer:
         attention_scores = attention_weights[-1]
         return attention_scores.cpu().numpy()
 
-    def localize_targets(self, window_data: torch.Tensor, target_positions,window_start):
-        """Return both similarity score and actual values"""
+    def localize_targets(self, window_data: torch.Tensor, target_positions, window_start):
+        """Return similarity score, actual values, and precision/recall metrics"""
         attentions = self.analyze_attention(window_data).squeeze()
         avg_attention = attentions.mean(axis=0)
         token_attentions = avg_attention.mean(axis=0)
         seq_len = token_attentions.shape[0]
+
         results = {
             "similarity_score": 0,
             "total_targets": len(target_positions),
             "window_size": seq_len,
             "top_k_positions": [],
             'target_locations': target_positions,
-
-
         }
 
-        top_k_indices = heapq.nlargest(len(target_positions)*2, range(len(token_attentions)),
-                                       token_attentions.__getitem__)
+        # top_k_indices = heapq.nlargest(len(target_positions), range(len(token_attentions)),
+        #                                token_attentions.__getitem__)
+        top_k_indices = dynamic_topk_by_threshold(token_attentions,1.5)
         results["top_k_positions"] = top_k_indices
-        results["abs_top_k_positions"] = [top_k_indices[i] + window_start for i in range(len(top_k_indices))]
-        results["abs_target_locations"] = [target_positions[i] + window_start for i in range(len(target_positions))]
+        results["abs_top_k_positions"] = [idx + window_start for idx in top_k_indices]
+        results["abs_target_locations"] = [pos + window_start for pos in target_positions]
+
+
+        matched_targets = set()
+        matched_predictions = set()
+        tolerance = 10
+
+        for pred_pos in top_k_indices:
+            for target_idx, target_pos in enumerate(target_positions):
+                if target_idx not in matched_targets and abs(target_pos - pred_pos) <= tolerance:
+                    matched_targets.add(target_idx)
+                    matched_predictions.add(pred_pos)
+                    break
+
+        true_positives = len(matched_targets)
+        precision = true_positives / len(top_k_indices) if any(top_k_indices) else 0.0
+        recall = true_positives / len(target_positions) if any(target_positions) else 0.0
+
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
 
         for target_pos in target_positions:
             min_distance = float('inf')
@@ -322,10 +350,58 @@ class TargetLocalizer:
             similarity = 1 - (min_distance / seq_len)
             results["similarity_score"] += max(0, similarity)
 
-        results["similarity_score"] /= len(target_positions)
+        results["similarity_score"] /= len(target_positions) if len(target_positions) > 0 else 1
+
+        # Add separate metrics to results
+        results.update({
+            "precision": precision,
+            "recall": recall,
+            "f1_score": f1,
+            "true_positives": true_positives,
+            "num_predictions": len(top_k_indices),
+            "num_targets": len(target_positions)
+        })
+
         return results
 
 
+def calculate_confusion_metrics(df):
+    """Calculate confusion matrix metrics from DataFrame containing TP, predictions and targets"""
+    total_tp = df['true_positives'].sum()
+    total_predictions = df['num_predictions'].sum()
+    total_targets = df['num_targets'].sum()
+
+    # Calculate other metrics
+    fp = total_predictions - total_tp  # False Positives
+    fn = total_targets - total_tp  # False Negatives
+
+    # Create confusion matrix
+    cm = np.array([
+        [total_tp, fp],
+        [fn, total_predictions - fp]
+    ])
+
+    # Calculate rates
+    precision = total_tp / total_predictions if total_predictions > 0 else 0
+    recall = total_tp / total_targets if total_targets > 0 else 0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+
+
+    return cm, {'precision': precision, 'recall': recall, 'f1': f1}
+
+
+# Use with your DataFrame
+def dynamic_topk_by_threshold(token_attentions: np.ndarray,
+                              std_multiplier: float = 2.0) -> List[int]:
+    """
+    Return indices of all positions whose attention > mean + (std_multiplier * std).
+    """
+    mean_attn = np.mean(token_attentions)
+    std_attn = np.std(token_attentions)
+    threshold = mean_attn + std_multiplier * std_attn
+
+    top_indices = np.where(token_attentions > threshold)[0].tolist()
+    return top_indices
 
 
 def create_dataset(windows, labels, tokenizer, feature_columns):
@@ -352,9 +428,11 @@ def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  w
         'CURRENT_FIX_IA_Y', 'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT',
     ]
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    method_dir = os.path.join('results', f'self_supervised_transformer_participant{participant_id}_window_size_{window_size}_random_mask')
+    method_dir = os.path.join('results', f'self_supervised_transformer_participant{participant_id}_window_size_{window_size}')
     os.makedirs(method_dir, exist_ok=True)
     print(f"window_size is {window_size}")
+
+
     X_all, Y_all, window_metadata = create_dynamic_time_series_with_indices(
         df, feature_columns=feature_columns, window_size=window_size)
     feature_columns+= ['diff_pupil', 'diff_fix_duration']
@@ -378,18 +456,32 @@ def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  w
         max_len=window_size,
         pretrained_model='xlnet-base-cased'
     )
+    best_model_path =os.path.join(method_dir, "model.pth")
 
-    model = train_self_supervised(
-        model=model,
-        train_loader=dataloader,
-        epochs=1000,
-        learning_rate=1e-4,
-        device='cuda'
-    )
+    if TRAIN:
+        model = train_self_supervised(
+            model=model,
+            train_loader=dataloader,
+            epochs=150,
+            learning_rate=1e-4,
+            device='cuda'
+        )
+        save_dict = {
+            'model_state_dict': model.state_dict(),
+            'vocab_size': tokenizer.vocab_size,
+            'n_features': len(feature_columns)
+        }
+        torch.save(save_dict, best_model_path)
+    else:
+        checkpoint = torch.load(best_model_path)
+        model.load_state_dict(checkpoint['model_state_dict'])
 
-    # Evaluation
+    model = model.to(device)
     localizer = TargetLocalizer(model, device)
-
+    total_precision = 0
+    total_recall = 0
+    total_f1 = 0
+    total_windows = 0
     all_results = []
     print("\nEvaluating target localization...")
     for i, (window, meta) in enumerate(zip(X_all, window_metadata)):
@@ -406,20 +498,29 @@ def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  w
             results['participant_id'] = meta['participant_id']
             results['trial_id'] = meta['trial_id']
             all_results.append(results)
+            total_precision += results['precision']
+            total_recall += results['recall']
+            total_f1 += results['f1_score']
+            total_windows += 1
 
 
-
-
+    target_pick_method = 'threshold'
     all_results_df = pd.DataFrame(all_results)
-    all_results_df.to_csv(os.path.join(method_dir, 'attention.csv'))
+    all_results_df.to_csv(os.path.join(method_dir, f'{target_pick_method}_attention.csv'))
     print('############ percent similarity_score ############')
     print(all_results_df['similarity_score'].mean())
+    cm, metrics = calculate_confusion_metrics(all_results_df)
+    print(cm)
+    for k,v in metrics.items():
+        print(f'############ {k} ############')
+        print(f'$$$$$$$$$$$$ {v} $$$$$$$$$$$$')
+
     sns.histplot(data=all_results_df, x='similarity_score', bins=10, kde=True)
     plt.xlabel('Percent Coincidences')
     plt.ylabel('Count')
     plt.title('Distribution of Percent Coincidences')
-    plt.savefig(os.path.join(method_dir, 'similarity_score.png'))
-
+    plt.savefig(os.path.join(method_dir, f'similarity_score.png'))
+    plt.plot()
 
 
 
@@ -438,6 +539,5 @@ if __name__ == "__main__":
         participant_id=config.participant_id,
         data_format="legacy"
     )
-    for window_size in [100]:
-        print(f"WINDOW_SIZE {window_size}")
+    for window_size in [150]:
         find_attention(df, window_size=window_size)

@@ -1,29 +1,26 @@
 import json
 import os
 
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from pyparsing import alphas
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, \
+    f1_score
 from sklearn.preprocessing import StandardScaler
-from sympy.benchmarks.bench_meijerint import alpha
 from torch.nn import CrossEntropyLoss
 from torch.utils.data import DataLoader, WeightedRandomSampler, TensorDataset
 from sklearn.utils.class_weight import compute_class_weight
 from pathlib import Path
 
-from data_process import IdentSubRec
-from representation_method.utils.statistical_classifer import analyze_dynamic_windows
 from representation_method.utils.trainers import FocalLoss, EnsembleTrainer
 from representation_method.utils.visualization import analyze_embeddings_from_loader, \
     analyze_vae_embeddings_from_loader, analyze_vae_embeddings_with_umap, analyze_encoder_embeddings_with_umap_2
 # Import our utility modules
 from utils.general_utils import seed_everything
 from utils.data_utils import create_time_series, split_train_test_for_time_series, DataSplitter, \
-    create_dynamic_time_series, find_max_consecutive_hits
+    create_dynamic_time_series, find_max_consecutive_hits, create_dynamic_time_series_for_rf, \
+    create_dynamic_time_series_with_smooth_labels
 from utils.losses import WeightedCrossEntropyLoss, ContrastiveAutoencoderLoss, ImbalancedTripletContrastiveLoss, \
     CombinedTemporalLoss
 from utils.gan_utils import generate_balanced_data_with_gan
@@ -31,22 +28,121 @@ from utils.data_loader import load_eye_tracking_data, DataConfig, create_data_lo
 from models.autoencoder import CNNRecurrentAutoencoder, initialize_weights, TimeSeriesVAE, ImprovedTimeSeriesVAE, \
     CombinedVAEClassifier
 from models.classifier import CombinedModel, TVAEClassifier, EnhancedClassifier, EnhancedCombinedModel, \
-    SimpleCombinedModel
+    SimpleCombinedModel, ComplexCNNClassifier
 from utils.trainers import AutoencoderTrainer, CombinedModelTrainer, ContrastiveAutoencoderTrainer, VAETrainer, \
     VAEClassifierTrainer, ImprovedVAEClassifierTrainer, TripletAutoencoderTrainer
 from latent_space_classifer import  LatentSpaceClassifier
 feature_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X', 'CURRENT_FIX_IA_Y',
                    'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT']
+from sklearn.ensemble import RandomForestClassifier
+
+
+def filter_easy_negatives(X, y, recall_target=0.95, max_depth=6, n_estimators=50):
+    """
+    Train a simple random forest to filter out 'easy' negative windows
+    while retaining ~95% recall for positives.
+
+    Args:
+        X (np.ndarray): shape (num_windows, window_size, num_features) or (num_windows, feature_dim).
+        y (np.ndarray): shape (num_windows,).
+        recall_target (float): Desired recall for positive class (0.0 - 1.0).
+        max_depth (int): RandomForest max_depth parameter.
+        n_estimators (int): RandomForest n_estimators parameter.
+
+    Returns:
+        keep_mask (np.ndarray): Boolean mask of windows to KEEP (True).
+        model (RandomForestClassifier): Trained RF model (for reference).
+        chosen_threshold (float): Probability threshold used.
+    """
+    # 1) Flatten each window so the coarse model sees a simpler 1D feature vector per window
+    #    (Alternatively, you could extract some aggregated features instead of flattening.)
+    num_windows = X.shape[0]
+    X_flat = X.reshape(num_windows, -1)
+
+    # 2) Train a simple RandomForest on (X_flat, y)
+    rf = RandomForestClassifier(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        class_weight='balanced',  # helps with imbalance
+        random_state=42
+    )
+    rf.fit(X_flat, y)
+
+    # 3) Get predicted probabilities for the positive class
+    pos_probs = rf.predict_proba(X_flat)[:, 1]
+
+    # 4) Choose a threshold that yields the desired recall
+    #    Sort windows by descending probability
+    sorted_indices = np.argsort(-pos_probs)
+    pos_count = np.sum(y == 1)
+    found_positives = 0
+    chosen_threshold = 0.0
+
+    for idx in sorted_indices:
+        if y[idx] == 1:
+            found_positives += 1
+        current_recall = found_positives / pos_count if pos_count > 0 else 1.0
+        if current_recall >= recall_target:
+            chosen_threshold = pos_probs[idx]
+            break
+
+    # 5) Create mask of windows with probability >= chosen_threshold
+    keep_mask = pos_probs >= chosen_threshold
+
+    print(f"\n[Coarse Filter] Achieved ~{recall_target * 100:.1f}% recall")
+    print(f"[Coarse Filter] Probability threshold chosen = {chosen_threshold:.4f}")
+    print(f"[Coarse Filter] Keeping {np.sum(keep_mask)}/{num_windows} windows (~{100 * np.mean(keep_mask):.1f}%)")
+
+    return keep_mask, rf, chosen_threshold
+
+def evaluate_random_classifier(Y_test,method_dir = None):
+    """
+    Evaluate a random classifier against the given Y_test.
+    """
+    # Calculate class distribution
+    class_counts = np.bincount(Y_test)
+    class_probs = class_counts / len(Y_test)
+
+    # Generate random predictions based on class probabilities
+    random_predictions = np.random.choice(len(class_probs), size=len(Y_test), p=class_probs)
+
+    # Calculate metrics
+    acc = accuracy_score(Y_test, random_predictions)
+    precision = precision_score(Y_test, random_predictions, average="binary", pos_label=1)
+    recall = recall_score(Y_test, random_predictions, average="binary", pos_label=1)
+    f1 = f1_score(Y_test, random_predictions, average="binary", pos_label=1)
+
+    # Print classification report
+    print("Random Classifier Metrics:")
+    print(f"Accuracy: {acc:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"F1 Score: {f1:.4f}")
+    metrics = {
+        "accuracy": acc,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1
+    }
+    if method_dir:
+        os.makedirs(method_dir, exist_ok=True)
+        results_path = os.path.join(method_dir, "random_classifier_metrics.json")
+        with open(results_path, "w") as f:
+            json.dump(metrics, f, indent=4)
+        print(f"Metrics saved to {results_path}")
+
+    # Return metrics
+    return metrics
 
 # feature_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION']
 def main_with_autoencoder(df, window_size=5, method='', resample=False, classification_epochs=20, batch_size=32,
                           ae_epochs=100, depth=4, num_filters=32, lr=0.001, mask_probability=0.4,
                           early_stopping_patience=30, threshold=0.5, use_gan=False, TRAIN = False, use_vae=True,
-                          vae_params=None, assemble=False):
+                          vae_params=None, assemble=False,seed = 0):
     """
     Main training pipeline with autoencoder and optional GAN augmentation.
     """
-    seed_everything(0)
+    seed_everything(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Create results_old directory
@@ -80,50 +176,67 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
         for key, value in hyperparameters.items():
             f.write(f"{key}: {value}\n")
 
-    # 2. Data Preparation
-    # Split train/test
-    # max_consecutive = find_max_consecutive_hits(df)
-    # window_size = max_consecutive + 4
-    # Add buffer
     print(f"window_size is {window_size}")
-    train_df, test_df = split_train_test_for_time_series(df, test_size=0.2, random_state=0)
-    train_df, val_df = split_train_test_for_time_series(train_df, test_size=0.2, random_state=0)
+    train_df, test_df = split_train_test_for_time_series(df, test_size=0.2, random_state=seed)
+    train_df, val_df = split_train_test_for_time_series(train_df, test_size=0.2, random_state=seed)
 
     print("Original class distribution in test set:")
     print(test_df["target"].value_counts())
-
-
-
     # Create time series
-    X_train, Y_train = create_dynamic_time_series(
+    X_train, Y_train ,_= create_dynamic_time_series(
         train_df,feature_columns=None,participant_id=config.participant_id,load_existing=False,split_type='train',window_size=window_size)
-    X_test, Y_test = create_dynamic_time_series(
+    X_test, Y_test,_ = create_dynamic_time_series(
         test_df,feature_columns=None,participant_id=config.participant_id,load_existing=False,split_type='test',window_size=window_size)
-    X_val, Y_val = create_dynamic_time_series(
+    X_val, Y_val,_ = create_dynamic_time_series(
         val_df,feature_columns=None,participant_id=config.participant_id,load_existing=False,split_type='test',window_size=window_size)
-    print("Original class distribution in test set:")
-    print(pd.Series(Y_test).value_counts())
+
+    # evaluate_random_classifier(Y_test,method_dir)
+    if window_size == 10:
+        depth = 3
+    elif window_size in [20,50,150]:
+        depth = 4
+    else:
+        depth = 2
+
+    # print("after window class distribution in test set:")
+    # print(pd.Series(Y_test).value_counts())
+    # Create time series
+
     # results, best_clf = analyze_dynamic_windows(X_train, Y_train, X_test, Y_test, X_val, Y_val)
     # return results
     # Scale data
+    # print("Before first filtering")
+    # print(pd.Series(Y_train).value_counts())
+    # keep_mask, rf_model, coarse_threshold = filter_easy_negatives(
+    #     X_train, Y_train,
+    #     recall_target=0.99,
+    #     max_depth=6,
+    #     n_estimators=50
+    # )
+    #
+    # # Apply mask to remove easy negatives from training data
+    # # X_train = X_train[keep_mask]
+    # # Y_train = Y_train[keep_mask]
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train.reshape(-1, X_train.shape[-1])).reshape(X_train.shape)
     X_val_scaled = scaler.transform(X_val.reshape(-1, X_val.shape[-1])).reshape(X_val.shape)
     X_test_scaled = scaler.transform(X_test.reshape(-1, X_test.shape[-1])).reshape(X_test.shape)
-
+    input_dim = X_train.shape[-1]
     if use_vae:
         autoencoder = TimeSeriesVAE(
-            input_dim=len(feature_columns)+2,
+            input_dim=input_dim,
             hidden_dim=64,
             latent_dim=vae_params.get('latent_dim', 32)
         ).to(device)
 
         # autoencoder = ImprovedTimeSeriesVAE(len(feature_columns)+2,latent_dim=vae_params.get('latent_dim', 32)).to(device)
+
+
     else:
         autoencoder =CNNRecurrentAutoencoder(
-            in_channels=len(feature_columns)+2,  # Number of input features
+            in_channels=input_dim,  # Number of input features
             num_filters=32,  # Match the old model's filter count
-            depth=2,  # - original 4
+            depth=depth ,  # - original 4
             hidden_size=128,  # Match the old hidden size
             num_layers=1,
             rnn_type='GRU',
@@ -140,14 +253,12 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
         X_val_tensor = torch.tensor(X_val_scaled, dtype=torch.float32).permute(0, 2, 1)
         X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32).permute(0, 2, 1)
 
-        # Force labels to be 1D
         Y_train_1d = Y_train.flatten() if isinstance(Y_train, np.ndarray) else np.array(Y_train).flatten()
         Y_val_1d = Y_val.flatten() if isinstance(Y_val, np.ndarray) else np.array(Y_val).flatten()
         Y_test_1d = Y_test.flatten() if isinstance(Y_test, np.ndarray) else np.array(Y_test).flatten()
 
         print("Shape after flattening:", Y_train_1d.shape)  # Debug print
 
-        # Create tensors from 1D arrays
         Y_train_tensor = torch.tensor(Y_train_1d, dtype=torch.long)
         Y_val_tensor = torch.tensor(Y_val_1d, dtype=torch.long)
         Y_test_tensor = torch.tensor(Y_test_1d, dtype=torch.long)
@@ -208,20 +319,20 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
                 early_stopping_patience=early_stopping_patience
             )
         else:
-            trainer = TripletAutoencoderTrainer(
-                model=autoencoder,
-                criterion=nn.MSELoss(),
-                optimizer=optimizer,
-                scheduler=scheduler,
-                device=device,
-                margin=params.get('margin', 10),
-                triplet_weight=params.get('triplet_weight', 30),
-                distance_metric=params.get('distance_metric', 'cosine'),
-                mask_probability=params.get('mask_probability', 0.1),
-                save_path=method_dir,
-                early_stopping_patience=early_stopping_patience
-
-                )
+            # trainer = TripletAutoencoderTrainer(
+            #     model=autoencoder,
+            #     criterion=nn.MSELoss(),
+            #     optimizer=optimizer,
+            #     scheduler=scheduler,
+            #     device=device,
+            #     margin=params.get('margin', 10),
+            #     triplet_weight=params.get('triplet_weight', 30),
+            #     distance_metric=params.get('distance_metric', 'cosine'),
+            #     mask_probability=params.get('mask_probability', 0.1),
+            #     save_path=method_dir,
+            #     early_stopping_patience=early_stopping_patience
+            #
+            #     )
             trainer = AutoencoderTrainer(
                 model=autoencoder,
                 criterion=nn.MSELoss(),
@@ -230,7 +341,9 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
                 device=device,
                 mask_probability=params.get('mask_probability', 0.4),
                 save_path=method_dir,
-                early_stopping_patience=early_stopping_patience
+                early_stopping_patience=early_stopping_patience,
+                recon_criterion=nn.MSELoss(),
+                cls_criterion= FocalLoss()
 
             )
 
@@ -253,11 +366,11 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
         # return results
     else:
         root_dir = Path(__file__).resolve().parent  # Go up 3 levels
-        best_autoencoder_path = os.path.join(root_dir, "results",'dynamic windowing with diffs assemble - focal loss 0.75_approach_6_participant_1use_gan_False',
+        best_autoencoder_path = os.path.join(root_dir, "results",'add focal loss to AE _approach_6_participant_1use_gan_False',
                                              'best_autoencoder_model.pth')
 
 
-        autoencoder.load_state_dict(torch.load(best_autoencoder_path))
+        # autoencoder.load_state_dict(torch.load(best_autoencoder_path))
 
     # 4. GAN Data Generation (if enabled)
 
@@ -305,20 +418,22 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
             num_samples=len(weights),
             replacement=True
         )
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size)
 
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    # model = TVAEClassifier(autoencoder, num_classes=2).to(device)
+    ensemble_save_path = os.path.join(method_dir,'ensemble_models')
+    os.makedirs(ensemble_save_path, exist_ok=True)
+    input_dim = X_train_tensor.shape[1]
 
     if assemble:
-        # Initialize ensemble trainer
         ensemble_trainer = EnsembleTrainer(
-            base_model_class=EnhancedCombinedModel,  # Your model class
-            model_params={'model': autoencoder, 'num_classes': 2},
-            n_models=10,  # Number of models in ensemble
+            base_model_class=ComplexCNNClassifier,
+            model_params={'input_dim': input_dim},
+            n_models=10,
             device='cuda',
-            save_path='ensemble_models'
+            save_path=ensemble_save_path
+
         )
 
         # Train ensemble
@@ -328,27 +443,20 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
             val_loader=val_loader,
             batch_size=32,
             epochs=50,
-            criterion=nn.CrossEntropyLoss(),
+            criterion = nn.CrossEntropyLoss(),
             optimizer_class=optim.Adam,
             optimizer_params={'lr': 0.001},majority_weight=weights[0]
         )
         accuracy, f1= ensemble_trainer.evaluate(test_loader)
         return accuracy,f1
-    model = EnhancedCombinedModel(autoencoder, num_classes=2).to(device)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
+    model = SimpleCombinedModel(autoencoder, num_classes=2).to(device)
     # TVAEClassifier
     # optimizer = optim.Adam(model.parameters(), lr=lr)
     optimizer = optim.AdamW([
-        {'params': model.encoder.parameters(), 'lr': lr * 0.1},
+        {'params': model.encoder.parameters(), 'lr': lr },
         {'params': model.classifier.parameters(), 'lr': lr}
     ], weight_decay=1e-4)
-
-    # Create trainer
-    try:
-        classifier, test_metrics = train_latent_classifier(vae_model=autoencoder, train_loader=train_loader,
-                                                           val_loader=val_loader, test_loader=test_loader, device=device)
-        print(test_metrics)
-    except Exception:
-        print("error in latent classifier")
 
     criterion = CrossEntropyLoss()
     combined_trainer = CombinedModelTrainer(
@@ -386,7 +494,8 @@ def create_method_name(name,config, params):
         f"{name}"
         f"_approach_{config.approach_num}"
         f"_participant_{params['participant']}"
-        f"use_gan_{params['use_gan']}"
+        f'seed_{params["seed"]}'
+        f'window_size_{params["window_size"]}'
     )
 
 
@@ -708,8 +817,8 @@ if __name__ == '__main__':
         )
 
     params = {
-        'name': 'dynamic windowing with diffs assemble - keep only target samples',
-        'window_size': 200,
+        'name': 'cnn with complex classifier',
+        'window_size': 100,
         'classification_epochs': 200,
         'batch_size': 32,
         'ae_epochs': 150,
@@ -721,13 +830,13 @@ if __name__ == '__main__':
         'use_gan': False,
         'early_stopping_patience': 10,
         'resample': False,
-        'TRAIN': True,
+        'TRAIN': False,
         "classifier": "add dropout =0.1",
         "margin":0.1,
         "distance_metric":'cosine',
         "triplet_weight":0.5,
         'lr':0.0001,
-        'latent_dim':32
+        'latent_dim':32,
     }
 
 
@@ -740,361 +849,72 @@ if __name__ == '__main__':
         data_format="legacy"
     )
 
-    # Combine params for method name
+    # Combine params for method name SimpleCombinedModel,150,200,300,500
     combined_params = params  # This merges both dictionaries
+    for window in [100]:
+        print(f"####### WINDOW {window}#########")
+        try:
+            # for seed in  [0,5,13, 123, 999, 2025]:
+            for seed in  [0]:
+                print(f"#######SEED {seed}#########")
+                combined_params["seed"] = seed
+                params['window_size'] = window
+                method_name = create_method_name(combined_params['name'], config, combined_params)
 
-    method_name = create_method_name(combined_params['name'], config, combined_params)
+                main_with_autoencoder(
+                    df=df,
+                    window_size=params['window_size'],
+                    method=method_name,  # generated from create_method_name
+                    resample=params['resample'],
+                    classification_epochs=params['classification_epochs'],  # from params['classification_epochs']
+                    batch_size=params['batch_size'],  # from params['batch_size']
+                    ae_epochs=params['ae_epochs'],  # from params['ae_epochs']
+                    depth=params['depth'],  # from params['depth']
+                    num_filters=params['num_filters'],  # from params['num_filters']
+                    lr=0.001,  # from vae_params['lr']
+                    mask_probability=params['mask_probability'],  # from params['mask_probability']
+                    early_stopping_patience=params['early_stopping_patience'],  # from params['early_stopping_patience']
+                    threshold=params['threshold'],  # from params['threshold']
+                    use_gan=params['use_gan'],  # from params['use_gan']
+                    TRAIN=params['TRAIN'],  # from params['TRAIN']
+                    use_vae=False,  # since we want to use VAE
+                    vae_params=params , # the VAE-specific parameters dictionary
+                    assemble=True,
+                    seed=seed
+                )
+        except Exception as e:
+            print(e)
+            continue
 
-    main_with_autoencoder(
-        df=df,
-        window_size=params['window_size'],
-        method=method_name,  # generated from create_method_name
-        resample=params['resample'],
-        classification_epochs=params['classification_epochs'],  # from params['classification_epochs']
-        batch_size=params['batch_size'],  # from params['batch_size']
-        ae_epochs=params['ae_epochs'],  # from params['ae_epochs']
-        depth=params['depth'],  # from params['depth']
-        num_filters=params['num_filters'],  # from params['num_filters']
-        lr=0.001,  # from vae_params['lr']
-        mask_probability=params['mask_probability'],  # from params['mask_probability']
-        early_stopping_patience=params['early_stopping_patience'],  # from params['early_stopping_patience']
-        threshold=params['threshold'],  # from params['threshold']
-        use_gan=params['use_gan'],  # from params['use_gan']
-        TRAIN=params['TRAIN'],  # from params['TRAIN']
-        use_vae=False,  # since we want to use VAE
-        vae_params=params , # the VAE-specific parameters dictionary
-        assemble=True,
-    )
-    # main(config, params, use_legacy)
-    #
-    # import itertools
-    # from copy import deepcopy
-    #
-    # best_results = {
-    #     'silhouette': {
-    #         'score': float('-inf'),
-    #         'params': None
-    #     },
-    #     'davies': {
-    #         'score': float('inf'),  # Lower is better for Davies-Bouldin
-    #         'params': None
-    #     }
-    # }
-    # all_results = []
-    # # Grid parameters
-    # margins = [0.1,0.3,0.5]
-    # triplet_weights = [10,30,50]
-    # betas = [0.1]
-    # alphas = [0.05,0.1]
-    # distances = ["cosine","L2"]
-    # loss_types = ["normal","dual"]
-    # latent_dims = [2,8,16,32,64]
-    # lrs = [0.01,0.001,0.0001]
-    # # Base configurations
-    # use_legacy = False
-    #
-    # if use_legacy:
-    #     base_config = DataConfig(
-    #         data_path='data/Categorized_Fixation_Data_1_18.csv',
-    #         approach_num=6,
-    #         normalize=True,
-    #         per_slice_target=True,
-    #         participant_id=1
-    #     )
-    # else:
-    #     base_config = DataConfig(
-    #         data_path='data/Formatted_Samples_ML',
-    #         approach_num=6,
-    #         normalize=True,
-    #         per_slice_target=True,
-    #         participant_id=1,
-    #         window_size=1000,
-    #         stride=1
-    #     )
 
-    # base_params = {
-    #     'name': 'VAE triple loss grid search',
-    #     'window_size': 1000,
-    #     'classification_epochs': 30,
-    #     'batch_size': 512,
-    #     'ae_epochs': 70,
-    #     'depth': 5,
-    #     'num_filters': 4,
-    #     'mask_probability': 0.4,
-    #     'threshold': 0.9,
-    #     'participant': 1,
-    #     'use_gan': False,
-    #     'early_stopping_patience': 5,
-    #     'resample': False,
-    #     'TRAIN': True,
-    #     'classifier': 'add dropout =0.1'
-    # }
-    #
-    # # Run experiments
-    # total_experiments = len(margins) * len(triplet_weights) * len(betas) * len(distances) * len(loss_types) *len(alphas) * len(latent_dims)
-    # current_experiment = 0
-    #
-    # for margin, triplet_weight, beta, distance,alpha_l2, loss_type,latent_dim,lr in itertools.product(
-    #         margins, triplet_weights, betas, distances,alphas, loss_types,latent_dims,lrs):
-    #
-    #     current_experiment += 1
-    #     print(f"\nExperiment {current_experiment}/{total_experiments}")
-    #     print(f"Margin: {margin}, Triplet Weight: {triplet_weight}, Beta: {beta}, Alpha {alpha_l2}")
-    #     print(f"Distance: {distance}, Loss Type: {loss_type}")
-    #     print(f"Latent Dimensions: {latent_dim}")
-    #     print(f"LR: {lr}")
-    #     # Create copies of base configurations
-    #     config = deepcopy(base_config)
-    #     params = deepcopy(base_params)
-    #     current_params = {
-    #         'margin': margin,
-    #         'triplet_weight': triplet_weight,
-    #         'beta': beta,
-    #         'distance_metric': distance,
-    #         'loss_type': loss_type,
-    #         'alpha': alpha_l2,
-    #         'latent_dim': latent_dim,
-    #         'lr': lr
-    #     }
-    #     params.update(current_params)
-    #     params['name'] = f'All_VAE_m{margin}_tw{triplet_weight}_b{beta}_a{alpha_l2}_dist_{distance}_loss_{loss_type}_dim_{latent_dim}_lr{lr}'
-    #
-    #     try:
-    #         avg_davies, avg_silhouette = main(config, params, use_legacy)
-    #
-    #         # Store results
-    #         result = {
-    #             'params': current_params,
-    #             'davies_score': avg_davies,
-    #             'silhouette_score': avg_silhouette
-    #         }
-    #         all_results.append(result)
-    #
-    #         # Update best results
-    #         if avg_silhouette > best_results['silhouette']['score']:
-    #             best_results['silhouette']['score'] = avg_silhouette
-    #             best_results['silhouette']['params'] = current_params
-    #             print(f"\nNew best silhouette score: {avg_silhouette:.4f}")
-    #
-    #         if avg_davies < best_results['davies']['score']:  # Lower is better for Davies-Bouldin
-    #             best_results['davies']['score'] = avg_davies
-    #             best_results['davies']['params'] = current_params
-    #             print(f"\nNew best Davies-Bouldin score: {avg_davies:.4f}")
-    #
-    #         # Save current state after each experiment
-    #         def json_serialize(obj):
-    #             """Convert numpy types to Python native types for JSON serialization"""
-    #             if isinstance(obj, np.integer):
-    #                 return int(obj)
-    #             elif isinstance(obj, np.floating):
-    #                 return float(obj)
-    #             elif isinstance(obj, np.ndarray):
-    #                 return obj.tolist()
-    #             else:
-    #                 return obj
-    #
-    #
-    #         # When saving results:
-    #         with open('grid_search_results.json', 'w') as f:
-    #             results_dict = {
-    #                 'best_results': {
-    #                     'silhouette': {
-    #                         'score': float(best_results['silhouette']['score']),
-    #                         'params': {k: json_serialize(v) for k, v in best_results['silhouette']['params'].items()}
-    #                     },
-    #                     'davies': {
-    #                         'score': float(best_results['davies']['score']),
-    #                         'params': {k: json_serialize(v) for k, v in best_results['davies']['params'].items()}
-    #                     }
-    #                 },
-    #                 'all_results': [{
-    #                     'params': {k: json_serialize(v) for k, v in result['params'].items()},
-    #                     'davies_score': float(result['davies_score']),
-    #                     'silhouette_score': float(result['silhouette_score'])
-    #                 } for result in all_results]
-    #             }
-    #             json.dump(results_dict, f, indent=4)
-    #
-    #     except Exception as e:
-    #         print(f"Error in experiment: {str(e)}")
-    #         continue
-    #
-    # print("\nGrid search completed!")
-    #
-    # import itertools
-    # from copy import deepcopy
-    # import json
-    # import numpy as np
-    #
-    # # Define parameter grids
-    # grids = {
-    #     'window_size': [50],
-    #     'batch_size': [128],
-    #     'ae_epochs': [100],
-    #     'depth': [3],
-    #     'num_filters': [4],
-    #     'mask_probability': [0.3],
-    #     'margin': [0.1, 0.3],
-    #     'distance_metric': ['cosine', 'L2'],
-    #     'triplet_weight': [0, 10,50],
-    #     'lr': [0.001,0.1]
-    # }
-    #
-    #
-    # # Base parameters that don't change
-    # base_params = {
-    #     'name': 'old data with trip grid',
-    #     'resample': False,
-    #     'classification_epochs': 100,
-    #     'early_stopping_patience': 10,
-    #     'threshold': 0.9,
-    #     'use_gan': False,
-    #     'TRAIN': True,
-    #     'classifier': 'add dropout =0.1',
-    #     'participant':1
-    # }
-    #
-    # # Track best results
-    # best_results = {
-    #     'silhouette': {'score': float('-inf'), 'params': None, 'vae_params': None},
-    #     'davies': {'score': float('inf'), 'params': None, 'vae_params': None}
-    # }
-    # all_results = []
-    #
-    # # Load legacy data once
-    # df = load_eye_tracking_data(
-    #     data_path=config.data_path,
-    #     approach_num=config.approach_num,
-    #     participant_id=config.participant_id,
-    #     data_format="legacy"
-    # )
-    #
-    # # Calculate total experiments
-    # param_combinations = list(itertools.product(
-    #     *[grids[param] for param in grids.keys()]
-    # ))
-    # total_experiments = len(param_combinations)
-    # current_experiment = 0
-    #
-    # # Run grid search
-    # for values in param_combinations:
-    #     current_experiment += 1
-    #
-    #     # Split values into main params and vae params
-    #     main_param_values = values[:len(grids)]
-    #     vae_param_values = values[len(grids):]
-    #
-    #     # Create parameter dictionaries
-    #     current_params = base_params.copy()
-    #     current_vae_params = {}
-    #
-    #     # Update main parameters
-    #     for param, value in zip(grids.keys(), main_param_values):
-    #         current_params[param] = value
-    #
-    #
-    #     print(f"\nExperiment {current_experiment}/{total_experiments}")
-    #     print("\nMain parameters:")
-    #
-    #
-    #
-    #     try:
-    #         # Create method name
-    #         method_name = create_method_name(current_params['name'], config, {**current_params, **current_vae_params})
-    #         davies_score, silhouette_score = main_with_autoencoder(
-    #             df=df,
-    #             window_size=current_params['window_size'],
-    #             method=method_name,
-    #             resample=current_params['resample'],
-    #             classification_epochs=current_params['classification_epochs'],
-    #             batch_size=current_params['batch_size'],
-    #             ae_epochs=current_params['ae_epochs'],
-    #             depth=current_params['depth'],
-    #             num_filters=current_params['num_filters'],
-    #             lr=current_params['lr'],
-    #             mask_probability=current_params['mask_probability'],
-    #             early_stopping_patience=current_params['early_stopping_patience'],
-    #             threshold=current_params['threshold'],
-    #             use_gan=current_params['use_gan'],
-    #             TRAIN=current_params['TRAIN'],
-    #             use_vae=False,
-    #             vae_params=None
-    #         )
-    #
-    #         # Store results
-    #         result = {
-    #             'params': current_params.copy(),
-    #             'vae_params': current_vae_params.copy(),
-    #             'davies_score': davies_score,
-    #             'silhouette_score': silhouette_score
-    #         }
-    #         all_results.append(result)
-    #
-    #         # Update best results
-    #         if silhouette_score > best_results['silhouette']['score']:
-    #             best_results['silhouette'].update({
-    #                 'score': silhouette_score,
-    #                 'params': current_params.copy(),
-    #                 'vae_params': current_vae_params.copy()
-    #             })
-    #             print(f"\nNew best silhouette score: {silhouette_score:.4f}")
-    #
-    #         if davies_score < best_results['davies']['score']:
-    #             best_results['davies'].update({
-    #                 'score': davies_score,
-    #                 'params': current_params.copy(),
-    #                 'vae_params': current_vae_params.copy()
-    #             })
-    #             print(f"\nNew best Davies-Bouldin score: {davies_score:.4f}")
-    #
-    #         # Save results after each experiment
-    #         with open('vae_legacy_grid_search_results.json', 'w') as f:
-    #             json.dump({
-    #                 'best_results': best_results,
-    #                 'all_results': all_results
-    #             }, f, indent=4, default=lambda x: float(x) if isinstance(x, np.number) else x)
-    #
-    #     except Exception as e:
-    #         print(f"Error in experiment: {str(e)}")
-    #         continue
-    #
-    # print("\nGrid search completed!")
-    # print("\nBest Results:")
-    # print("\nBest Silhouette Score:", best_results['silhouette']['score'])
-    # print("Parameters:", best_results['silhouette']['params'])
-    # print("VAE Parameters:", best_results['silhouette']['vae_params'])
-    # print("\nBest Davies Score:", best_results['davies']['score'])
-    # print("Parameters:", best_results['davies']['params'])
-    # print("VAE Parameters:", best_results['davies']['vae_params'])
-    #
-# [[11958   140]
-#  [  128    11]]
+# [[4326 4593]
+#  [1189 1337]]
+# ansemble
+# [[3304 5615]
+#  [ 953 1573]]
+
+# [[5624 3295]
+#  [1557  969]]
+
+# [[3312 5607]
+#  [ 868 1658]]
+
+
+#########################
 #
-# Test Set Metrics:
-# precision: 0.0728
-# recall: 0.0791
-# f1: 0.0759
-# minority_precision: 0.0728
-# minority_recall: 0.0791
-# minority_f1: 0.0759
-# {'precision': 0.0728476821192053, 'recall': 0.07913669064748201, 'f1': 0.07586206896551724, 'minority_precision': 0.0728476821192053, 'minority_recall': 0.07913669064748201, 'minority_f1': 0.07586206896551724}
-# Training Progress:  26%|▎| 10/39 [00:07<00:21,  1.36it/s, train_loss=0.5210, tra
-# Early stopping triggered at epoch 11
-# Training Progress:  26%|▎| 10/39 [00:08<00:23,  1.23it/s, train_loss=0.5210, tra
-#
-# Finding optimal threshold...
-# Collecting predictions: 100%|███████████████| 285/285 [00:00<00:00, 3658.47it/s]
-# Finding optimal threshold: 100%|███████████| 100/100 [00:00<00:00, 25503.49it/s]
-# No threshold satisfies the criteria. Consider relaxing constraints.
-# Evaluating: 100%|███████████████████████████| 383/383 [00:00<00:00, 3719.29it/s]
-#               precision    recall  f1-score   support
-#
-#            0       0.97      0.22      0.36     12098
-#            1       0.00      0.32      0.01       139
-#
-#     accuracy                           0.22     12237
-#    macro avg       0.48      0.27      0.18     12237
-# weighted avg       0.95      0.22      0.35     12237
-#
-# [[2639 9459]
-#  [  95   44]]
+# Ensemble Results:
+# Accuracy: 0.5966
+# F1 Score: 0.6267
+# acc
+# 0.5965923984272609
+# minority_precision
+# 0.2563505010487066
+# minority_recall
+# 0.43547110055423593
+# minority_f1
+# 0.3227226052515769
+# [[5728 3191]
+#  [1426 1100]]
+
+
+# with GRU improved little bit - recal to 0.5 m precison to 0.24

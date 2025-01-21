@@ -1,5 +1,104 @@
-import torch
+
 import torch.nn as nn
+import math
+
+class PositionalEncoding(nn.Module):
+    """
+    Standard sine-cosine positional encoding.
+    For 1D sequences, this is typically enough for time-series tasks.
+    """
+    def __init__(self, d_model, max_len=1000):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+
+        pe[:, 0::2] = torch.sin(position * div_term)   # even indices
+        pe[:, 1::2] = torch.cos(position * div_term)   # odd indices
+
+        # Register pe as a buffer so it’s not trained
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        """
+        x shape: (batch_size, seq_len, d_model)
+        We add positional encoding up to seq_len positions.
+        """
+        seq_len = x.size(1)
+        # Add the positional encoding to each batch’s slice
+        x = x + self.pe[:seq_len, :].unsqueeze(0).to(x.device)
+        return x
+
+class TimeSeriesTransformer(nn.Module):
+    """
+    Example time series classification model using a TransformerEncoder.
+    """
+    def __init__(self, input_dim, model_dim=64, n_heads=4, num_layers=2,
+                 dim_feedforward=128, dropout=0.1, num_classes=2,
+                 max_len=1000, batch_first=True):
+        """
+        Args:
+            input_dim (int): Number of features per time step.
+            model_dim (int): Embedding dimension for the Transformer.
+            n_heads (int): Number of heads in multi-head attention.
+            num_layers (int): Number of TransformerEncoder layers.
+            dim_feedforward (int): Hidden dimension of the feed-forward network.
+            dropout (float): Dropout probability.
+            num_classes (int): Number of output classes.
+            max_len (int): Max sequence length for positional encoding.
+            batch_first (bool): Whether input is (batch_size, seq_len, embedding_dim).
+        """
+        super(TimeSeriesTransformer, self).__init__()
+
+        self.model_dim = model_dim
+
+        # 1) Project input_dim -> model_dim
+        self.input_projection = nn.Linear(8, 64)
+        # 2) Positional encoding
+        self.pos_encoder = PositionalEncoding(model_dim, max_len=max_len)
+
+        # 3) Encoder layers
+        #    Build a TransformerEncoder using nn.TransformerEncoderLayer
+        encoder_layers = nn.TransformerEncoderLayer(
+            d_model=model_dim,
+            nhead=n_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=batch_first,  # So input is (batch, seq_len, dim)
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
+
+        # 4) Classification head
+        self.classifier = nn.Linear(model_dim, num_classes)
+
+        self.dropout = nn.Dropout(dropout)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        """
+        x shape: (batch_size, seq_len, input_dim)
+        """
+        # 1) Linear projection
+        x = x.transpose(1, 2)
+        x = self.input_projection(x)  # -> (batch_size, seq_len, model_dim)
+        x = self.relu(x)
+
+        # 2) Positional encoding
+        x = self.pos_encoder(x)  # -> (batch_size, seq_len, model_dim)
+
+        # 3) Transformer encoding
+        #    (batch_size, seq_len, model_dim)
+        x = self.transformer_encoder(x)  # -> same shape
+
+        # 4) Pool over time dimension
+        #    Example: global average pooling over seq_len
+        x = x.mean(dim=1)  # -> (batch_size, model_dim)
+
+        # 5) Classification
+        x = self.dropout(x)
+        x = self.classifier(x)  # -> (batch_size, num_classes)
+
+        return x
 
 
 class ResidualBlock(nn.Module):
@@ -13,65 +112,114 @@ class ResidualBlock(nn.Module):
                                padding=dilation, dilation=dilation)
         self.bn2 = nn.BatchNorm1d(out_channels)
 
+        # In case of channel mismatch (in_channels != out_channels),
+        # use 1x1 conv to match dimensions for the residual connection
+        self.shortcut = None
         if in_channels != out_channels:
-            self.projection = nn.Conv1d(in_channels, out_channels, kernel_size=1)
-        else:
-            self.projection = None
+            self.shortcut = nn.Conv1d(in_channels, out_channels, kernel_size=1)
 
     def forward(self, x):
-        residual = x
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        if self.projection is not None:
-            residual = self.projection(residual)
-        out += residual
+        identity = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        # If dimensions differ, adjust the identity
+        if self.shortcut is not None:
+            identity = self.shortcut(identity)
+
+        out += identity
         out = self.relu(out)
         return out
 
 
 class ComplexCNNClassifier(nn.Module):
-    def __init__(self, input_dim, num_classes):
+    def __init__(self, input_dim, hidden_rnn_dim=256, rnn_type="GRU"):
+        """
+        Args:
+            input_dim (int): Number of input channels (e.g. # features for 1D time series).
+            hidden_rnn_dim (int): Hidden dimension for the GRU/LSTM layer.
+            rnn_type (str): "GRU" or "LSTM".
+        """
         super(ComplexCNNClassifier, self).__init__()
-        self.initial_conv = nn.Conv1d(128, 64, kernel_size=7, padding=3)
+        self.initial_conv = nn.Conv1d(input_dim, 64, kernel_size=7, padding=3)
         self.initial_bn = nn.BatchNorm1d(64)
         self.relu = nn.ReLU(inplace=True)
         self.dropout = nn.Dropout(0.1)
 
-        self.layer1 = self._make_layer(ResidualBlock, 64, 64, 4, 1)
-        self.layer2 = self._make_layer(ResidualBlock, 64, 128, 4, 2)
-        self.layer3 = self._make_layer(ResidualBlock, 128, 256, 4, 4)
-        self.layer4 = self._make_layer(ResidualBlock, 256, 512, 4, 8)
+        # Four CNN layers with increasing channels & dilation
+        self.layer1 = self._make_layer(ResidualBlock, 64, 64, 4, dilation=1)
+        self.layer2 = self._make_layer(ResidualBlock, 64, 128, 4, dilation=2)
+        self.layer3 = self._make_layer(ResidualBlock, 128, 256, 4, dilation=4)
+        self.layer4 = self._make_layer(ResidualBlock, 256, 512, 4, dilation=8)
 
-        self.gap = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Linear(512, num_classes)
+
+        if rnn_type.upper() == "LSTM":
+            self.rnn = nn.LSTM(
+                input_size=512,
+                hidden_size=hidden_rnn_dim,
+                num_layers=1,
+                batch_first=True
+            )
+        else:  # Default to GRU
+            self.rnn = nn.GRU(
+                input_size=512,
+                hidden_size=hidden_rnn_dim,
+                num_layers=1,
+                batch_first=True
+            )
+
+
+        self.fc = nn.Linear(hidden_rnn_dim, 2)
 
     def _make_layer(self, block, in_channels, out_channels, num_blocks, dilation):
-        layers = []
-        layers.append(block(in_channels, out_channels, dilation=dilation))
+        layers = [block(in_channels, out_channels, dilation=dilation)]
         for _ in range(1, num_blocks):
             layers.append(block(out_channels, out_channels, dilation=dilation))
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        x = self.relu(self.initial_bn(self.initial_conv(x)))
+        """
+        x: (batch, channels=input_dim, seq_len)
+        """
+        # CNN feature extraction
+        x = self.relu(self.initial_bn(self.initial_conv(x)))  # (B, 64, seq_len)
         x = self.dropout(x)
 
-        x = self.layer1(x)
+        x = self.layer1(x)  # (B, 64, seq_len)
         x = self.dropout(x)
 
-        x = self.layer2(x)
+        x = self.layer2(x)  # (B, 128, seq_len)
         x = self.dropout(x)
 
-        x = self.layer3(x)
+        x = self.layer3(x)  # (B, 256, seq_len)
         x = self.dropout(x)
 
-        x = self.layer4(x)
+        x = self.layer4(x)  # (B, 512, seq_len)
         x = self.dropout(x)
 
-        x = self.gap(x).squeeze(-1)
-        x = self.dropout(x)
+        # Recurrent layer expects (B, seq_len, features)
+        # So we transpose from (B, 512, seq_len) -> (B, seq_len, 512)
+        x = x.transpose(1, 2)  # Now shape = (B, seq_len, 512)
 
-        x = self.fc(x)
+        # Feed into GRU or LSTM
+        if isinstance(self.rnn, nn.LSTM):
+            # LSTM returns (output, (h_n, c_n))
+            # We can take the last hidden state h_n (shape: (num_layers, B, hidden_rnn_dim))
+            rnn_out, (h_n, c_n) = self.rnn(x)
+
+            x = h_n[-1]  # last layer’s hidden state
+        else:
+            # GRU returns (output, h_n), where h_n is (num_layers, B, hidden_rnn_dim)
+            rnn_out, h_n = self.rnn(x)
+            x = h_n[-1]
+
+        # x shape here = (B, hidden_rnn_dim)
+        x = self.dropout(x)
+        x = self.fc(x)  # (B, 2)
         return x
 
 
@@ -79,15 +227,19 @@ class CombinedModel(nn.Module):
     def __init__(self, model, num_classes):
         super(CombinedModel, self).__init__()
         self.encoder = model.encoder
-        self.classifier = ComplexCNNClassifier(input_dim=128, num_classes=num_classes)
+        # self.classifier = ComplexCNNClassifier(input_dim=128, num_classes=num_classes)
+        self.classifier =None
 
     def forward(self, x):
-        outputs, hidden = self.encoder(x)
-        if isinstance(outputs, tuple):
-            outputs = outputs[0]
-        x = outputs.permute(0, 2, 1)
-        logits = self.classifier(x)
-        return logits
+
+        x = x.view(x.size(0), -1)  # Flatten the input
+        self.classifier = nn.Sequential(
+            nn.Linear(x.size(1), 64),  # Dynamic input size
+            nn.ReLU(),
+            nn.Dropout(p=0.2),
+            nn.Linear(64, 2)
+        ).to(x.device)
+        return self.classifier(x)
 
 
 class SimpleMLP(nn.Module):

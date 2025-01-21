@@ -78,10 +78,9 @@ def create_dynamic_time_series_with_indices(df: pd.DataFrame, feature_columns: L
 
     return np.array(windows), np.array(labels), window_metadata
 
-
-def create_dynamic_time_series(df: pd.DataFrame, feature_columns=None, save_dir=None,
-                               load_existing=False, participant_id=1, split_type='train',
-                               window_size=10, pad_value=0):
+def create_dynamic_time_series_for_rf(df: pd.DataFrame, feature_columns=None,
+                                      participant_id=1, split_type='train',
+                                      window_size=10):
     if feature_columns is None:
         feature_columns = [
             'Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X',
@@ -89,6 +88,162 @@ def create_dynamic_time_series(df: pd.DataFrame, feature_columns=None, save_dir=
         ]
 
     key_features = ['Pupil_Size', 'CURRENT_FIX_DURATION']
+    samples = []
+    labels = []
+
+    trial_groups = df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX'])
+
+    for (_, trial_idx), trial_df in trial_groups:
+        trial_length = len(trial_df)
+        trial_df = trial_df.reset_index(drop=True)
+
+        for start_idx in range(0, trial_length - window_size + 1):
+            end_idx = start_idx + window_size
+            window = trial_df.iloc[start_idx:end_idx]
+
+            # Calculate global features for the window
+            global_features = []
+            for feature in key_features:
+                values = window[feature].values
+                max_diff = np.max(values) - np.min(values)  # Max - Min for the feature
+                diffs = np.diff(values)
+                global_features.extend([
+                    max_diff,
+                    np.max(np.abs(diffs)),
+                    np.min(np.abs(diffs)),
+                    np.mean(np.abs(diffs)),
+                    np.std(diffs),
+                    np.percentile(diffs, 90),
+                    len(diffs[abs(diffs) > np.std(diffs)])
+                ])
+
+            x_coords = window['CURRENT_FIX_IA_X'].values
+            y_coords = window['CURRENT_FIX_IA_Y'].values
+            dx = np.diff(x_coords)
+            dy = np.diff(y_coords)
+            velocities = np.sqrt(dx**2 + dy**2)
+            accelerations = np.diff(velocities)
+
+            global_features.extend([
+                np.mean(velocities),
+                np.max(velocities),
+                np.std(velocities),
+                np.mean(accelerations),
+                np.max(np.abs(accelerations))
+            ])
+
+            label = int(window['target'].sum() > 0)
+            samples.append(global_features)
+            labels.append(label)
+
+    return np.array(samples), np.array(labels)
+
+
+
+
+from scipy.ndimage import gaussian_filter1d
+def create_dynamic_time_series_with_smooth_labels(
+        df: pd.DataFrame, feature_columns=None, save_dir=None,
+        load_existing=False, participant_id=1, split_type='train',
+        window_size=10, pad_value=0, smoothing_sigma=30.0):
+    if feature_columns is None:
+        feature_columns = [
+            'Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X',
+            'CURRENT_FIX_IA_Y', 'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT'
+        ]
+
+    # Key features for detailed analysis
+    key_features = ['Pupil_Size', 'CURRENT_FIX_DURATION']
+
+    # Try loading existing files
+    if load_existing and save_dir:
+        samples_path = os.path.join(save_dir, f'{participant_id}_dynamic_samples_{split_type}.npy')
+        labels_path = os.path.join(save_dir, f'{participant_id}_dynamic_labels_{split_type}.npy')
+        locations_path = os.path.join(save_dir, f'{participant_id}_target_locations_{split_type}.npy')
+        if all(os.path.exists(f) for f in [samples_path, labels_path, locations_path]):
+            return (np.load(samples_path), np.load(labels_path), np.load(locations_path))
+
+    samples = []
+    labels = []
+    target_locations = []
+    smoothed_labels = []
+
+    # Process each trial
+    trial_groups = df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX'])
+    target_trials = [(idx, group) for idx, group in trial_groups if group['target'].any()]
+    print(f"Found {len(target_trials)} trials containing targets out of {len(list(trial_groups))} total trials")
+
+    for (_, trial_idx), trial_df in trial_groups:
+        trial_length = len(trial_df)
+        trial_df = trial_df.reset_index(drop=True)
+
+        # Smooth the target values in the trial
+
+        for start_idx in range(0, trial_length - window_size + 1):
+            end_idx = start_idx + window_size
+            window = trial_df.iloc[start_idx:end_idx]
+
+            # Extract smoothed targets and original targets
+            target_array = window['target'].values
+            smoothed_targets = gaussian_filter1d(window['target'].values.astype(float),sigma=smoothing_sigma)
+            window_target_positions = np.where(target_array == 1)[0]
+
+            window_features = window[feature_columns].values
+            global_features = []
+
+            # Compute metrics for key features
+            for feature in key_features:
+                values = window[feature].values
+                max_diff = np.max(values) - np.min(values)  # Max - Min for the feature
+
+                global_features.extend([max_diff])
+
+            global_features = np.array(global_features)
+            global_features_tiled = np.tile(global_features, (len(window), 1))
+
+            # Combine all features
+            combined_features = np.concatenate([window_features, global_features_tiled], axis=1)
+
+            # Use smoothed targets as labels
+            samples.append(combined_features)
+            label = int(len(window_target_positions) > 0)
+
+            labels.append(label)
+            target_locations.append(window_target_positions)
+            smoothed_labels.append(smoothed_targets)
+
+    samples = np.array(samples)
+    labels = np.array(labels)
+    smoothed_labels = np.array(smoothed_labels)
+
+    target_locations = np.array(target_locations, dtype=object)
+
+    # Save processed data
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        if participant_id is None:
+            participant_id = 100
+
+        np.save(os.path.join(save_dir, f'{participant_id}_dynamic_samples_{split_type}.npy'), samples)
+        np.save(os.path.join(save_dir, f'{participant_id}_dynamic_labels_{split_type}.npy'), labels)
+        np.save(os.path.join(save_dir, f'{participant_id}_target_locations_{split_type}.npy'), target_locations)
+
+    return samples, labels, target_locations,smoothed_labels
+
+
+
+
+
+def create_dynamic_time_series(df: pd.DataFrame, feature_columns=None, save_dir=None,
+                               load_existing=False, participant_id=1, split_type='train',
+                               window_size=10, pad_value=0):
+    if feature_columns is None:
+        feature_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'relative_x', 'relative_y',
+                           'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT']
+
+    # Key features for detailed analysis
+    key_features = ['Pupil_Size', 'CURRENT_FIX_DURATION']
+    position_features = ['CURRENT_FIX_IA_X', 'CURRENT_FIX_IA_Y']
 
     # Try loading existing files
     if load_existing and save_dir:
@@ -110,7 +265,8 @@ def create_dynamic_time_series(df: pd.DataFrame, feature_columns=None, save_dir=
     for (_, trial_idx), trial_df in trial_groups:
         trial_length = len(trial_df)
         trial_df = trial_df.reset_index(drop=True)
-        for start_idx in range(0, trial_length - window_size + 1):
+
+        for start_idx in range(0, trial_length - window_size + 1,window_size //2):
             end_idx = start_idx + window_size
             window = trial_df.iloc[start_idx:end_idx]
 
@@ -119,20 +275,26 @@ def create_dynamic_time_series(df: pd.DataFrame, feature_columns=None, save_dir=
             window_target_positions = np.where(target_array == 1)[0]
 
             window_features = window[feature_columns].values
+            # global_features = []
+            #
+            # # For each key feature, calculate comprehensive metrics
+            # for feature in key_features:
+            #     values = window[feature].values
+            #     max_diff = np.max(values) - np.min(values)  # Max - Min for the feature
+            #
+            #     global_features.extend([
+            #         max_diff
+            #
+            #     ])
+            #
+            # global_features = np.array(global_features)
+            # global_features_tiled = np.tile(global_features, (len(window), 1))
 
-            diff_features = []
-            for feature in key_features:
-                values = window[feature].values
-                max_diff = np.abs(np.max(np.abs(np.diff(values))))
-                diff_features.append(max_diff)
-
-            diff_features = np.array(diff_features)
-            diff_features = np.tile(diff_features, (len(window), 1))
-
-            combined_features = np.concatenate([window_features, diff_features], axis=1)
+            # Combine all features
+            # combined_features = np.concatenate([window_features, global_features_tiled], axis=1)
             label = int(len(window_target_positions) > 0)
 
-            samples.append(combined_features)
+            samples.append(window_features)
             labels.append(label)
             target_locations.append(window_target_positions)
 
@@ -197,8 +359,8 @@ def create_windows(grouped, window_size, feature_columns=None):
         Tuple of (samples, labels, weights)
     """
     if feature_columns is None:
-        feature_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X', 'CURRENT_FIX_IA_Y',
-                           'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT']
+        feature_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'relative_x', 'relative_y',
+                           'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT','gaze_velocity']
     max_possible_time_length = 0
 
     # First pass to find maximum time length
