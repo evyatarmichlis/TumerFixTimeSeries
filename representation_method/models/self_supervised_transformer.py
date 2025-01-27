@@ -1,6 +1,8 @@
+import ast
 import heapq
 import os
 import random
+from collections import defaultdict
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
@@ -27,7 +29,7 @@ from representation_method.utils.data_utils import create_dynamic_time_series, s
 from representation_method.utils.general_utils import seed_everything
 
 
-TRAIN = True
+TRAIN = False
 
 class EyeTrackingDataset(Dataset):
     def __init__(
@@ -292,18 +294,21 @@ class TargetLocalizer:
         self.model = model
         self.device = device
 
-    def analyze_attention(self, window_data: torch.Tensor) -> np.ndarray:
+    def analyze_attention(self, window_data: torch.Tensor, supervised=False) -> np.ndarray:
         """Analyze attention patterns to localize targets"""
         self.model.eval()
         with torch.no_grad():
-            _, attention_weights = self.model(window_data.to(self.device), output_attentions=True)
 
-        attention_scores = attention_weights[-1]
+            output = self.model(window_data.to(self.device), output_attentions=True)
+            if supervised:
+                attention_scores = output[-1]
+            else:
+                attention_scores = output[-1][-1]
         return attention_scores.cpu().numpy()
 
-    def localize_targets(self, window_data: torch.Tensor, target_positions, window_start):
+    def localize_targets(self, window_data: torch.Tensor, target_positions, window_start,supervised=False):
         """Return similarity score, actual values, and precision/recall metrics"""
-        attentions = self.analyze_attention(window_data).squeeze()
+        attentions = self.analyze_attention(window_data,supervised).squeeze()
         avg_attention = attentions.mean(axis=0)
         token_attentions = avg_attention.mean(axis=0)
         seq_len = token_attentions.shape[0]
@@ -318,7 +323,7 @@ class TargetLocalizer:
 
         # top_k_indices = heapq.nlargest(len(target_positions), range(len(token_attentions)),
         #                                token_attentions.__getitem__)
-        top_k_indices = dynamic_topk_by_threshold(token_attentions,1.5)
+        top_k_indices = dynamic_topk_by_threshold(token_attentions,1.7)
         results["top_k_positions"] = top_k_indices
         results["abs_top_k_positions"] = [idx + window_start for idx in top_k_indices]
         results["abs_target_locations"] = [pos + window_start for pos in target_positions]
@@ -419,6 +424,31 @@ def create_dataset(windows, labels, tokenizer, feature_columns):
 
     return EyeTrackingDataset(tokens_array, labels)
 
+def z_score_detection(window_df, feature_columns, threshold=3.0):
+    """
+    Detect anomalies based on Z-Score in a given window.
+
+    Args:
+    - window_df: DataFrame containing the features for the window.
+    - feature_columns: List of feature names to consider for Z-Score detection.
+    - threshold: Z-Score threshold for detecting anomalies.
+
+    Returns:
+    - List of indices in the window where anomalies are detected.
+    """
+    anomalies = []
+    for feature in feature_columns:
+        # Compute rolling mean and standard deviation
+        mean = window_df[feature].mean()
+        std = window_df[feature].std() + 1e-8  # Avoid division by zero
+        z_scores = (window_df[feature] - mean) / std
+
+        # Find indices exceeding the threshold
+        anomaly_indices = window_df[z_scores.abs() > threshold].index.tolist()
+        anomalies.extend(anomaly_indices)
+    return sorted(set(anomalies))  # Remove duplicates
+
+
 def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  window_size = 100,top_k = 1):
     # Set parameters
     seed_everything(0)
@@ -483,6 +513,10 @@ def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  w
     total_f1 = 0
     total_windows = 0
     all_results = []
+    total_z_score_precision = 0
+    total_z_score_recall = 0
+    total_z_score_f1 = 0
+    total_z_score_windows = 0
     print("\nEvaluating target localization...")
     for i, (window, meta) in enumerate(zip(X_all, window_metadata)):
         window_2d = window.squeeze()
@@ -495,8 +529,30 @@ def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  w
                 meta['relative_target_positions'],
                 meta['window_start']
             )
+
             results['participant_id'] = meta['participant_id']
             results['trial_id'] = meta['trial_id']
+            z_score_anomalies = z_score_detection(window_df, feature_columns)
+            z_score_target_matches = sum(
+                1 for target in meta['relative_target_positions']
+                if any(abs(target - anomaly) <= 5 for anomaly in z_score_anomalies)  # Tolerance of 5 timesteps
+            )
+
+            z_score_precision = z_score_target_matches / len(z_score_anomalies) if z_score_anomalies else 0.0
+            z_score_recall = z_score_target_matches / len(meta['relative_target_positions']) if len(
+                meta['relative_target_positions']) > 0 else 0.0
+            z_score_f1 = 2 * (z_score_precision * z_score_recall) / (z_score_precision + z_score_recall) if (z_score_precision + z_score_recall) > 0 else 0.0
+            # Add Z-Score results to the results dictionary
+            results.update({
+                'z_score_anomalies': z_score_anomalies,
+                'z_score_precision': z_score_precision,
+                'z_score_recall': z_score_recall,
+                'z_score_f1': z_score_f1
+            })
+            total_z_score_precision += z_score_precision
+            total_z_score_recall += z_score_recall
+            total_z_score_f1 += z_score_f1
+            total_z_score_windows += 1
             all_results.append(results)
             total_precision += results['precision']
             total_recall += results['recall']
@@ -514,13 +570,169 @@ def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  w
     for k,v in metrics.items():
         print(f'############ {k} ############')
         print(f'$$$$$$$$$$$$ {v} $$$$$$$$$$$$')
+    if total_z_score_windows > 0:
+        avg_z_score_precision = total_z_score_precision / total_z_score_windows
+        avg_z_score_recall = total_z_score_recall / total_z_score_windows
+        avg_z_score_f1 = total_z_score_f1 / total_z_score_windows
 
+        print("\nAverage Z-Score Metrics:")
+        print(f"Z-Score Precision: {avg_z_score_precision:.4f}")
+        print(f"Z-Score Recall: {avg_z_score_recall:.4f}")
+        print(f"Z-Score F1-Score: {avg_z_score_f1:.4f}")
+    else:
+        print("\nNo windows with Z-Score results to calculate averages.")
     sns.histplot(data=all_results_df, x='similarity_score', bins=10, kde=True)
     plt.xlabel('Percent Coincidences')
     plt.ylabel('Count')
     plt.title('Distribution of Percent Coincidences')
     plt.savefig(os.path.join(method_dir, f'similarity_score.png'))
     plt.plot()
+
+
+
+    # Debugging: Check for missing columns
+    required_columns = ['participant_id', 'trial_id', 'abs_top_k_positions', 'abs_target_locations']
+    for col in required_columns:
+        if col not in all_results_df.columns:
+            raise KeyError(f"Missing required column: {col}")
+
+    # Step 1: Convert string representations of lists to actual lists
+    def safe_literal_eval(val):
+        if isinstance(val, str):  # Only parse strings
+            try:
+                return ast.literal_eval(val)
+            except (ValueError, SyntaxError):
+                print(f"Warning: Skipping malformed entry: {val}")
+                return []  # Return an empty list for malformed entries
+        elif isinstance(val, list):  # If already a list, return as is
+            return val
+        else:
+            print(f"Warning: Unexpected data type: {type(val)}")
+            return []  # Return an empty list for unexpected data types
+
+    all_results_df['abs_top_k_positions'] = all_results_df['abs_top_k_positions'].apply(safe_literal_eval)
+    all_results_df['abs_target_locations'] = all_results_df['abs_target_locations'].apply(safe_literal_eval)
+
+    # Step 2: Group by participant_id and trial_id
+    grouped_results = defaultdict(lambda: {'ground_truth': set(), 'predictions': defaultdict(int)})
+
+    for _, row in all_results_df.iterrows():
+        participant_id = row['participant_id']
+        trial_id = row['trial_id']
+        scan_id = (participant_id, trial_id)
+
+        # Aggregate ground truth
+        if isinstance(row['abs_target_locations'], list):
+            grouped_results[scan_id]['ground_truth'].update(row['abs_target_locations'])
+
+        # Aggregate predictions
+        if isinstance(row['abs_top_k_positions'], list):
+            for position in row['abs_top_k_positions']:
+                grouped_results[scan_id]['predictions'][position] += 1
+
+    # Step 3: Majority voting and match predictions
+    tolerance = 10  # Tolerance for matching positions
+
+
+    agreement_thresholds = np.arange(0.1, 1.0, 0.1)  # Thresholds from 10% to 90%
+    threshold_results = []
+
+    for agreement_threshold in agreement_thresholds:
+        per_scan_results = []
+
+        for scan_id, data in grouped_results.items():
+            participant_id, trial_id = scan_id
+            ground_truth = sorted(data['ground_truth'])
+
+            # Calculate window participation for each position
+            total_windows = len(all_results_df[(all_results_df['participant_id'] == participant_id) &
+                                               (all_results_df['trial_id'] == trial_id)])
+            position_votes = data['predictions']  # Predictions and their counts from windows
+            position_agreement = {pos: count / total_windows for pos, count in position_votes.items()}
+
+            # Apply majority voting dynamically based on agreement
+            predictions = sorted(
+                [position for position, agreement in position_agreement.items() if agreement >= agreement_threshold]
+            )
+
+            # Match predictions to ground truth
+            matched_predictions = set()
+            matched_ground_truth = set()
+
+            for predicted in predictions:
+                for target in ground_truth:
+                    if target not in matched_ground_truth and abs(predicted - target) <= tolerance:
+                        matched_predictions.add(predicted)
+                        matched_ground_truth.add(target)
+                        break
+
+            # Calculate metrics for this scan
+            true_positives = len(matched_predictions)
+            predicted_positives = len(predictions)
+            ground_truth_positives = len(ground_truth)
+
+            precision = true_positives / predicted_positives if predicted_positives > 0 else 0.0
+            recall = true_positives / ground_truth_positives if ground_truth_positives > 0 else 0.0
+            f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+
+            per_scan_results.append({
+                'participant_id': participant_id,
+                'trial_id': trial_id,
+                'ground_truth': ground_truth,
+                'predictions': predictions,
+                'precision': precision,
+                'recall': recall,
+                'f1_score': f1,
+                'matched_predictions': list(matched_predictions),
+                'matched_ground_truth': list(matched_ground_truth)
+            })
+
+        # Aggregate results for this threshold
+        overall_true_positives = sum(len(set(row['matched_predictions'])) for row in per_scan_results)
+        overall_predicted_positives = sum(len(set(row['predictions'])) for row in per_scan_results)
+        overall_ground_truth_positives = sum(len(set(row['ground_truth'])) for row in per_scan_results)
+
+        overall_precision = overall_true_positives / overall_predicted_positives if overall_predicted_positives > 0 else 0.0
+        overall_recall = overall_true_positives / overall_ground_truth_positives if overall_ground_truth_positives > 0 else 0.0
+        overall_f1 = (
+            2 * (overall_precision * overall_recall) / (overall_precision + overall_recall)
+            if (overall_precision + overall_recall) > 0 else 0.0
+        )
+
+        threshold_results.append({
+            'agreement_threshold': agreement_threshold,
+            'precision': overall_precision,
+            'recall': overall_recall,
+            'f1_score': overall_f1
+        })
+
+    # Step 6: Convert results to a DataFrame
+    threshold_df = pd.DataFrame(threshold_results)
+
+    # Step 7: Plot the results
+    plt.figure(figsize=(10, 6))
+    plt.plot(threshold_df['agreement_threshold'] * 100, threshold_df['precision'], marker='o', label="Precision")
+    plt.plot(threshold_df['agreement_threshold'] * 100, threshold_df['recall'], marker='s', label="Recall")
+    plt.plot(threshold_df['agreement_threshold'] * 100, threshold_df['f1_score'], marker='^', label="F1 Score")
+
+    plt.title("Precision, Recall, and F1 Score over Voting Agreement Thresholds")
+    plt.xlabel("Voting Agreement Threshold (%)")
+    plt.ylabel("Metric Value")
+    plt.ylim(0, 1.1)  # Ensure metrics range between 0 and 1
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+
+    # Save the plot
+    plot_path = os.path.join(method_dir, 'voting_threshold_metrics.png')
+    plt.savefig(plot_path)
+    print(f"Plot saved to: {plot_path}")
+
+    # Save threshold results to CSV
+    threshold_csv_path = os.path.join(method_dir, 'voting_threshold_metrics.csv')
+    threshold_df.to_csv(threshold_csv_path, index=False)
+    print(f"Threshold results saved to: {threshold_csv_path}")
+
 
 
 

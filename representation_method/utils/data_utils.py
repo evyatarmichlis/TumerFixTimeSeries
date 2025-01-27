@@ -266,7 +266,7 @@ def create_dynamic_time_series(df: pd.DataFrame, feature_columns=None, save_dir=
         trial_length = len(trial_df)
         trial_df = trial_df.reset_index(drop=True)
 
-        for start_idx in range(0, trial_length - window_size + 1,window_size //2):
+        for start_idx in range(0, trial_length - window_size + 1):
             end_idx = start_idx + window_size
             window = trial_df.iloc[start_idx:end_idx]
 
@@ -292,7 +292,8 @@ def create_dynamic_time_series(df: pd.DataFrame, feature_columns=None, save_dir=
 
             # Combine all features
             # combined_features = np.concatenate([window_features, global_features_tiled], axis=1)
-            label = int(len(window_target_positions) > 0)
+            # label = int(len(window_target_positions) > 0)
+            label = int(len(window_target_positions)==1 and  window_target_positions[0] ==  0)
 
             samples.append(window_features)
             labels.append(label)

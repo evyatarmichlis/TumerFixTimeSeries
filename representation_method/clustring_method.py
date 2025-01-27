@@ -81,12 +81,12 @@ def segment_and_cluster(
             segment_sizes.append(end_idx - start_idx)  # Track segment size
 
             # Simple features: mean, std, min, max
-            means = np.mean(segment_data, axis=0)
-            stds = np.std(segment_data, axis=0)
+            # means = np.mean(segment_data, axis=0)
+            # stds = np.std(segment_data, axis=0)
             mins = np.min(segment_data, axis=0)
             maxs = np.max(segment_data, axis=0)
 
-            feat_vector = np.concatenate([means, stds, mins, maxs], axis=0)
+            feat_vector = np.concatenate([mins, maxs], axis=0)
 
             segment_features_all.append(feat_vector)
             segment_indices.append((i, s))
@@ -1028,11 +1028,11 @@ if __name__ == "__main__":
     )
 
     os.makedirs('cluster_results', exist_ok=True)
-    window_size = 500
+    window_size = 2
     seed = 2024
     print(f"seed{seed}")
 
-    n_segments = 10
+    n_segments = 1
     n_clusters = 3
     clustering_method = 'kmeans'
     segmentation_method = 'eq'
@@ -1132,7 +1132,7 @@ if __name__ == "__main__":
         lambda_triplet=3,
         lambda_clf=3,
         batch_size=64,
-        epochs=500,
+        epochs=30,
         lr=1e-4,
         device=device
     )
