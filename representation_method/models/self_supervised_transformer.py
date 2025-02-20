@@ -21,7 +21,6 @@ from torch.utils.data import DataLoader
 
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from scipy.signal import find_peaks
 
 from representation_method.utils.data_loader import DataConfig, load_eye_tracking_data
 from representation_method.utils.data_utils import create_dynamic_time_series, split_train_test_for_time_series, \
@@ -29,7 +28,7 @@ from representation_method.utils.data_utils import create_dynamic_time_series, s
 from representation_method.utils.general_utils import seed_everything
 
 
-TRAIN = False
+TRAIN = True
 
 class EyeTrackingDataset(Dataset):
     def __init__(
@@ -370,29 +369,24 @@ class TargetLocalizer:
         return results
 
 
-def calculate_confusion_metrics(df):
+def calculate_metrics(df):
     """Calculate confusion matrix metrics from DataFrame containing TP, predictions and targets"""
-    total_tp = df['true_positives'].sum()
-    total_predictions = df['num_predictions'].sum()
-    total_targets = df['num_targets'].sum()
 
-    # Calculate other metrics
-    fp = total_predictions - total_tp  # False Positives
-    fn = total_targets - total_tp  # False Negatives
+    df['FP'] = df['num_predictions'] - df['true_positives']
+    df['FN'] = df['total_targets'] - df['true_positives']
 
-    # Create confusion matrix
-    cm = np.array([
-        [total_tp, fp],
-        [fn, total_predictions - fp]
-    ])
+    # Sum counts across windows
+    total_TP = df['true_positives'].sum()
+    total_FP = df['FP'].sum()
+    total_FN = df['FN'].sum()
 
-    # Calculate rates
-    precision = total_tp / total_predictions if total_predictions > 0 else 0
-    recall = total_tp / total_targets if total_targets > 0 else 0
-    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+    # Compute precision, recall, and F1 score
+    precision = total_TP / (total_TP + total_FP) if (total_TP + total_FP) > 0 else 0
+    recall = total_TP / (total_TP + total_FN) if (total_TP + total_FN) > 0 else 0
+    f1_score = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
 
 
-    return cm, {'precision': precision, 'recall': recall, 'f1': f1}
+    return {'precision': precision, 'recall': recall, 'f1': f1_score}
 
 
 # Use with your DataFrame
@@ -458,7 +452,7 @@ def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  w
         'CURRENT_FIX_IA_Y', 'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT',
     ]
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    method_dir = os.path.join('results', f'self_supervised_transformer_participant{participant_id}_window_size_{window_size}')
+    method_dir = os.path.join('results', f'self_supervised_transformer_participant_{participant_id}_window_size_{window_size}')
     os.makedirs(method_dir, exist_ok=True)
     print(f"window_size is {window_size}")
 
@@ -565,8 +559,7 @@ def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  w
     all_results_df.to_csv(os.path.join(method_dir, f'{target_pick_method}_attention.csv'))
     print('############ percent similarity_score ############')
     print(all_results_df['similarity_score'].mean())
-    cm, metrics = calculate_confusion_metrics(all_results_df)
-    print(cm)
+    metrics = calculate_metrics(all_results_df)
     for k,v in metrics.items():
         print(f'############ {k} ############')
         print(f'$$$$$$$$$$$$ {v} $$$$$$$$$$$$')
@@ -587,33 +580,30 @@ def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  w
     plt.title('Distribution of Percent Coincidences')
     plt.savefig(os.path.join(method_dir, f'similarity_score.png'))
     plt.plot()
+    windows_voting(all_results_df, method_dir)
 
-
-
-    # Debugging: Check for missing columns
+def windows_voting(all_results_df,method_dir):
     required_columns = ['participant_id', 'trial_id', 'abs_top_k_positions', 'abs_target_locations']
     for col in required_columns:
         if col not in all_results_df.columns:
             raise KeyError(f"Missing required column: {col}")
 
-    # Step 1: Convert string representations of lists to actual lists
     def safe_literal_eval(val):
-        if isinstance(val, str):  # Only parse strings
+        if isinstance(val, str):
             try:
                 return ast.literal_eval(val)
             except (ValueError, SyntaxError):
                 print(f"Warning: Skipping malformed entry: {val}")
-                return []  # Return an empty list for malformed entries
-        elif isinstance(val, list):  # If already a list, return as is
+                return []
+        elif isinstance(val, list):
             return val
         else:
             print(f"Warning: Unexpected data type: {type(val)}")
-            return []  # Return an empty list for unexpected data types
+            return []
 
     all_results_df['abs_top_k_positions'] = all_results_df['abs_top_k_positions'].apply(safe_literal_eval)
     all_results_df['abs_target_locations'] = all_results_df['abs_target_locations'].apply(safe_literal_eval)
 
-    # Step 2: Group by participant_id and trial_id
     grouped_results = defaultdict(lambda: {'ground_truth': set(), 'predictions': defaultdict(int)})
 
     for _, row in all_results_df.iterrows():
@@ -621,20 +611,17 @@ def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  w
         trial_id = row['trial_id']
         scan_id = (participant_id, trial_id)
 
-        # Aggregate ground truth
         if isinstance(row['abs_target_locations'], list):
             grouped_results[scan_id]['ground_truth'].update(row['abs_target_locations'])
 
-        # Aggregate predictions
         if isinstance(row['abs_top_k_positions'], list):
             for position in row['abs_top_k_positions']:
                 grouped_results[scan_id]['predictions'][position] += 1
 
-    # Step 3: Majority voting and match predictions
-    tolerance = 10  # Tolerance for matching positions
+    tolerance = 10
 
 
-    agreement_thresholds = np.arange(0.1, 1.0, 0.1)  # Thresholds from 10% to 90%
+    agreement_thresholds = np.arange(0.1, 1.0, 0.1)
     threshold_results = []
 
     for agreement_threshold in agreement_thresholds:
@@ -644,13 +631,11 @@ def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  w
             participant_id, trial_id = scan_id
             ground_truth = sorted(data['ground_truth'])
 
-            # Calculate window participation for each position
             total_windows = len(all_results_df[(all_results_df['participant_id'] == participant_id) &
                                                (all_results_df['trial_id'] == trial_id)])
-            position_votes = data['predictions']  # Predictions and their counts from windows
+            position_votes = data['predictions']
             position_agreement = {pos: count / total_windows for pos, count in position_votes.items()}
 
-            # Apply majority voting dynamically based on agreement
             predictions = sorted(
                 [position for position, agreement in position_agreement.items() if agreement >= agreement_threshold]
             )
@@ -666,7 +651,6 @@ def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  w
                         matched_ground_truth.add(target)
                         break
 
-            # Calculate metrics for this scan
             true_positives = len(matched_predictions)
             predicted_positives = len(predictions)
             ground_truth_positives = len(ground_truth)
@@ -706,10 +690,8 @@ def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  w
             'f1_score': overall_f1
         })
 
-    # Step 6: Convert results to a DataFrame
     threshold_df = pd.DataFrame(threshold_results)
 
-    # Step 7: Plot the results
     plt.figure(figsize=(10, 6))
     plt.plot(threshold_df['agreement_threshold'] * 100, threshold_df['precision'], marker='o', label="Precision")
     plt.plot(threshold_df['agreement_threshold'] * 100, threshold_df['recall'], marker='s', label="Recall")
@@ -723,12 +705,10 @@ def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  w
     plt.grid(True)
     plt.tight_layout()
 
-    # Save the plot
     plot_path = os.path.join(method_dir, 'voting_threshold_metrics.png')
     plt.savefig(plot_path)
     print(f"Plot saved to: {plot_path}")
 
-    # Save threshold results to CSV
     threshold_csv_path = os.path.join(method_dir, 'voting_threshold_metrics.csv')
     threshold_df.to_csv(threshold_csv_path, index=False)
     print(f"Threshold results saved to: {threshold_csv_path}")
@@ -737,19 +717,36 @@ def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  w
 
 
 if __name__ == "__main__":
-    config = DataConfig(
-        data_path='data/Categorized_Fixation_Data_1_18.csv',
-        approach_num=8,
-        normalize=True,
-        per_slice_target=True,
-        participant_id=1
-    )
+    participant_id = 37
+    try:
 
-    df = load_eye_tracking_data(
-        data_path=config.data_path,
-        approach_num=config.approach_num,
-        participant_id=config.participant_id,
-        data_format="legacy"
-    )
-    for window_size in [150]:
-        find_attention(df, window_size=window_size)
+        config = DataConfig(
+            data_path='data/Categorized_Fixation_Data_1_18.csv',
+            approach_num=8,
+            normalize=True,
+            per_slice_target=True,
+            participant_id=participant_id
+        )
+
+        df = load_eye_tracking_data(
+            data_path=config.data_path,
+            approach_num=config.approach_num,
+            participant_id=config.participant_id,
+            data_format="legacy"
+        )
+        find_attention(df, window_size=150,participant_id=str(participant_id))
+    except Exception as e:
+        print(e)
+
+
+# ############ precision ############
+# $$$$$$$$$$$$ 0.37025097245164384 $$$$$$$$$$$$
+# ############ recall ############
+# $$$$$$$$$$$$ 0.5909342177998894 $$$$$$$$$$$$
+# ############ f1 ############
+# $$$$$$$$$$$$ 0.4552587181209153 $$$$$$$$$$$$
+#
+# Average Z-Score Metrics:
+# Z-Score Precision: 0.4623
+# Z-Score Recall: 0.2698
+# Z-Score F1-Score: 0.2208
