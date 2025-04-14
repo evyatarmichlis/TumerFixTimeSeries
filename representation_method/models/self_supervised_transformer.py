@@ -443,9 +443,9 @@ def z_score_detection(window_df, feature_columns, threshold=3.0):
     return sorted(set(anomalies))  # Remove duplicates
 
 
-def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  window_size = 100,top_k = 1):
+def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  window_size = 100,seed = 0):
     # Set parameters
-    seed_everything(0)
+    seed_everything(seed)
 
     feature_columns = [
         'Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X',
@@ -486,7 +486,7 @@ def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  w
         model = train_self_supervised(
             model=model,
             train_loader=dataloader,
-            epochs=150,
+            epochs=300,
             learning_rate=1e-4,
             device='cuda'
         )
@@ -718,6 +718,7 @@ def windows_voting(all_results_df,method_dir):
 
 if __name__ == "__main__":
     participant_id = 37
+    seed = 1
     try:
 
         config = DataConfig(

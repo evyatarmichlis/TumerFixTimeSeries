@@ -234,7 +234,6 @@ def train_triplet_ae(
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        sampler=sampler,
         drop_last=False
     )
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
@@ -448,9 +447,10 @@ def lgm_cls(X_train,X_test,y_train,y_test,X_val,y_val,class_weight):
 
 
 if __name__ == '__main__':
+
     seed = 0
     feature_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'relative_x', 'relative_y',
-                       'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT', 'gaze_velocity',"target"]
+                       'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT', 'gaze_velocity', "target"]
     # ------------------------------------------------------------
     # Example usage within your pipeline:
     config = DataConfig(
@@ -458,7 +458,7 @@ if __name__ == '__main__':
         approach_num=8,
         normalize=True,
         per_slice_target=False,
-        participant_id=1
+        participant_id=37
     )
 
     # Load legacy data
@@ -468,7 +468,6 @@ if __name__ == '__main__':
         participant_id=config.participant_id,
         data_format="legacy"
     )
-
 
     df['fix_group'] = (df['CURRENT_FIX_COMPONENT_INDEX'] == 1).cumsum()
 
@@ -486,11 +485,26 @@ if __name__ == '__main__':
     aggregated_features = df.groupby('fix_group')[feature_columns].agg(agg_methods).reset_index(drop=True)
     df_target_1 = aggregated_features[aggregated_features['target'] == 1]
     df_target_0 = aggregated_features[aggregated_features['target'] == 0]
-    feature_to_test = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'relative_x', 'relative_y',
-                        'CURRENT_FIX_COMPONENT_COUNT', 'gaze_velocity']
-    explore_agg_data(aggregated_features, feature_to_test)
-    train_df, test_df = split_train_test_for_time_series(df, test_size=0.2, random_state=seed)
-    train_df, val_df = split_train_test_for_time_series(train_df, test_size=0.2, random_state=seed)
+    features_to_test = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'relative_x', 'relative_y',
+                       'CURRENT_FIX_COMPONENT_COUNT', 'gaze_velocity']
+
+    # labels = (
+    #     df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX'])
+    #     .apply(lambda group: int((group['SCAN_TYPE'] != 'NORMAL').any()))
+    #     .reset_index(name='target')
+    # )
+
+    # aggregated_features = aggregated_features.merge(labels, on=['RECORDING_SESSION_LABEL', 'TRIAL_INDEX'])
+
+    # df_target_1 = aggregated_features[aggregated_features['target'] == 1]
+    # df_target_0 = aggregated_features[aggregated_features['target'] == 0]
+
+    # features_to_test = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'relative_x', 'relative_y',
+    #                     'CURRENT_FIX_COMPONENT_COUNT', 'gaze_velocity']
+    explore_agg_data(aggregated_features, features_to_test)
+    quit()
+    train_df, test_df = split_train_test_for_time_series(aggregated_features, test_size=0.2, random_state=seed,input_columns=features_to_test)
+    train_df, val_df = split_train_test_for_time_series(aggregated_features, test_size=0.2, random_state=seed,input_columns=features_to_test)
 
 
     feature_columns = [
@@ -502,17 +516,15 @@ if __name__ == '__main__':
     seed = 42
     # For example, you can compute class weights or define them manually.
     # Here, assume class_weight is a dict like: {0: 1, 1: 10}
-    class_weight = {0: 1, 1: 10}
+    class_weight = {0: 1, 1: 1}
 
     # Split the data using your time series split function
-    train_df, test_df = split_train_test_for_time_series(df, test_size=0.2, random_state=seed)
-    train_df, val_df = split_train_test_for_time_series(train_df, test_size=0.2, random_state=seed)
     train_dataset = AggDataset(train_df, feature_columns, label_column='target')
     val_dataset = AggDataset(val_df, feature_columns, label_column='target')
     test_dataset = AggDataset(test_df, feature_columns, label_column='target')
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Train the model
+    # # Train the model
     model, history = train_triplet_ae(
         train_dataset=train_dataset,
         val_dataset=val_dataset,
@@ -521,9 +533,9 @@ if __name__ == '__main__':
         margin=1.0,
         lambda_recon=1.0,
         lambda_triplet=1.0,
-        lambda_clf=2.0,
-        batch_size=64,
-        epochs=100,
+        lambda_clf=3.0,
+        batch_size=32,
+        epochs=10000,
         lr=1e-3,
         device="cuda"
     )
@@ -698,29 +710,34 @@ if __name__ == '__main__':
     plt.show()
     #
 
-    # # Define your feature columns and target column
-    # feature_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'relative_x', 'relative_y',
-    #                    'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT', 'gaze_velocity']
-    # target_column = 'target'
+    # Define your feature columns and target column
+    feature_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'relative_x', 'relative_y',
+                       'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT', 'gaze_velocity']
+    target_column = 'target'
+
+    # Extract features and targets
+    X_train = train_df[feature_columns].values
+    y_train = train_df[target_column].values
+
+    X_val =    val_df[feature_columns].values
+    y_val = val_df[target_column].values
+
+    X_test = test_df[feature_columns].values
+    y_test = test_df[target_column].values
     #
-    # # Extract features and targets
-    # X_train = train_df[feature_columns].values
-    # y_train = train_df[target_column].values
-    #
-    # X_test = test_df[feature_columns].values
-    # y_test = test_df[target_column].values
-    #
-    # # Initialize and fit TabPFNClassifier
-    # clf = TabPFNClassifier(random_state=42,ignore_pretraining_limits=True)
-    # clf.fit(X_train, y_train)
-    #
-    # # Predict probabilities on the test set
-    # y_pred_proba = clf.predict_proba(X_test)
-    #
-    # # (Optional) You can also get hard predictions if needed:
-    # y_pred = clf.predict(X_test)
-    #
-    # # Print out the predicted probabilities and some evaluation metrics
-    # print("Predicted probabilities:\n", y_pred_proba)
-    # print("\nClassification Report:\n", classification_report(y_test, y_pred))
-    # print("\nConfusion Matrix:\n", confusion_matrix(y_test, y_pred))
+    # Initialize and fit TabPFNClassifier
+    clf = TabPFNClassifier(random_state=42,ignore_pretraining_limits=True)
+    clf.fit(X_train, y_train)
+
+    # Predict probabilities on the test set
+    y_pred_proba = clf.predict_proba(X_test)
+
+    # (Optional) You can also get hard predictions if needed:
+    y_pred = clf.predict(X_test)
+
+    # Print out the predicted probabilities and some evaluation metrics
+    print("Predicted probabilities:\n", y_pred_proba)
+    print("\nClassification Report:\n", classification_report(y_test, y_pred))
+    print("\nConfusion Matrix:\n", confusion_matrix(y_test, y_pred))
+
+    lgm_cls(X_train, X_test, y_train, y_test, X_val, y_val, class_weight)

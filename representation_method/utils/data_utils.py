@@ -231,7 +231,63 @@ def create_dynamic_time_series_with_smooth_labels(
     return samples, labels, target_locations,smoothed_labels
 
 
+def create_dynamic_time_series_with_metadata(df, feature_columns=None, window_size=100):
+    """
+    Enhanced version of create_dynamic_time_series that preserves detailed window metadata
+    for tracking predictions across cross-validation folds.
+    """
+    if feature_columns is None:
+        feature_columns = [
+            'Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X',
+            'CURRENT_FIX_IA_Y', 'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT'
+        ]
 
+    key_features = ['Pupil_Size', 'CURRENT_FIX_DURATION']
+
+    windows = []
+    labels = []
+    metadata = []
+
+    # Process each trial
+    for (participant_id, trial_id), trial_df in df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']):
+        trial_length = len(trial_df)
+        trial_df = trial_df.reset_index(drop=True)
+
+        for start_idx in range(0, trial_length - window_size + 1):
+            end_idx = start_idx + window_size
+            window = trial_df.iloc[start_idx:end_idx]
+
+            # Extract target information
+            target_array = window['target'].values
+            window_target_positions = np.where(target_array == 1)[0]
+
+            # Extract window features
+            window_features = window[feature_columns].values
+
+            # Calculate diffs for key features if needed
+            global_features = []
+            for feature in key_features:
+                values = window[feature].values
+                max_diff = np.max(values) - np.min(values)
+                global_features.append(max_diff)
+
+            # Store window data
+            windows.append(window_features)
+            labels.append(int(len(window_target_positions) > 0))
+
+            # Store detailed metadata
+            window_meta = {
+                'participant_id': participant_id,
+                'trial_id': trial_id,
+                'window_start_idx': start_idx,
+                'window_end_idx': end_idx,
+                'window_id': f"P{participant_id}_T{trial_id}_W{start_idx}-{end_idx}",
+                'has_target': int(len(window_target_positions) > 0),
+                'target_positions': window_target_positions.tolist() if len(window_target_positions) > 0 else []
+            }
+            metadata.append(window_meta)
+
+    return np.array(windows), np.array(labels), metadata
 
 
 def create_dynamic_time_series(df: pd.DataFrame, feature_columns=None, save_dir=None,
@@ -275,25 +331,24 @@ def create_dynamic_time_series(df: pd.DataFrame, feature_columns=None, save_dir=
             window_target_positions = np.where(target_array == 1)[0]
 
             window_features = window[feature_columns].values
-            # global_features = []
+            global_features = []
             #
             # # For each key feature, calculate comprehensive metrics
-            # for feature in key_features:
-            #     values = window[feature].values
-            #     max_diff = np.max(values) - np.min(values)  # Max - Min for the feature
-            #
-            #     global_features.extend([
-            #         max_diff
-            #
-            #     ])
-            #
-            # global_features = np.array(global_features)
-            # global_features_tiled = np.tile(global_features, (len(window), 1))
+            for feature in key_features:
+                values = window[feature].values
+                max_diff = np.max(values) - np.min(values)  # Max - Min for the feature
 
-            # Combine all features
-            # combined_features = np.concatenate([window_features, global_features_tiled], axis=1)
-            # label = int(len(window_target_positions) > 0)
-            label = int(len(window_target_positions)==1 and  window_target_positions[0] ==  0)
+                global_features.extend([
+                    max_diff
+
+                ])
+
+            global_features = np.array(global_features)
+            global_features_tiled = np.tile(global_features, (len(window), 1))
+
+            combined_features = np.concatenate([window_features, global_features_tiled], axis=1)
+            label = int(len(window_target_positions) > 0)
+            # label = int(len(window_target_positions)==1 and  window_target_positions[0] ==  0)
 
             samples.append(window_features)
             labels.append(label)
@@ -314,6 +369,76 @@ def create_dynamic_time_series(df: pd.DataFrame, feature_columns=None, save_dir=
         np.save(os.path.join(save_dir, f'{participant_id}_target_locations_{split_type}.npy'), target_locations)
 
     return samples, labels, target_locations
+
+
+
+def create_dynamic_time_series_3rd_class(df: pd.DataFrame, feature_columns=None, save_dir=None,
+                               load_existing=False, participant_id=1, split_type='train',
+                               window_size=10):
+    if feature_columns is None:
+        feature_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'relative_x', 'relative_y',
+                           'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT']
+
+
+    if load_existing and save_dir:
+        samples_path = os.path.join(save_dir, f'{participant_id}_dynamic_samples_{split_type}.npy')
+        labels_path = os.path.join(save_dir, f'{participant_id}_dynamic_labels_{split_type}.npy')
+        locations_path = os.path.join(save_dir, f'{participant_id}_target_locations_{split_type}.npy')
+        if all(os.path.exists(f) for f in [samples_path, labels_path, locations_path]):
+            return (np.load(samples_path), np.load(labels_path), np.load(locations_path))
+
+    samples = []
+    labels = []
+    target_locations = []
+
+    # Process each trial
+    trial_groups = df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX'])
+    target_trials = [(idx, group) for idx, group in trial_groups if group['target'].any()]
+    print(f"Found {len(target_trials)} trials containing targets out of {len(list(trial_groups))} total trials")
+
+    for (_, trial_idx), trial_df in trial_groups:
+        trial_length = len(trial_df)
+        trial_df = trial_df.reset_index(drop=True)
+
+        for start_idx in range(0, trial_length - window_size + 1):
+            end_idx = start_idx + window_size
+            window = trial_df.iloc[start_idx:end_idx]
+
+            # Get the target values for this window.
+            target_array = window['target'].values
+
+
+            if 1 in target_array:
+                label = 1
+            elif 2 in target_array:
+                label = 2
+            else:
+                label = 0
+
+            window_target_positions = np.where(target_array != 0)[0]
+
+            window_features = window[feature_columns].values
+
+            samples.append(window_features)
+            labels.append(label)
+            target_locations.append(window_target_positions)
+
+    samples = np.array(samples)
+    labels = np.array(labels)
+    target_locations = np.array(target_locations, dtype=object)
+
+    # Save processed data if a directory is provided.
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        if participant_id is None:
+            participant_id = 100
+
+        np.save(os.path.join(save_dir, f'{participant_id}_dynamic_samples_{split_type}.npy'), samples)
+        np.save(os.path.join(save_dir, f'{participant_id}_dynamic_labels_{split_type}.npy'), labels)
+        np.save(os.path.join(save_dir, f'{participant_id}_target_locations_{split_type}.npy'), target_locations)
+
+    return samples, labels, target_locations
+
 
 def resample_func(time_series_df, interval, feature_columns=None):
     if feature_columns is None:

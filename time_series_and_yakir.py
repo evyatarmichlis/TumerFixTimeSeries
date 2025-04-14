@@ -259,7 +259,7 @@ if __name__ == '__main__':
     expert_rad_e1_e3_csv_file_path = 'data/ExpertRad_Fixations_E1_E3.csv'
     rad_s1_s18_file_path = 'data/Rad_Fixations_S1_S18_Data.csv'
     formatted_rad_s1_s18_file_path = 'data/Formatted_Fixations_ML.csv'
-    categorized_rad_s1_s18_file_path = 'data/Categorized_Fixation_Data_1_18.csv'
+    categorized_rad_s1_s18_file_path = 'old_data/Categorized_Fixation_Data_1_18.csv'
 
     raw_participants_file_paths = ['1_Formatted_Sample.csv', '2_Formatted_Sample.csv', '3_Formatted_Sample.csv',
                                    '4_Formatted_Sample.csv', '6_Formatted_Sample.csv', '7_Formatted_Sample.csv',

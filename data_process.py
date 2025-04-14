@@ -429,9 +429,6 @@ class IdentSubRec:
 
             # Group by the three keys and split by them - RECORDING_SESSION_LABEL, TRIAL_INDEX, CURRENT_FIX_INDEX:
             print_and_log('Splitting train / test data by RECORDING_SESSION_LABEL, TRIAL_INDEX, CURRENT_FIX_INDEX')
-            #
-            # self.df['group'] = self.df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']].apply(
-            #     lambda row: '_'.join(row.values.astype(str)), axis=1)
             self.df['group'] = self.df[['RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_INDEX']].apply(
                 lambda row: '_'.join(row.values.astype(str)), axis=1)
             gss = GroupShuffleSplit(n_splits=1,
@@ -445,20 +442,6 @@ class IdentSubRec:
                 test_index]
             y_train, y_test = self.df['target'].iloc[train_index], self.df['target'].iloc[test_index]
 
-            # x_test_file_path = 'data/temp/x_test.csv'
-            # # x_test.to_csv(x_test_file_path, index=False)
-            # x_test = pd.read_csv(x_test_file_path, nrows=None)
-            # y_test_file_path = 'data/temp/y_test.csv'
-            # # y_test.to_csv(y_test_file_path, index=False)
-            # y_test = pd.read_csv(y_test_file_path, nrows=None)
-            #
-            # used_data = self.df[input_data_points]
-            # used_data_with_indices = used_data.copy().reset_index()
-            # merged_df = pd.merge(used_data_with_indices, x_test, how='outer', indicator=True)
-            # x_train_with_index_column = merged_df.query('_merge == "left_only"').drop('_merge', axis=1)
-            # original_indices = x_train_with_index_column['index'].tolist()
-            # x_train = used_data[used_data.index.isin(original_indices)]
-            # y_train = self.df['target'][self.df['target'].index.isin(original_indices)]
 
             if smote_type is not None:
                 x_train, y_train = apply_smote_and_related(x=x_train, y=y_train, smote_type=smote_type)
@@ -811,7 +794,7 @@ if __name__ == '__main__':
         print_stats = False
         approach_num = 8
     else:
-        nodule_categorized_rad_s1_s18_file_path = 'data/Categorized_Fixation_Data_1_18.csv'
+        nodule_categorized_rad_s1_s18_file_path = 'old_data/Categorized_Fixation_Data_1_18.csv'
         used_data_file_path = nodule_categorized_rad_s1_s18_file_path
 
         # ekg_001_file_path = 'data/ECG/ML_ECGData_P001.csv'

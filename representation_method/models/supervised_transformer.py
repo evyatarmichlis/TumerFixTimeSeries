@@ -579,8 +579,8 @@ def create_dataset(windows, reconstruction_labels, target_labels, tokenizer, fea
     tokens_array = np.array(all_tokens)
     return EyeTrackingDataset(tokens_array, reconstruction_labels, target_labels)
 
-def find_attention(df, participant_id='all', window_size=100, filter_targets=True):
-    seed = 2024
+def find_attention(df, participant_id='all', window_size=100, filter_targets=True, seed = 2024
+):
     seed_everything(seed)
 
     train_df, test_df = split_train_test_for_time_series(df, test_size=0.2, random_state=seed)
@@ -691,27 +691,27 @@ def find_attention(df, participant_id='all', window_size=100, filter_targets=Tru
         pretrained_path = os.path.join('results', f'self_supervised_transformer_participant_{participant_id}_window_size_150', 'model.pth')
         #
         # # # Run grid search.
-        grid_results, best_params = grid_search_loss_weights(
-            base_model=create_model_instance,
-            pretrained_path=pretrained_path,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            X_test=X_test,
-            test_metadata=test_metadata,
-            tokenizer=tokenizer,
-            feature_columns=feature_columns,
-            device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
-            grid_alpha=[0.1,1,5],
-            grid_beta=[0.1,1,5],
-            grid_gamma=[1,5, 10.0,15],
-            epochs=100,
-            learning_rate=1e-5,
-            patience=10
-        )
+        # grid_results, best_params = grid_search_loss_weights(
+        #     base_model=create_model_instance,
+        #     pretrained_path=pretrained_path,
+        #     train_loader=train_loader,
+        #     val_loader=val_loader,
+        #     X_test=X_test,
+        #     test_metadata=test_metadata,
+        #     tokenizer=tokenizer,
+        #     feature_columns=feature_columns,
+        #     device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+        #     grid_alpha=[0.1,1,5],
+        #     grid_beta=[0.1,1,5],
+        #     grid_gamma=[1,5, 10.0,15],
+        #     epochs=100,
+        #     learning_rate=1e-5,
+        #     patience=10
+        # )
 
         # Optionally, save the grid search results to a CSV.
-        grid_df = pd.DataFrame(grid_results)
-        grid_df.to_csv(os.path.join(method_dir, "grid_search_results.csv"), index=False)
+        # grid_df = pd.DataFrame(grid_results)
+        # grid_df.to_csv(os.path.join(method_dir, "grid_search_results.csv"), index=False)
 
         supervised_state = model.state_dict()
 
@@ -805,7 +805,7 @@ if __name__ == "__main__":
                 participant_id=config.participant_id,
                 data_format="legacy"
             )
-            find_attention(df, window_size=150, participant_id=str(participant_id))
+            find_attention(df, window_size=150, participant_id=str(participant_id),seed = 1)
         except Exception as e:
             print(e)
 

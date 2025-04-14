@@ -1992,6 +1992,7 @@ class EnsembleTrainer:
         self.best_val_losses = []
 
         for i in range(self.n_models):
+            print(f"model:{i/self.n_models}")
             # Create new model instance
             model = self.base_model_class(**self.model_params).to(self.device)
             optimizer = optimizer_class(model.parameters(), **optimizer_params)
@@ -2013,7 +2014,7 @@ class EnsembleTrainer:
             print(f"Model {i+1}/{self.n_models} trained. Best val loss: {best_val_loss:.4f}, "
                   f"Minority class F1: {minority_f1:.4f}")
 
-    def predict(self, data_loader, minority_weight=1.5):
+    def predict(self, data_loader, minority_weight=1.0):
         """
         Make predictions using weighted majority voting to favor minority class.
 
@@ -2229,3 +2230,287 @@ class EnsembleTrainer:
 
         return best_result['threshold'], best_result, results
 
+
+
+class EnsembleTrainer3dClass:
+    def __init__(self,
+                 base_model_class,
+                 model_params: dict,
+                 n_models: int = 5,
+                 device: str = 'cuda',
+                 save_path: str = None):
+
+        # Create save directory if it doesn't exist
+        if save_path:
+            os.makedirs(save_path, exist_ok=True)
+            print(f"Save directory created/verified at: {save_path}")
+        self.base_model_class = base_model_class
+        self.model_params = model_params
+        self.n_models = n_models
+        self.device = device
+        self.save_path = save_path
+        self.models = []
+        self.best_val_losses = []
+        # For multiclass we no longer use thresholding in this example
+        self.best_threshold = None
+
+    def create_weighted_loader(self, dataset, batch_size, majority_weight=0.5):
+        """Create a DataLoader with weighted sampling (lower weight for majority class)"""
+        # Extract labels from TensorDataset
+        labels = dataset.tensors[1].cpu().numpy()
+
+        # Calculate class weights
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        minority_idx = counts.argmin()
+
+        # Assign weights: lower weight for majority classes
+        weights = np.ones(len(labels))
+        majority_mask = labels != unique_labels[minority_idx]
+        weights[majority_mask] = majority_weight
+        weights = weights / weights.sum()
+
+        sampler = WeightedRandomSampler(
+            weights=weights,
+            num_samples=len(weights),
+            replacement=True
+        )
+        return DataLoader(dataset, batch_size=batch_size, sampler=sampler)
+
+    def create_hybrid_loader(self,
+                             dataset: TensorDataset,
+                             batch_size: int,
+                             undersample_ratio: float = 0.5) -> DataLoader:
+        # Convert tensors to NumPy arrays
+        data = dataset.tensors[0].cpu().numpy()
+        labels = dataset.tensors[1].cpu().numpy()
+
+        # Get unique classes and counts
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        min_count = counts.min()
+
+        # For each class, undersample if needed
+        reduced_indices = []
+        for label in unique_labels:
+            indices = np.where(labels == label)[0]
+            # If this class has more samples than the smallest class,
+            # undersample by taking a fraction (undersample_ratio) of its indices.
+            if len(indices) > min_count:
+                keep_count = int(len(indices) * undersample_ratio)
+                sampled_indices = np.random.choice(indices, size=keep_count, replace=False)
+                reduced_indices.append(sampled_indices)
+            else:
+                # If already the minority (or equal), keep all indices.
+                reduced_indices.append(indices)
+        reduced_indices = np.concatenate(reduced_indices)
+        np.random.shuffle(reduced_indices)
+
+        # Create reduced dataset
+        reduced_data = data[reduced_indices]
+        reduced_labels = labels[reduced_indices]
+
+        # Calculate sampling weights inversely proportional to class frequency.
+        unique_reduced, counts_reduced = np.unique(reduced_labels, return_counts=True)
+        class_weight_map = {label: 1.0 / count for label, count in zip(unique_reduced, counts_reduced)}
+        weights = np.array([class_weight_map[label] for label in reduced_labels], dtype=np.float32)
+        weights /= weights.sum()  # Normalize weights
+
+        sampler = WeightedRandomSampler(
+            weights=weights,
+            num_samples=len(weights),
+            replacement=True
+        )
+
+        new_dataset = TensorDataset(
+            torch.FloatTensor(reduced_data),
+            torch.LongTensor(reduced_labels)
+        )
+
+        loader = DataLoader(
+            new_dataset,
+            batch_size=batch_size,
+            sampler=sampler
+        )
+        return loader
+
+    def create_undersampled_loader(self, dataset, batch_size):
+        """Create a DataLoader with undersampling of majority class"""
+        labels = dataset.tensors[1].cpu().numpy()
+        data = dataset.tensors[0].cpu().numpy()
+
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        minority_class = unique_labels[counts.argmin()]
+        minority_count = counts.min()
+
+        minority_indices = np.where(labels == minority_class)[0]
+        majority_indices = np.where(labels != minority_class)[0]
+
+        sampled_majority_indices = np.random.choice(
+            majority_indices,
+            size=minority_count,
+            replace=False
+        )
+
+        selected_indices = np.concatenate([minority_indices, sampled_majority_indices])
+        np.random.shuffle(selected_indices)
+
+        balanced_data = data[selected_indices]
+        balanced_labels = labels[selected_indices]
+
+        balanced_dataset = TensorDataset(
+            torch.FloatTensor(balanced_data),
+            torch.LongTensor(balanced_labels)
+        )
+
+        return DataLoader(balanced_dataset, batch_size=batch_size, shuffle=True)
+
+    def train_single_model(self, model, train_loader, val_loader, epochs, criterion, optimizer):
+        best_val_loss = float('inf')
+        patience = 10
+        patience_counter = 0
+        best_f1 = 0
+        for epoch in range(epochs):
+            # Training
+            model.train()
+            train_loss = 0
+            for batch_idx, (data, target) in enumerate(train_loader):
+                data, target = data.to(self.device), target.to(self.device)
+                optimizer.zero_grad()
+                output = model(data)
+                loss = criterion(output, target)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
+
+            # Validation
+            model.eval()
+            val_loss = 0
+            val_preds = []
+            val_targets = []
+            with torch.no_grad():
+                for data, target in val_loader:
+                    data, target = data.to(self.device), target.to(self.device)
+                    output = model(data)
+                    val_loss += criterion(output, target).item()
+                    _, preds = torch.max(output, 1)
+                    val_preds.extend(preds.cpu().numpy())
+                    val_targets.extend(target.cpu().numpy())
+            val_loss /= len(val_loader)
+            # Compute weighted F1 score for multiclass
+            f1 = f1_score(val_targets, val_preds, average='weighted')
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_f1 = f1
+                patience_counter = 0
+                if self.save_path:
+                    torch.save(model.state_dict(),
+                               f"{self.save_path}/model_{len(self.models)}.pt")
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    break
+        # For multiclass, we are not using a threshold
+        return model, best_val_loss, best_f1, None
+
+    def train_ensemble(self, train_dataset, val_loader, batch_size, epochs, criterion,
+                       optimizer_class, optimizer_params, majority_weight=0.5,
+                       undersample_ratio=0.1, minority_weight=2.0):
+        """Train the ensemble of models using weighted sampling"""
+        self.models = []
+        self.best_val_losses = []
+
+        for i in range(self.n_models):
+            model = self.base_model_class(**self.model_params).to(self.device)
+            optimizer = optimizer_class(model.parameters(), **optimizer_params)
+
+            train_loader = self.create_hybrid_loader(
+                dataset=train_dataset,
+                batch_size=batch_size,
+            )
+            trained_model, best_val_loss, f1, _ = self.train_single_model(
+                model, train_loader, val_loader, epochs, criterion, optimizer)
+
+            self.models.append(trained_model)
+            self.best_val_losses.append(best_val_loss)
+            print(f"Model {i+1}/{self.n_models} trained. Best val loss: {best_val_loss:.4f}, "
+                  f"Weighted F1: {f1:.4f}")
+
+    def predict(self, data_loader):
+        """
+        Make predictions by averaging the probabilities from all models and taking argmax.
+        """
+        all_probabilities = []
+        for model in self.models:
+            model.eval()
+            model_probs = []
+            with torch.no_grad():
+                for data, _ in data_loader:
+                    data = data.to(self.device)
+                    outputs = model(data)
+                    probs = F.softmax(outputs, dim=1)
+                    model_probs.append(probs.cpu().numpy())
+            # Concatenate predictions for this model
+            all_probabilities.append(np.concatenate(model_probs, axis=0))
+        # Average probabilities across models
+        avg_probs = np.mean(np.stack(all_probabilities, axis=0), axis=0)  # shape: (n_samples, n_classes)
+        final_predictions = np.argmax(avg_probs, axis=1)
+        return final_predictions
+
+    def predict_proba(self, data_loader):
+        """
+        Get probability predictions from ensemble.
+        Returns average probability across all models.
+        """
+        all_probabilities = []
+
+        for model in self.models:
+            model.eval()
+            model_probs = []
+            with torch.no_grad():
+                for data, _ in data_loader:
+                    data = data.to(self.device)
+                    outputs = model(data)
+                    probs = F.softmax(outputs, dim=1)
+                    model_probs.extend(probs.cpu().numpy())
+            all_probabilities.append(np.array(model_probs))
+
+        return np.mean(np.stack(all_probabilities, axis=0), axis=0)
+
+    def evaluate(self, test_loader):
+        """Evaluate the ensemble"""
+        predictions = self.predict(test_loader)
+        true_labels = []
+        for _, labels in test_loader:
+            true_labels.extend(labels.cpu().numpy())
+
+        results = self._calculate_metrics(true_labels, predictions)
+        print("\nEnsemble Results:")
+        print(f"Accuracy: {results['accuracy']:.4f}")
+        print(f"Precision: {results['precision']:.4f}")
+        print(f"Recall: {results['recall']:.4f}")
+        print(f"F1 Score: {results['f1']:.4f}")
+
+        cm = confusion_matrix(true_labels, predictions)
+        print("Confusion Matrix:")
+        print(cm)
+        report = classification_report(true_labels, predictions)
+        if self.save_path:
+            with open(os.path.join(self.save_path, 'evaluation_results.txt'), 'w') as f:
+                f.write("Classification Report:\n")
+                f.write(report)
+                f.write("\nConfusion Matrix:\n")
+                f.write(str(cm))
+        return results['accuracy'], results['f1']
+
+    def _calculate_metrics(self, labels, predictions):
+        """Calculate comprehensive metrics for multiclass evaluation."""
+        accuracy = accuracy_score(labels, predictions)
+        precision = precision_score(labels, predictions, average='weighted')
+        recall = recall_score(labels, predictions, average='weighted')
+        f1 = f1_score(labels, predictions, average='weighted')
+        return {
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1
+        }

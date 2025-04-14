@@ -1275,7 +1275,7 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
 
 if __name__ == '__main__':
     # Load your dataset
-    categorized_rad_s1_s18_file_path = 'data/Categorized_Fixation_Data_1_18.csv'
+    categorized_rad_s1_s18_file_path = 'old_data/Categorized_Fixation_Data_1_18.csv'
     approach_num = 6
     categorized_rad_init_kwargs = dict(
         data_file_path=categorized_rad_s1_s18_file_path,

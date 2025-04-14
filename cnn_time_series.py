@@ -414,7 +414,7 @@ def main(df, window_size=5, method='', resample=False,epochs=100,batch_size=32):
 if __name__ == '__main__':
 
 
-    categorized_rad_s1_s18_file_path = 'data/Categorized_Fixation_Data_1_18.csv'
+    categorized_rad_s1_s18_file_path = 'old_data/Categorized_Fixation_Data_1_18.csv'
 
     raw_participants_file_paths = ['1_Formatted_Sample.csv', '2_Formatted_Sample.csv', '3_Formatted_Sample.csv',
                                    '4_Formatted_Sample.csv', '6_Formatted_Sample.csv', '7_Formatted_Sample.csv',

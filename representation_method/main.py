@@ -31,7 +31,7 @@ from models.classifier import CombinedModel, TVAEClassifier, EnhancedClassifier,
     SimpleCombinedModel, ComplexCNNClassifier
 from utils.trainers import AutoencoderTrainer, CombinedModelTrainer, ContrastiveAutoencoderTrainer, VAETrainer, \
     VAEClassifierTrainer, ImprovedVAEClassifierTrainer, TripletAutoencoderTrainer
-from latent_space_classifer import  LatentSpaceClassifier
+# from latent_space_classifer import  LatentSpaceClassifier
 feature_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X', 'CURRENT_FIX_IA_Y',
                    'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT']
 from sklearn.ensemble import RandomForestClassifier
@@ -198,25 +198,6 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
     else:
         depth = 2
 
-    # print("after window class distribution in test set:")
-    # print(pd.Series(Y_test).value_counts())
-    # Create time series
-
-    # results, best_clf = analyze_dynamic_windows(X_train, Y_train, X_test, Y_test, X_val, Y_val)
-    # return results
-    # Scale data
-    # print("Before first filtering")
-    # print(pd.Series(Y_train).value_counts())
-    # keep_mask, rf_model, coarse_threshold = filter_easy_negatives(
-    #     X_train, Y_train,
-    #     recall_target=0.99,
-    #     max_depth=6,
-    #     n_estimators=50
-    # )
-    #
-    # # Apply mask to remove easy negatives from training data
-    # # X_train = X_train[keep_mask]
-    # # Y_train = Y_train[keep_mask]
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train.reshape(-1, X_train.shape[-1])).reshape(X_train.shape)
     X_val_scaled = scaler.transform(X_val.reshape(-1, X_val.shape[-1])).reshape(X_val.shape)
@@ -228,8 +209,6 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
             hidden_dim=64,
             latent_dim=vae_params.get('latent_dim', 32)
         ).to(device)
-
-        # autoencoder = ImprovedTimeSeriesVAE(len(feature_columns)+2,latent_dim=vae_params.get('latent_dim', 32)).to(device)
 
 
     else:
@@ -409,10 +388,8 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
             mask = (Y_train_1d == label)
             weights[mask] = 1.0 / class_counts[int(label)]
 
-        # Convert to tensor and create sampler
         weights = torch.FloatTensor(weights)
 
-        # Convert to tensor and create sampler
         sampler = WeightedRandomSampler(
             weights=weights,
             num_samples=len(weights),
@@ -428,15 +405,13 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
 
     if assemble:
         ensemble_trainer = EnsembleTrainer(
-            base_model_class=ComplexCNNClassifier,
-            model_params={'input_dim': input_dim},
+            base_model_class=CombinedModel,
+            model_params={'input_dim': input_dim,'output_classes':2},
             n_models=10,
             device='cuda',
             save_path=ensemble_save_path
 
         )
-
-        # Train ensemble
 
         ensemble_trainer.train_ensemble(
             train_dataset=train_dataset,
@@ -700,35 +675,35 @@ def train_vae_classifier(autoencoder, train_loader, val_loader, test_loader, par
     return vae_classifier, results
 
 
-def train_latent_classifier(vae_model, train_loader, val_loader, test_loader, device):
-    """Train and evaluate the latent space classifier"""
-
-    # Initialize classifier
-    classifier = LatentSpaceClassifier(
-        vae_model=vae_model,
-        n_neighbors=5,  # Increased for more robust estimation
-        contamination=0.03,  # Adjust based on expected anomaly ratio
-        device=device
-    )
-
-    # Train
-    print("Training latent space classifier...")
-    classifier.fit(train_loader, val_loader)
-
-    # Find optimal threshold
-    # best_threshold = classifier.optimize_threshold(
-    #     val_loader,
-    #     min_recall=0.3  # Minimum recall we want to achieve
-    # )
-    # print(f"\nOptimal threshold: {best_threshold:.3f}")
-    best_threshold  =0.5
-    # Evaluate on test set
-    test_metrics = classifier.evaluate(test_loader, threshold=best_threshold)
-    print("\nTest Set Metrics:")
-    for metric, value in test_metrics.items():
-        print(f"{metric}: {value:.4f}")
-
-    return classifier, test_metrics
+# def train_latent_classifier(vae_model, train_loader, val_loader, test_loader, device):
+#     """Train and evaluate the latent space classifier"""
+#
+#     # Initialize classifier
+#     classifier = LatentSpaceClassifier(
+#         vae_model=vae_model,
+#         n_neighbors=5,  # Increased for more robust estimation
+#         contamination=0.03,  # Adjust based on expected anomaly ratio
+#         device=device
+#     )
+#
+#     # Train
+#     print("Training latent space classifier...")
+#     classifier.fit(train_loader, val_loader)
+#
+#     # Find optimal threshold
+#     # best_threshold = classifier.optimize_threshold(
+#     #     val_loader,
+#     #     min_recall=0.3  # Minimum recall we want to achieve
+#     # )
+#     # print(f"\nOptimal threshold: {best_threshold:.3f}")
+#     best_threshold  =0.5
+#     # Evaluate on test set
+#     test_metrics = classifier.evaluate(test_loader, threshold=best_threshold)
+#     print("\nTest Set Metrics:")
+#     for metric, value in test_metrics.items():
+#         print(f"{metric}: {value:.4f}")
+#
+#     return classifier, test_metrics
 
 
 
@@ -790,7 +765,7 @@ def main(data_config, params, use_legacy=False):
         # path = '/cs/usr/evyatar613/Desktop/josko_lab/Pycharm/TumerFixTimeSeries/representation_method/results/VAE_m0.4_tw10_b0.1_a0.05_cosine_normal_approach_6_window_1000_depth_5_lr_0.0001_ae_epochs_100_class_epochs_20_mask_0.4_filters_4_batch_256_participant_1_thresh_0.9,use_gan_False/best_model_model.pth'
         checkpoint = torch.load(path)
         autoencoder.load_state_dict(checkpoint)
-        classifier, test_metrics = train_latent_classifier(vae_model=autoencoder, train_loader=train_loader,val_loader=val_loader,test_loader=test_loader,device=device)
+        # classifier, test_metrics = train_latent_classifier(vae_model=autoencoder, train_loader=train_loader,val_loader=val_loader,test_loader=test_loader,device=device)
 
 
 if __name__ == '__main__':
@@ -803,7 +778,7 @@ if __name__ == '__main__':
             approach_num=6,
             normalize=True,
             per_slice_target=True,
-            participant_id=1
+            participant_id=36
         )
     else:
         config = DataConfig(

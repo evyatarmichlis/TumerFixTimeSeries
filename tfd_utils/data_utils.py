@@ -193,7 +193,7 @@ def get_df_for_training(
         if data_fp.endswith('.xlsx'):
             data_fp_df = pd.read_excel(data_fp, nrows=nrows, skiprows=skip_rows)
         elif data_fp.endswith('.csv'):
-            data_fp_df = pd.read_csv(data_fp, nrows=nrows, skiprows=skip_rows)
+            data_fp_df = pd.read_csv(data_fp,nrows=nrows,skiprows=skip_rows,engine='python',  on_bad_lines='skip')
         else:
             raise ValueError(f'Unsupported file type for {data_fp}')
         dfs.append(data_fp_df)

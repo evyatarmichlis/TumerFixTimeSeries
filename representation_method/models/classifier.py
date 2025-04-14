@@ -137,7 +137,7 @@ class ResidualBlock(nn.Module):
 
 
 class ComplexCNNClassifier(nn.Module):
-    def __init__(self, input_dim, hidden_rnn_dim=256, rnn_type="GRU"):
+    def __init__(self, input_dim, hidden_rnn_dim=256, rnn_type="GRU",output_classes=2):
         """
         Args:
             input_dim (int): Number of input channels (e.g. # features for 1D time series).
@@ -173,7 +173,7 @@ class ComplexCNNClassifier(nn.Module):
             )
 
 
-        self.fc = nn.Linear(hidden_rnn_dim, 2)
+        self.fc = nn.Linear(hidden_rnn_dim, output_classes)
 
     def _make_layer(self, block, in_channels, out_channels, num_blocks, dilation):
         layers = [block(in_channels, out_channels, dilation=dilation)]
@@ -224,21 +224,20 @@ class ComplexCNNClassifier(nn.Module):
 
 
 class CombinedModel(nn.Module):
-    def __init__(self, model, num_classes):
+    def __init__(self, input_dim,output_classes=2):
         super(CombinedModel, self).__init__()
-        self.encoder = model.encoder
-        # self.classifier = ComplexCNNClassifier(input_dim=128, num_classes=num_classes)
-        self.classifier =None
+        self.num_classes = output_classes
 
-    def forward(self, x):
-
-        x = x.view(x.size(0), -1)  # Flatten the input
         self.classifier = nn.Sequential(
-            nn.Linear(x.size(1), 64),  # Dynamic input size
+            nn.Linear(600, 64),  # Dynamic input size
             nn.ReLU(),
             nn.Dropout(p=0.2),
-            nn.Linear(64, 2)
-        ).to(x.device)
+            nn.Linear(64, self.num_classes)
+        )
+    def forward(self, x):
+
+        x = x.view(x.size(0), -1)
+
         return self.classifier(x)
 
 
