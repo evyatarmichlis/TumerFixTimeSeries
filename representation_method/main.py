@@ -134,7 +134,6 @@ def evaluate_random_classifier(Y_test,method_dir = None):
     # Return metrics
     return metrics
 
-# feature_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION']
 def main_with_autoencoder(df, window_size=5, method='', resample=False, classification_epochs=20, batch_size=32,
                           ae_epochs=100, depth=4, num_filters=32, lr=0.001, mask_probability=0.4,
                           early_stopping_patience=30, threshold=0.5, use_gan=False, TRAIN = False, use_vae=True,
@@ -298,20 +297,7 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
                 early_stopping_patience=early_stopping_patience
             )
         else:
-            # trainer = TripletAutoencoderTrainer(
-            #     model=autoencoder,
-            #     criterion=nn.MSELoss(),
-            #     optimizer=optimizer,
-            #     scheduler=scheduler,
-            #     device=device,
-            #     margin=params.get('margin', 10),
-            #     triplet_weight=params.get('triplet_weight', 30),
-            #     distance_metric=params.get('distance_metric', 'cosine'),
-            #     mask_probability=params.get('mask_probability', 0.1),
-            #     save_path=method_dir,
-            #     early_stopping_patience=early_stopping_patience
-            #
-            #     )
+
             trainer = AutoencoderTrainer(
                 model=autoencoder,
                 criterion=nn.MSELoss(),
@@ -329,20 +315,6 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
 
 
         trainer.train(train_loader, val_loader, epochs=ae_epochs)
-        # best_autoencoder_path = '/cs/usr/evyatar613/Desktop/josko_lab/Pycharm/TumerFixTimeSeries/representation_method/results/VAET old method improved_approach_6_window_50_depth_5_lr_0.001_ae_epochs_30_class_epochs_20_mask_0.4_filters_4_batch_32_participant_1_thresh_0.95,use_gan_False/best_model_model.pth'
-        # # best_autoencoder_path = '/cs/usr/evyatar613/Desktop/josko_lab/Pycharm/TumerFixTimeSeries/representation_method/results/AE on old data  test_approach_6_window_50_depth_5_lr_0.001_ae_epochs_30_class_epochs_30_mask_0.4_filters_4_batch_256_participant_1_thresh_0.95,use_gan_False/best_autoencoder_checkpoint.pth'
-        # # best_autoencoder_path = '/cs/usr/evyatar613/Desktop/josko_lab/Pycharm/TumerFixTimeSeries/representation_method/results/Evyatar_approach_6_window_50_depth_4_lr_0.001_ae_epochs_100_class_epochs_20_mask_0.4_filters_32_batch_32_participant_1_thresh_0.9,use_gan_True/best_autoencoder_model.pth'
-        # autoencoder.load_state_dict(torch.load(best_autoencoder_path))
-        # results = analyze_vae_embeddings_with_umap(
-        #     encoder_model=autoencoder,
-        #     loader=test_loader,
-        #     device=device,
-        #     method_dir=method_dir,
-        #     loader_name='test',
-        #     n_iterations=5,
-        #     sample_ratio=0.2
-        # )
-        # return results
     else:
         root_dir = Path(__file__).resolve().parent  # Go up 3 levels
         best_autoencoder_path = os.path.join(root_dir, "results",'add focal loss to AE _approach_6_participant_1use_gan_False',
@@ -395,8 +367,6 @@ def main_with_autoencoder(df, window_size=5, method='', resample=False, classifi
             num_samples=len(weights),
             replacement=True
         )
-    train_loader = DataLoader(train_dataset, batch_size=batch_size)
-
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     ensemble_save_path = os.path.join(method_dir,'ensemble_models')
@@ -475,310 +445,22 @@ def create_method_name(name,config, params):
 
 
 
-def prepare_dataloaders(X_train, Y_train, X_val, Y_val, X_test, Y_test, batch_size, use_gan=False):
-    """Create all necessary dataloaders with proper sampling."""
-    train_dataset = torch.utils.data.TensorDataset(
-        torch.tensor(X_train, dtype=torch.float32).permute(0, 2, 1),
-        torch.tensor(Y_train, dtype=torch.long)
-    )
-    val_dataset = torch.utils.data.TensorDataset(
-        torch.tensor(X_val, dtype=torch.float32).permute(0, 2, 1),
-        torch.tensor(Y_val, dtype=torch.long)
-    )
-    test_dataset = torch.utils.data.TensorDataset(
-        torch.tensor(X_test, dtype=torch.float32).permute(0, 2, 1),
-        torch.tensor(Y_test, dtype=torch.long)
-    )
 
-    if not use_gan:
-        classes = np.unique(Y_train)
-        class_weights = compute_class_weight('balanced', classes=classes, y=Y_train)
-        samples_weight = np.array([class_weights[t] for t in Y_train])
-        sampler = WeightedRandomSampler(torch.from_numpy(samples_weight).float(), len(samples_weight))
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
-    else:
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-    return train_loader, val_loader, test_loader
-
-
-def setup_autoencoder(input_shape, params, device):
-    """Create and initialize autoencoder."""
-    # autoencoder = CNNRecurrentAutoencoder(
-    #     in_channels=input_shape[-1],
-    #     num_filters=params['num_filters'],
-    #     depth=params['depth'],
-    #     hidden_size=128,
-    #     num_layers=1,
-    #     rnn_type='GRU',
-    #     input_length=input_shape[1]
-    # ).to(device)
-    autoencoder = TimeSeriesVAE(input_dim=input_shape[-1], hidden_dim=64, latent_dim=params['latent_dim']).to(device)
-    autoencoder.apply(initialize_weights)
-    return autoencoder
-
-
-def train_autoencoder_model(autoencoder, train_loader, val_loader, params, device, save_path):
-    """Setup and train autoencoder."""
-    optimizer = optim.AdamW(autoencoder.parameters(), lr=params['lr'], weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=20)
-    # trainer = AutoencoderTrainer(
-    #     model=autoencoder,
-    #     criterion=nn.MSELoss(),
-    #     optimizer=optimizer,
-    #     scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=20),
-    #     device=device,
-    #     save_path=save_path,
-    #     early_stopping_patience=10,
-    #     mask_probability=params['mask_probability']
-    # )
-    #
-    # trainer.train(train_loader,val_loader,epochs=params['ae_epochs'])
-    # Calculate weights for balanced sampling
-    labels = train_loader.dataset.tensors[1].numpy()  # Get labels from dataset
-    class_counts = np.bincount(labels)
-    weights = 1. / class_counts[labels]
-    weights = torch.FloatTensor(weights)
-
-    # Create balanced sampler
-    sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
-
-    # Create new train loader with balanced sampling
-    train_loader_balanced = DataLoader(
-        train_loader.dataset,
-        batch_size=train_loader.batch_size,
-        sampler=sampler,
-        num_workers=train_loader.num_workers,
-        pin_memory=train_loader.pin_memory
-    )
-
-    trainer = VAETrainer(
-        model=autoencoder,
-        criterion = nn.MSELoss(),
-        optimizer=optimizer,
-        scheduler=scheduler,
-        device=device,
-        l2_alpha = params['alpha'],
-        beta=params['beta'],
-        margin = params['margin'],
-        triplet_weight = params['triplet_weight'],
-        distance_metric = params['distance_metric'],
-        loss_type = params['loss_type'],
-        # Adjust this to control KL divergence impact
-        save_path=save_path,
-        early_stopping_patience=5
-    )
-    #
-    trainer.train(train_loader_balanced, val_loader, epochs=params['ae_epochs'])
-    # criterion = nn.MSELoss()
-    # loss_fn = ImbalancedTripletContrastiveLoss(
-    #     criterion=criterion,
-    #     lambda_contrast=5.0,
-    #     lambda_triplet=2.0,  # Adjust based on your needs
-    #     temperature=0.1,
-    #     margin=1.0  # Adjust based on your embedding space
-    # ).to(device)
-    # # Your existing code
-    # criterion = nn.MSELoss()
-    # # loss_fn = ContrastiveAutoencoderLoss(
-    # #     criterion=criterion
-    # # ).to(device)
-    #
-    # # Create trainer with chosen loss
-    # contrastive_trainer = ContrastiveAutoencoderTrainer(
-    #     model=autoencoder,
-    #     optimizer=optimizer,
-    #     loss_function=loss_fn,
-    #     device=device,
-    #     scheduler=scheduler,
-    #     mask_probability=0.1,
-    #     save_path=save_path,
-    #     early_stopping_patience=5
-    # )
-    # #
-    # # # Train with balanced loader
-    # contrastive_trainer.train(train_loader_balanced, val_loader, epochs=params['ae_epochs'])
-
-
-def train_combined_model(autoencoder, train_loader, val_loader, test_loader, params, device, save_path):
-    """Setup and train combined model."""
-    model = CombinedModel(autoencoder, num_classes=2).to(device)
-    optimizer = optim.AdamW([
-        {'params': model.encoder.parameters(), 'lr': params['lr'] * 0.1},
-        {'params': model.classifier.parameters(), 'lr': params['lr']}
-    ], weight_decay=1e-4)
-    classifier_dir = os.path.join(save_path, params['classifier'])
-    os.makedirs(classifier_dir, exist_ok=True)
-    trainer = CombinedModelTrainer(
-        model=model,
-        criterion=CrossEntropyLoss(),
-        optimizer=optimizer,
-        scheduler=optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3,verbose=True),
-        device=device,
-        save_path=classifier_dir,
-        early_stopping_patience=5
-    )
-
-    trainer.train(train_loader, val_loader, epochs=params['classification_epochs'])
-    trainer.evaluate(test_loader, threshold=params['threshold'])
-
-
-def train_vae_classifier(autoencoder, train_loader, val_loader, test_loader, params, device, method_dir):
-    """
-    Train VAE classifier using the new trainer
-    """
-    vae_classifier = TVAEClassifier(
-        vae_model=autoencoder,
-        hidden_dim=128,  # You can adjust this
-        num_classes=2,
-        dropout=0.3
-    ).to(device)
-
-    trainer = VAEClassifierTrainer(
-        model=vae_classifier,
-        device=device,
-        focal_loss_gamma=2.0  # You can adjust this
-    )
-
-    _, labels = next(iter(train_loader))
-    class_counts = np.bincount(labels.numpy())
-    class_weights = len(labels) / (len(np.unique(labels)) * class_counts)
-
-    # Create paths for saving results
-    model_save_path = os.path.join(method_dir, 'best_vae_classifier.pth')
-    curves_save_path = os.path.join(method_dir, 'vae_training_curves.png')
-    results_save_path = os.path.join(method_dir, 'vae_classification_results.txt')
-
-    # Train the model
-    history = trainer.train(
-        train_loader=train_loader,
-        val_loader=val_loader,
-        epochs=params['classification_epochs'],
-        learning_rate=params['lr'],
-        class_weights=class_weights,
-        early_stopping_patience=10,
-        save_path=model_save_path
-    )
-
-    trainer.plot_training_history(history, save_path=curves_save_path)
-
-    results = trainer.evaluate(test_loader)
-
-    with open(results_save_path, 'w') as f:
-        f.write("Classification Report:\n")
-        f.write(results['classification_report'])
-        f.write("\n\nConfusion Matrix:\n")
-        f.write(str(results['confusion_matrix']))
-    return vae_classifier, results
-
-
-# def train_latent_classifier(vae_model, train_loader, val_loader, test_loader, device):
-#     """Train and evaluate the latent space classifier"""
-#
-#     # Initialize classifier
-#     classifier = LatentSpaceClassifier(
-#         vae_model=vae_model,
-#         n_neighbors=5,  # Increased for more robust estimation
-#         contamination=0.03,  # Adjust based on expected anomaly ratio
-#         device=device
-#     )
-#
-#     # Train
-#     print("Training latent space classifier...")
-#     classifier.fit(train_loader, val_loader)
-#
-#     # Find optimal threshold
-#     # best_threshold = classifier.optimize_threshold(
-#     #     val_loader,
-#     #     min_recall=0.3  # Minimum recall we want to achieve
-#     # )
-#     # print(f"\nOptimal threshold: {best_threshold:.3f}")
-#     best_threshold  =0.5
-#     # Evaluate on test set
-#     test_metrics = classifier.evaluate(test_loader, threshold=best_threshold)
-#     print("\nTest Set Metrics:")
-#     for metric, value in test_metrics.items():
-#         print(f"{metric}: {value:.4f}")
-#
-#     return classifier, test_metrics
-
-
-
-def main(data_config, params, use_legacy=False):
-    """Main training pipeline."""
-    seed_everything(0)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    method_name = create_method_name(params['name'], data_config, params)
-    method_dir = os.path.join('results', method_name)
-    os.makedirs(method_dir, exist_ok=True)
-
-    if use_legacy:
-        df = load_eye_tracking_data(data_path=data_config.data_path,
-                                    approach_num=data_config.approach_num,
-                                    participant_id=data_config.participant_id,
-                                    data_format="legacy")
-        return main_with_autoencoder(df=df, window_size=params['window_size'],
-                                     method=method_name,
-                                     **{k: v for k, v in params.items() if k != 'name'})
-
-    # Load and split data
-    loader = create_data_loader('time_series', data_config)
-    window_data, labels, meta_data = loader.load_data(data_type='windowed')
-    splitter = DataSplitter(window_data, labels, meta_data, random_state=42)
-    (X_train, Y_train), (X_val, Y_val), (X_test, Y_test) = splitter.split_by_trials()
-
-    # Scale data
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train.reshape(-1, X_train.shape[-1])).reshape(X_train.shape)
-    X_val_scaled = scaler.transform(X_val.reshape(-1, X_val.shape[-1])).reshape(X_val.shape)
-    X_test_scaled = scaler.transform(X_test.reshape(-1, X_test.shape[-1])).reshape(X_test.shape)
-
-    # Create dataloaders
-    train_loader, val_loader, test_loader = prepare_dataloaders(
-        X_train_scaled, Y_train, X_val_scaled, Y_val, X_test_scaled, Y_test,
-        params['batch_size'], params['use_gan']
-    )
-
-    # Setup and train autoencoder
-    autoencoder = setup_autoencoder(X_train.shape, params, device)
-    if params['TRAIN']:
-        train_autoencoder_model(autoencoder, train_loader, val_loader, params, device, method_dir)
-        embeddings, median_embeddings_2d, median_labels, metrics = analyze_vae_embeddings_with_umap(
-            vae_model=autoencoder,
-            loader=test_loader,
-            device=device,
-            method_dir=method_dir,
-            n_iterations=10,
-            sample_ratio=0.2,
-            n_neighbors=15,
-            min_dist=0.1
-        )
-        return metrics['avg_davies'],metrics['avg_silhouette']
-
-
-    else:
-        path = '/cs/usr/evyatar613/Desktop/josko_lab/Pycharm/TumerFixTimeSeries/representation_method/results/All_VAE_m0.1_tw10_b0.1_a0.1_dist_L2_loss_normal_dim_32_lr0.001_approach_6_window_1000_depth_5_lr_0.001_ae_epochs_70_class_epochs_30_mask_0.4_filters_4_batch_512_participant_1_thresh_0.9,use_gan_False/best_model_model.pth'
-        # path = '/cs/usr/evyatar613/Desktop/josko_lab/Pycharm/TumerFixTimeSeries/representation_method/results/VAE_m0.4_tw10_b0.1_a0.05_cosine_normal_approach_6_window_1000_depth_5_lr_0.0001_ae_epochs_100_class_epochs_20_mask_0.4_filters_4_batch_256_participant_1_thresh_0.9,use_gan_False/best_model_model.pth'
-        checkpoint = torch.load(path)
-        autoencoder.load_state_dict(checkpoint)
-        # classifier, test_metrics = train_latent_classifier(vae_model=autoencoder, train_loader=train_loader,val_loader=val_loader,test_loader=test_loader,device=device)
 
 
 if __name__ == '__main__':
+
+    csv_path = Path(__file__).parent.parent / "fwd_data" / 'Nodule_Categorized_Fixation_Data_1_18.csv'
 
 
     use_legacy = True
     if use_legacy:
         config = DataConfig(
-            data_path='data/Categorized_Fixation_Data_1_18.csv',
-            approach_num=6,
+            data_path=str(csv_path),
+            approach_num=15,
             normalize=True,
             per_slice_target=True,
-            participant_id=36
+            participant_id=1
         )
     else:
         config = DataConfig(
@@ -786,21 +468,21 @@ if __name__ == '__main__':
             approach_num=8,
             normalize=True,
             per_slice_target=True,
-            participant_id=1,
+            participant_id=2,
             window_size=1,
             stride=1
         )
 
     params = {
         'name': 'cnn with complex classifier',
-        'window_size': 100,
+        'window_size': 50,
         'classification_epochs': 200,
         'batch_size': 32,
         'ae_epochs': 150,
         'depth': 4,
         'num_filters': 32,
         'mask_probability': 0.8,
-        'threshold': 0.5,
+        'threshold': 0.9,
         'participant': config.participant_id,  # Added this back as it's needed for method name
         'use_gan': False,
         'early_stopping_patience': 10,

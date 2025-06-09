@@ -1982,7 +1982,7 @@ class EnsembleTrainer:
                 if patience_counter >= patience:
                     break
         best_threshold, best_f1, _ = self.find_optimal_threshold(val_loader,model)
-
+        best_threshold = 0.8
         return model, best_val_loss,best_minority_f1,best_threshold
 
     def train_ensemble(self, train_dataset, val_loader, batch_size, epochs, criterion,
@@ -2014,59 +2014,38 @@ class EnsembleTrainer:
             print(f"Model {i+1}/{self.n_models} trained. Best val loss: {best_val_loss:.4f}, "
                   f"Minority class F1: {minority_f1:.4f}")
 
-    def predict(self, data_loader, minority_weight=1.0):
+    def predict(self, data_loader, threshold=0.5, minority_weight=1.0):
         """
-        Make predictions using weighted majority voting to favor minority class.
-
-        Args:
-            data_loader: DataLoader with test data
-            minority_weight: Weight to apply to minority class predictions (>1 favors minority class)
+        Ensemble predict by averaging class-1 probabilities and
+        thresholding at `threshold`. If minority_weight > 1,
+        we multiply all p(class=1) by that factor before averaging.
         """
-        all_predictions = []
-        all_probabilities = []  # Store probabilities for each model
+        all_model_probs = []  # will be shape (n_models, n_samples)
 
-        # Get predictions and probabilities from each model
+        # 1) Gather per-model p(class=1) for every sample
         for model in self.models:
             model.eval()
-            predictions = []
-            probabilities = []
+            probs_1 = []
 
             with torch.no_grad():
                 for data, _ in data_loader:
                     data = data.to(self.device)
                     outputs = model(data)
-                    probs = F.softmax(outputs, dim=1)
+                    probs = F.softmax(outputs, dim=1)[:, 1]  # take class=1 prob
+                    probs_1.extend(probs.cpu().numpy())
 
-                    # Store both predictions and probabilities
-                    _, preds = torch.max(outputs, 1)
-                    predictions.extend(preds.cpu().numpy())
-                    probabilities.extend(probs.cpu().numpy())
+            all_model_probs.append(probs_1)
 
-            all_predictions.append(predictions)
-            all_probabilities.append(probabilities)
+        # 2) Convert to array and weight the minority class if desired
+        all_model_probs = np.array(all_model_probs)  # shape (n_models, n_samples)
+        if minority_weight != 1.0:
+            all_model_probs *= minority_weight
 
-        # Convert to numpy arrays
-        all_predictions = (np.array(all_predictions) >= np.array(self.best_threshold).mean()).astype(int)
+        # 3) Average across models and threshold
+        avg_probs = all_model_probs.mean(axis=0)  # shape (n_samples,)
+        final_preds = (avg_probs >= threshold).astype(int)
 
-        # all_predictions = np.array(all_predictions)  # shape: [n_models, n_samples]
-
-        # Apply weighted voting
-        final_predictions = []
-        for i in range(all_predictions.shape[1]):  # For each sample
-            # Get predictions for this sample from all models
-            sample_preds = all_predictions[:, i]
-
-            # Weight minority class predictions
-            minority_votes = np.sum(sample_preds == 1)
-            majority_votes = np.sum(sample_preds == 0)
-
-            weighted_minority = minority_votes * minority_weight
-            weighted_majority = majority_votes
-
-            final_pred = 1 if weighted_minority > weighted_majority else 0
-            final_predictions.append(final_pred)
-
-        return np.array(final_predictions)
+        return final_preds
 
     def predict_proba(self, data_loader):
         """
@@ -2093,14 +2072,13 @@ class EnsembleTrainer:
 
     def evaluate(self, test_loader):
         """Evaluate the ensemble"""
-        predictions = self.predict(test_loader)
 
         true_labels = []
         for _, labels in test_loader:
             true_labels.extend(labels.cpu().numpy())
 
         for weight in [1,1.5,2,3]:
-            predictions = self.predict(test_loader, minority_weight=weight)
+            predictions = self.predict(test_loader, minority_weight=weight,threshold=0.9)
 
             results = self._calculate_metrics(true_labels, predictions)
             for k,v in results.items():

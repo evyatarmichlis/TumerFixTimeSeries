@@ -146,22 +146,22 @@ def get_df_for_training(
 ):
     nrows = None  # Read all the rows
     # Original keys for the processed data:
-    orig_pr_data_keys = ['RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_INDEX', 'Pupil_Size',
+    orig_pr_data_keys = ['AILMENT_NUMBER','RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_INDEX', 'Pupil_Size',
                          'CURRENT_FIX_DURATION', 'CURRENT_FIX_INTEREST_AREA_LABEL', 'CURRENT_FIX_COMPONENT_COUNT',
                          'CURRENT_FIX_COMPONENT_INDEX', 'CURRENT_FIX_COMPONENT_DURATION', 'Zones', 'Hit']
     # Original keys for the formatted processed data:
-    orig_f_pr_data_keys = ['RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_COMPONENT_IMAGE_NUMBER',
+    orig_f_pr_data_keys = ['AILMENT_NUMBER','RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_COMPONENT_IMAGE_NUMBER',
                            'CURRENT_FIX_COMPONENT_IMAGE_FILE', 'CURRENT_FIX_INDEX', 'Pupil_Size',
                            'CURRENT_FIX_DURATION', 'CURRENT_FIX_INTEREST_AREA_LABEL', 'CURRENT_FIX_COMPONENT_COUNT',
                            'CURRENT_FIX_COMPONENT_INDEX', 'CURRENT_FIX_COMPONENT_DURATION', 'Zones', 'Hit']
     # Original keys for the categorized processed data:
-    orig_cat_f_data_keys = ['RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_COMPONENT_IMAGE_NUMBER',
+    orig_cat_f_data_keys = ['AILMENT_NUMBER','RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_COMPONENT_IMAGE_NUMBER',
                             'CURRENT_FIX_COMPONENT_IMAGE_FILE', 'CURRENT_FIX_INDEX', 'Pupil_Size',
                             'CURRENT_FIX_DURATION', 'CURRENT_FIX_INTEREST_AREA_LABEL', 'CURRENT_FIX_COMPONENT_COUNT',
                             'CURRENT_FIX_COMPONENT_INDEX', 'CURRENT_FIX_COMPONENT_DURATION', 'Zones', 'Hit',
                             'SCAN_TYPE', 'SLICE_TYPE', 'LOCATION_TYPE']
     # Original keys for the raw data:
-    orig_raw_data_keys = ['RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_INDEX', 'SAMPLE_INDEX',
+    orig_raw_data_keys = ['AILMENT_NUMBER','RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_INDEX', 'SAMPLE_INDEX',
                           'SAMPLE_START_TIME', 'IN_BLINK', 'IN_SACCADE', 'Pupil_Size', 'TARGET_ZONE', 'TARGET_XY',
                           'GAZE_IA', 'GAZE_XY', 'Hit']
     # Original keys for the generalists / experts / med students data:
@@ -210,9 +210,9 @@ def get_df_for_training(
     #     print(f"Column: {col}, Type: {df[col].dtype}, Type Min/Max: {dtype_range(df[col].dtype)}, "
     #           f"Value Min/Max: {df[col].min()}/{df[col].max()}")
 
-    for data_key in ('AILMENT_NUMBER', 'Unnamed: 0'):
-        if data_key in df.keys():  # Undesired data
-            df = df.drop(data_key, axis=1)
+    # for data_key in ('AILMENT_NUMBER', 'Unnamed: 0'):
+    #     if data_key in df.keys():  # Undesired data
+    #         df = df.drop(data_key, axis=1)
 
     df_keys = sorted(list(df.keys()))
     if 'original_index' in df_keys:
@@ -341,7 +341,7 @@ def get_df_for_training(
 
     if not gen_data:
         for key in df.keys():
-            if key in ('CURRENT_FIX_COMPONENT_IMAGE_FILE', 'SCAN_TYPE', 'SLICE_TYPE', 'LOCATION_TYPE'):
+            if key in ('CURRENT_FIX_COMPONENT_IMAGE_FILE', 'SCAN_TYPE', 'SLICE_TYPE', 'LOCATION_TYPE','AILMENT_NUMBER'):
                 continue
             if ((df[key] < 0) & (df[key] != invalid_value)).any():
                 raise ValueError(f'Df at key <{key}> contains negative non invalid_value ({invalid_value}) values')
@@ -634,6 +634,42 @@ def get_df_for_training(
         df = df[df['GROUP'] != group_to_remove]
         print_and_log(f'Len df after - {len(df)}')
         df.reset_index(drop=True, inplace=True)
+    elif approach_num == 15:
+        print_and_log('====================================\n'
+                      'Approach 15.\n'
+                      'Include - normal miss zone,\n'
+                      '          abnormal miss zone,\n'
+                      '          nodule miss zone,\n'
+                      '          nodule surround zone,\n'
+                      '          nodule hit zone\n'
+                      'Exclude - none\n'
+                      'Prediction level - zone type\n'
+                      'Prediction target - any fixation in AILMENT_NUMBER\n'
+                      '                    with nodule hit zone\n'
+                      '====================================\n')
+
+        # First, identify all AILMENT_NUMBERs that contain any NODULE_HIT
+        ailments_with_hits = df[df['LOCATION_TYPE'] == 'NODULE_HIT']['AILMENT_NUMBER'].unique()
+
+        # Remove any invalid values (like -1, NaN, etc.) if they exist
+        ailments_with_hits = ailments_with_hits[ailments_with_hits != -1]  # Assuming -1 is invalid
+        ailments_with_hits = ailments_with_hits[~pd.isna(ailments_with_hits)]  # Remove NaN values
+
+        # Set target to True for all fixations in ailments that have any nodule hits
+        df.loc[:, 'target'] = df['AILMENT_NUMBER'].isin(ailments_with_hits)
+
+        # Log some statistics for verification
+        total_ailments = df['AILMENT_NUMBER'].nunique()
+        ailments_with_hits_count = len(ailments_with_hits)
+        total_positive_fixations = df['target'].sum()
+        total_fixations = len(df)
+
+        print_and_log(f'Statistics for Approach 15:\n'
+                      f'Total unique ailments: {total_ailments}\n'
+                      f'Ailments with nodule hits: {ailments_with_hits_count}\n'
+                      f'Total positive fixations: {total_positive_fixations}\n'
+                      f'Total fixations: {total_fixations}\n'
+                      f'Positive ratio: {total_positive_fixations / total_fixations:.4f}\n')
     else:
         raise ValueError(f'Unsupported approach - {approach_num}')
 

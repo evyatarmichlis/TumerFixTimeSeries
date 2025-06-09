@@ -27,14 +27,14 @@ from representation_method.utils.data_utils import create_dynamic_time_series, s
     create_dynamic_time_series_with_indices
 from representation_method.utils.general_utils import seed_everything
 
-
 TRAIN = True
+
 
 class EyeTrackingDataset(Dataset):
     def __init__(
-        self,
-        tokens: np.ndarray,
-        labels: np.ndarray,
+            self,
+            tokens: np.ndarray,
+            labels: np.ndarray,
     ):
         self.tokens = torch.LongTensor(tokens)
         self.labels = torch.LongTensor(labels)
@@ -47,6 +47,7 @@ class EyeTrackingDataset(Dataset):
             self.tokens[idx],
             self.labels[idx]
         )
+
 
 class EyeTrackingTokenizer:
     def __init__(self, n_bins: int = 20, strategy: str = 'quantile'):
@@ -110,8 +111,6 @@ class IntegratedEyeTrackingTransformer(nn.Module):
             for _ in range(n_features)
         ])
 
-
-
         # Position encoding
         self.pos_embedding = nn.Parameter(torch.randn(1, max_len, d_model))
 
@@ -124,15 +123,7 @@ class IntegratedEyeTrackingTransformer(nn.Module):
 
         # Initialize transformer backbone
         self.transformer = XLNetModel(config)
-        # config = BigBirdConfig.from_pretrained("google/bigbird-roberta-base")
-        # config.hidden_size = d_model
-        # config.num_attention_heads = n_heads
-        # config.num_hidden_layers = n_layers
-        # config.attention_type = "block_sparse"  # BigBird-specific
-        # config.block_size = 64  # Example block size
-        # config.num_random_blocks = 2  # Example random blocks
-        #
-        # self.transformer = BigBirdModel(config)
+
         # Self-supervised head
         self.reconstruction_head = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
@@ -167,15 +158,13 @@ class IntegratedEyeTrackingTransformer(nn.Module):
         hidden_states = outputs.last_hidden_state
         reconstructed = self.reconstruction_head(hidden_states)
 
-
         if output_attentions:
             return reconstructed, outputs.attentions
         return reconstructed
+
+
 def custom_collate(batch):
-    """
-    Custom collate function to handle variable-length target positions.
-    Each element in batch is (tokens, label, sequence_id, target_positions)
-    """
+    """Custom collate function to handle variable-length target positions."""
     tokens, labels = zip(*batch)
     tokens = torch.stack(tokens)
     labels = torch.stack(labels)
@@ -183,53 +172,32 @@ def custom_collate(batch):
 
 
 def random_mask_mse_loss(reconstructed, original, mask_ratio=0.15, mask_strategy='random'):
-    """
-    Create a loss with random masking
-
-    Args:
-    - reconstructed: Reconstructed time series tensor
-    - original: Original time series tensor
-    - mask_ratio: Proportion of time steps to mask
-    - mask_strategy: 'random', 'consecutive', or 'mixed'
-
-    Returns:
-    - Masked Mean Squared Error loss
-    """
+    """Create a loss with random masking"""
     batch_size, seq_len, n_features = original.shape
     mask = torch.zeros_like(original, dtype=torch.float32)
 
     for b in range(batch_size):
         if mask_strategy == 'random':
-            # Completely random masking
             mask_indices = torch.rand(seq_len) < mask_ratio
             mask[b, mask_indices, :] = 1.0
-
         elif mask_strategy == 'consecutive':
-            # Consecutive random masking
             num_masked_steps = int(seq_len * mask_ratio)
             start = random.randint(0, seq_len - num_masked_steps)
             mask[b, start:start + num_masked_steps, :] = 1.0
-
         elif mask_strategy == 'mixed':
-            # Mix of random and consecutive masking
             random_mask_indices = torch.rand(seq_len) < (mask_ratio / 2)
             mask[b, random_mask_indices, :] = 1.0
-
             num_consecutive_steps = int(seq_len * (mask_ratio / 2))
             start = random.randint(0, seq_len - num_consecutive_steps)
             mask[b, start:start + num_consecutive_steps, :] = 1.0
 
-    # Move mask to the same device as reconstructed
     mask = mask.to(reconstructed.device)
-
-    # Compute masked MSE
     squared_error = (reconstructed - original) ** 2
     masked_squared_error = squared_error * mask
-
-    # Compute loss
     loss = masked_squared_error.sum() / (mask.sum() + 1e-8)
-
     return loss
+
+
 def train_self_supervised(
         model: IntegratedEyeTrackingTransformer,
         train_loader: DataLoader,
@@ -241,11 +209,9 @@ def train_self_supervised(
     """Train the model in self-supervised mode"""
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
-    criterion = nn.MSELoss()
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=5
     )
-
 
     best_loss = float('inf')
     patience_counter = 0
@@ -258,7 +224,6 @@ def train_self_supervised(
             windows = batch[0].to(device)
             windows = windows.float()
             reconstructed = model(windows)
-            # loss = criterion(reconstructed, windows)
             loss = random_mask_mse_loss(
                 reconstructed,
                 windows,
@@ -288,6 +253,7 @@ def train_self_supervised(
 
     return model
 
+
 class TargetLocalizer:
     def __init__(self, model, device):
         self.model = model
@@ -297,7 +263,6 @@ class TargetLocalizer:
         """Analyze attention patterns to localize targets"""
         self.model.eval()
         with torch.no_grad():
-
             output = self.model(window_data.to(self.device), output_attentions=True)
             if supervised:
                 attention_scores = output[-1]
@@ -305,9 +270,9 @@ class TargetLocalizer:
                 attention_scores = output[-1][-1]
         return attention_scores.cpu().numpy()
 
-    def localize_targets(self, window_data: torch.Tensor, target_positions, window_start,supervised=False):
+    def localize_targets(self, window_data: torch.Tensor, target_positions, window_start, supervised=False):
         """Return similarity score, actual values, and precision/recall metrics"""
-        attentions = self.analyze_attention(window_data,supervised).squeeze()
+        attentions = self.analyze_attention(window_data, supervised).squeeze()
         avg_attention = attentions.mean(axis=0)
         token_attentions = avg_attention.mean(axis=0)
         seq_len = token_attentions.shape[0]
@@ -320,13 +285,10 @@ class TargetLocalizer:
             'target_locations': target_positions,
         }
 
-        # top_k_indices = heapq.nlargest(len(target_positions), range(len(token_attentions)),
-        #                                token_attentions.__getitem__)
-        top_k_indices = dynamic_topk_by_threshold(token_attentions,1.7)
+        top_k_indices = dynamic_topk_by_threshold(token_attentions, 1.7)
         results["top_k_positions"] = top_k_indices
         results["abs_top_k_positions"] = [idx + window_start for idx in top_k_indices]
         results["abs_target_locations"] = [pos + window_start for pos in target_positions]
-
 
         matched_targets = set()
         matched_predictions = set()
@@ -342,7 +304,6 @@ class TargetLocalizer:
         true_positives = len(matched_targets)
         precision = true_positives / len(top_k_indices) if any(top_k_indices) else 0.0
         recall = true_positives / len(target_positions) if any(target_positions) else 0.0
-
         f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
 
         for target_pos in target_positions:
@@ -356,7 +317,6 @@ class TargetLocalizer:
 
         results["similarity_score"] /= len(target_positions) if len(target_positions) > 0 else 1
 
-        # Add separate metrics to results
         results.update({
             "precision": precision,
             "recall": recall,
@@ -371,40 +331,30 @@ class TargetLocalizer:
 
 def calculate_metrics(df):
     """Calculate confusion matrix metrics from DataFrame containing TP, predictions and targets"""
-
     df['FP'] = df['num_predictions'] - df['true_positives']
     df['FN'] = df['total_targets'] - df['true_positives']
 
-    # Sum counts across windows
     total_TP = df['true_positives'].sum()
     total_FP = df['FP'].sum()
     total_FN = df['FN'].sum()
 
-    # Compute precision, recall, and F1 score
     precision = total_TP / (total_TP + total_FP) if (total_TP + total_FP) > 0 else 0
     recall = total_TP / (total_TP + total_FN) if (total_TP + total_FN) > 0 else 0
     f1_score = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
 
-
     return {'precision': precision, 'recall': recall, 'f1': f1_score}
 
 
-# Use with your DataFrame
-def dynamic_topk_by_threshold(token_attentions: np.ndarray,
-                              std_multiplier: float = 2.0) -> List[int]:
-    """
-    Return indices of all positions whose attention > mean + (std_multiplier * std).
-    """
+def dynamic_topk_by_threshold(token_attentions: np.ndarray, std_multiplier: float = 2.0) -> List[int]:
+    """Return indices of all positions whose attention > mean + (std_multiplier * std)."""
     mean_attn = np.mean(token_attentions)
     std_attn = np.std(token_attentions)
     threshold = mean_attn + std_multiplier * std_attn
-
     top_indices = np.where(token_attentions > threshold)[0].tolist()
     return top_indices
 
 
 def create_dataset(windows, labels, tokenizer, feature_columns):
-
     all_tokens = []
     for window in windows:
         tokens = tokenizer.tokenize(
@@ -415,64 +365,151 @@ def create_dataset(windows, labels, tokenizer, feature_columns):
 
     tokens_array = np.array(all_tokens)
     print(f"Tokenized shape: {tokens_array.shape}")
-
     return EyeTrackingDataset(tokens_array, labels)
 
+
 def z_score_detection(window_df, feature_columns, threshold=3.0):
-    """
-    Detect anomalies based on Z-Score in a given window.
-
-    Args:
-    - window_df: DataFrame containing the features for the window.
-    - feature_columns: List of feature names to consider for Z-Score detection.
-    - threshold: Z-Score threshold for detecting anomalies.
-
-    Returns:
-    - List of indices in the window where anomalies are detected.
-    """
+    """Detect anomalies based on Z-Score in a given window."""
     anomalies = []
     for feature in feature_columns:
-        # Compute rolling mean and standard deviation
         mean = window_df[feature].mean()
-        std = window_df[feature].std() + 1e-8  # Avoid division by zero
+        std = window_df[feature].std() + 1e-8
         z_scores = (window_df[feature] - mean) / std
-
-        # Find indices exceeding the threshold
         anomaly_indices = window_df[z_scores.abs() > threshold].index.tolist()
         anomalies.extend(anomaly_indices)
-    return sorted(set(anomalies))  # Remove duplicates
+    return sorted(set(anomalies))
 
 
-def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  window_size = 100,seed = 0):
-    # Set parameters
-    seed_everything(seed)
+def reconstruct_windows_from_cv_results(cv_results_df, target_fold, window_size=100):
+    """
+    Reconstruct windows from CV results for ensemble positive predictions.
 
+    Args:
+        cv_results_df: DataFrame with CV results
+        target_fold: Which fold to use for evaluation
+        window_size: Size of the sliding window
+
+    Returns:
+        X_windows: Array of window features
+        Y_windows: Array of window labels (ensemble predictions)
+        window_metadata: List of metadata for each window
+    """
+    print(f"Reconstructing windows from CV results for fold {target_fold}")
+
+    # Filter for target fold and test set with positive predictions
+    fold_data = cv_results_df[
+        (cv_results_df['fold'] == target_fold) &
+        (cv_results_df['set'] == 'test') &
+        (cv_results_df['prediction'] == 1)  # FILTER BY ENSEMBLE PREDICTION
+        ].copy()
+
+    if len(fold_data) == 0:
+        print(f"No positive predictions found in fold {target_fold}")
+        return np.array([]), np.array([]), []
+
+    print(f"Found {len(fold_data)} points with positive ensemble predictions in fold {target_fold}")
+
+    # Feature columns (excluding AILMENT_NUMBER)
     feature_columns = [
         'Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X',
-        'CURRENT_FIX_IA_Y', 'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT',
+        'CURRENT_FIX_IA_Y', 'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT'
     ]
+
+    windows = []
+    labels = []
+    metadata = []
+
+    # Group by trial to reconstruct windows
+    for (participant, trial), trial_data in fold_data.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']):
+        trial_data = trial_data.sort_values('point_id')
+
+        # Create sliding windows
+        for start_idx in range(0, len(trial_data) - window_size + 1):
+            end_idx = start_idx + window_size
+            window_points = trial_data.iloc[start_idx:end_idx]
+
+            # Verify this window was predicted as positive by ensemble
+            if window_points['prediction'].iloc[0] == 1:
+
+                # Extract features
+                window_features = window_points[feature_columns].values
+
+                # Get ground truth target positions for evaluation
+                target_positions = []
+                for i, (_, point) in enumerate(window_points.iterrows()):
+                    if point['target'] == True:  # Ground truth target
+                        target_positions.append(i)
+
+                # Store window data
+                windows.append(window_features)
+                labels.append(1)  # All these windows were predicted as positive
+
+                metadata.append({
+                    'participant_id': participant,
+                    'trial_id': trial,
+                    'window_start': window_points['point_id'].iloc[0],
+                    'window_end': window_points['point_id'].iloc[-1],
+                    'relative_target_positions': target_positions,
+                    'ensemble_probability': window_points['probability'].iloc[0],
+                    'has_ground_truth_targets': len(target_positions) > 0
+                })
+
+    X_windows = np.array(windows) if windows else np.array([])
+    Y_windows = np.array(labels) if labels else np.array([])
+
+    print(f"Reconstructed {len(X_windows)} windows from ensemble positive predictions")
+    print(f"Windows with ground truth targets: {sum(1 for m in metadata if m['has_ground_truth_targets'])}")
+
+    return X_windows, Y_windows, metadata
+
+
+def find_attention_from_cv_results(cv_results_path, participant_id, target_fold=0, window_size=100, seed=0):
+    """
+    Modified version that reads from CV results instead of original CSV.
+    Filters by ensemble predictions (pred == 1) instead of ground truth (target == 1).
+    """
+    seed_everything(seed)
+
+    print(f"Loading CV results from: {cv_results_path}")
+    cv_results_df = pd.read_csv(cv_results_path)
+
+    # Feature columns (excluding AILMENT_NUMBER)
+    feature_columns = [
+        'Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X',
+        'CURRENT_FIX_IA_Y', 'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT'
+    ]
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    method_dir = os.path.join('results', f'self_supervised_transformer_participant_{participant_id}_window_size_{window_size}')
+    method_dir = os.path.join('results',
+                              f'self_supervised_from_cv_participant_{participant_id}_fold_{target_fold}_window_size_{window_size}')
     os.makedirs(method_dir, exist_ok=True)
-    print(f"window_size is {window_size}")
 
+    print(f"Window size: {window_size}")
+    print(f"Target fold: {target_fold}")
 
-    X_all, Y_all, window_metadata = create_dynamic_time_series_with_indices(
-        df, feature_columns=feature_columns, window_size=window_size)
-    feature_columns+= ['diff_pupil', 'diff_fix_duration']
-    if filter_targets:
-        target_mask = Y_all == 1
-        X_all = X_all[target_mask]
-        window_metadata = [meta for i, meta in enumerate(window_metadata) if target_mask[i]]
-        Y_all = Y_all[target_mask]
+    # Reconstruct windows from CV results (filtered by ensemble predictions)
+    X_all, Y_all, window_metadata = reconstruct_windows_from_cv_results(
+        cv_results_df, target_fold, window_size
+    )
 
+    if len(X_all) == 0:
+        print("No windows found with positive ensemble predictions!")
+        return
+
+    # Add differential features if needed
+    # feature_columns += ['diff_pupil', 'diff_fix_duration']
+
+    # Create tokenizer and fit on the data
     tokenizer = EyeTrackingTokenizer()
     X_all_flat = X_all.reshape(-1, X_all.shape[-1])
     X_all_df = pd.DataFrame(X_all_flat, columns=feature_columns)
     tokenizer.fit(X_all_df, feature_columns)
-    all_dataset = create_dataset(X_all,Y_all,tokenizer,feature_columns)
-    dataloader = DataLoader(all_dataset, batch_size=32, shuffle=True,collate_fn=custom_collate)
 
+    # Create dataset and dataloader
+    all_dataset = create_dataset(X_all, Y_all, tokenizer, feature_columns)
+    dataloader = DataLoader(all_dataset, batch_size=32, shuffle=True, collate_fn=custom_collate)
+
+    # Create model
     model = IntegratedEyeTrackingTransformer(
         vocab_size=tokenizer.vocab_size,
         n_features=len(feature_columns),
@@ -480,9 +517,11 @@ def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  w
         max_len=window_size,
         pretrained_model='xlnet-base-cased'
     )
-    best_model_path =os.path.join(method_dir, "model.pth")
+
+    best_model_path = os.path.join(method_dir, "model.pth")
 
     if TRAIN:
+        print("Training self-supervised model on ensemble positive predictions...")
         model = train_self_supervised(
             model=model,
             train_loader=dataloader,
@@ -497,27 +536,32 @@ def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  w
         }
         torch.save(save_dict, best_model_path)
     else:
+        print("Loading existing model...")
         checkpoint = torch.load(best_model_path)
         model.load_state_dict(checkpoint['model_state_dict'])
 
     model = model.to(device)
     localizer = TargetLocalizer(model, device)
-    total_precision = 0
-    total_recall = 0
-    total_f1 = 0
-    total_windows = 0
+
+    # Evaluate target localization
+    print("\nEvaluating target localization on ensemble positive windows...")
     all_results = []
     total_z_score_precision = 0
     total_z_score_recall = 0
     total_z_score_f1 = 0
     total_z_score_windows = 0
-    print("\nEvaluating target localization...")
+
     for i, (window, meta) in enumerate(zip(X_all, window_metadata)):
+        if i % 100 == 0:
+            print(f"Processing window {i + 1}/{len(X_all)}")
+
         window_2d = window.squeeze()
         window_df = pd.DataFrame(window_2d, columns=feature_columns)
         tokenized_window = tokenizer.tokenize(window_df, feature_columns)
         window_tensor = torch.tensor(tokenized_window, dtype=torch.long).unsqueeze(0)
-        if len(meta['relative_target_positions'])>0:
+
+        # Only evaluate if there are ground truth targets in this window
+        if len(meta['relative_target_positions']) > 0:
             results = localizer.localize_targets(
                 window_tensor,
                 meta['relative_target_positions'],
@@ -526,43 +570,52 @@ def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  w
 
             results['participant_id'] = meta['participant_id']
             results['trial_id'] = meta['trial_id']
+            results['ensemble_probability'] = meta['ensemble_probability']
+
+            # Z-score detection for comparison
             z_score_anomalies = z_score_detection(window_df, feature_columns)
             z_score_target_matches = sum(
                 1 for target in meta['relative_target_positions']
-                if any(abs(target - anomaly) <= 5 for anomaly in z_score_anomalies)  # Tolerance of 5 timesteps
+                if any(abs(target - anomaly) <= 5 for anomaly in z_score_anomalies)
             )
 
             z_score_precision = z_score_target_matches / len(z_score_anomalies) if z_score_anomalies else 0.0
             z_score_recall = z_score_target_matches / len(meta['relative_target_positions']) if len(
                 meta['relative_target_positions']) > 0 else 0.0
-            z_score_f1 = 2 * (z_score_precision * z_score_recall) / (z_score_precision + z_score_recall) if (z_score_precision + z_score_recall) > 0 else 0.0
-            # Add Z-Score results to the results dictionary
+            z_score_f1 = 2 * (z_score_precision * z_score_recall) / (z_score_precision + z_score_recall) if (
+                                                                                                                        z_score_precision + z_score_recall) > 0 else 0.0
+
             results.update({
                 'z_score_anomalies': z_score_anomalies,
                 'z_score_precision': z_score_precision,
                 'z_score_recall': z_score_recall,
                 'z_score_f1': z_score_f1
             })
+
             total_z_score_precision += z_score_precision
             total_z_score_recall += z_score_recall
             total_z_score_f1 += z_score_f1
             total_z_score_windows += 1
+
             all_results.append(results)
-            total_precision += results['precision']
-            total_recall += results['recall']
-            total_f1 += results['f1_score']
-            total_windows += 1
 
+    if len(all_results) == 0:
+        print("No windows with ground truth targets found for evaluation!")
+        return
 
+    # Save and analyze results
     target_pick_method = 'threshold'
     all_results_df = pd.DataFrame(all_results)
     all_results_df.to_csv(os.path.join(method_dir, f'{target_pick_method}_attention.csv'))
+
     print('############ percent similarity_score ############')
     print(all_results_df['similarity_score'].mean())
+
     metrics = calculate_metrics(all_results_df)
-    for k,v in metrics.items():
+    for k, v in metrics.items():
         print(f'############ {k} ############')
         print(f'$$$$$$$$$$$$ {v} $$$$$$$$$$$$')
+
     if total_z_score_windows > 0:
         avg_z_score_precision = total_z_score_precision / total_z_score_windows
         avg_z_score_recall = total_z_score_recall / total_z_score_windows
@@ -572,17 +625,22 @@ def find_attention(df, participant_id='1', filter_targets=True,tolerance = 5,  w
         print(f"Z-Score Precision: {avg_z_score_precision:.4f}")
         print(f"Z-Score Recall: {avg_z_score_recall:.4f}")
         print(f"Z-Score F1-Score: {avg_z_score_f1:.4f}")
-    else:
-        print("\nNo windows with Z-Score results to calculate averages.")
+
+    # Create visualizations
     sns.histplot(data=all_results_df, x='similarity_score', bins=10, kde=True)
     plt.xlabel('Percent Coincidences')
     plt.ylabel('Count')
     plt.title('Distribution of Percent Coincidences')
     plt.savefig(os.path.join(method_dir, f'similarity_score.png'))
-    plt.plot()
+    plt.close()
+
     windows_voting(all_results_df, method_dir)
 
-def windows_voting(all_results_df,method_dir):
+    print(f"\nResults saved to: {method_dir}")
+
+
+def windows_voting(all_results_df, method_dir,suffix = ''):
+    """Same as original windows_voting function"""
     required_columns = ['participant_id', 'trial_id', 'abs_top_k_positions', 'abs_target_locations']
     for col in required_columns:
         if col not in all_results_df.columns:
@@ -619,8 +677,6 @@ def windows_voting(all_results_df,method_dir):
                 grouped_results[scan_id]['predictions'][position] += 1
 
     tolerance = 10
-
-
     agreement_thresholds = np.arange(0.1, 1.0, 0.1)
     threshold_results = []
 
@@ -640,7 +696,6 @@ def windows_voting(all_results_df,method_dir):
                 [position for position, agreement in position_agreement.items() if agreement >= agreement_threshold]
             )
 
-            # Match predictions to ground truth
             matched_predictions = set()
             matched_ground_truth = set()
 
@@ -700,54 +755,47 @@ def windows_voting(all_results_df,method_dir):
     plt.title("Precision, Recall, and F1 Score over Voting Agreement Thresholds")
     plt.xlabel("Voting Agreement Threshold (%)")
     plt.ylabel("Metric Value")
-    plt.ylim(0, 1.1)  # Ensure metrics range between 0 and 1
+    plt.ylim(0, 1.1)
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
 
-    plot_path = os.path.join(method_dir, 'voting_threshold_metrics.png')
+    plot_path = os.path.join(method_dir, f'voting_threshold_metrics_{suffix}.png')
     plt.savefig(plot_path)
     print(f"Plot saved to: {plot_path}")
 
-    threshold_csv_path = os.path.join(method_dir, 'voting_threshold_metrics.csv')
+    threshold_csv_path = os.path.join(method_dir, f'voting_threshold_metrics_{suffix}.csv')
     threshold_df.to_csv(threshold_csv_path, index=False)
     print(f"Threshold results saved to: {threshold_csv_path}")
 
 
-
-
 if __name__ == "__main__":
-    participant_id = 37
-    seed = 1
+    participant_id = 1
+    target_fold = 0  # Which fold to use for evaluation
+    seed = 0
+
     try:
 
-        config = DataConfig(
-            data_path='data/Categorized_Fixation_Data_1_18.csv',
-            approach_num=8,
-            normalize=True,
-            per_slice_target=True,
-            participant_id=participant_id
+        # MODIFIED: Read from CV results instead of original CSV
+        cv_results_path =  Path(__file__).parent.parent/"outputs"/f"participant_{participant_id}"/"all_folds_results.csv"
+
+        # Check if CV results file exists
+        if not os.path.exists(cv_results_path):
+            raise FileNotFoundError(f"CV results file not found: {cv_results_path}")
+
+        print(f"Using CV results from: {cv_results_path}")
+
+        # Run self-supervised transformer on ensemble positive predictions
+        find_attention_from_cv_results(
+            cv_results_path=cv_results_path,
+            participant_id=participant_id,
+            target_fold=target_fold,
+            window_size=100,
+            seed=seed
         )
 
-        df = load_eye_tracking_data(
-            data_path=config.data_path,
-            approach_num=config.approach_num,
-            participant_id=config.participant_id,
-            data_format="legacy"
-        )
-        find_attention(df, window_size=150,participant_id=str(participant_id))
     except Exception as e:
-        print(e)
+        print(f"Error: {e}")
+        import traceback
 
-
-# ############ precision ############
-# $$$$$$$$$$$$ 0.37025097245164384 $$$$$$$$$$$$
-# ############ recall ############
-# $$$$$$$$$$$$ 0.5909342177998894 $$$$$$$$$$$$
-# ############ f1 ############
-# $$$$$$$$$$$$ 0.4552587181209153 $$$$$$$$$$$$
-#
-# Average Z-Score Metrics:
-# Z-Score Precision: 0.4623
-# Z-Score Recall: 0.2698
-# Z-Score F1-Score: 0.2208
+        traceback.print_exc()

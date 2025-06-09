@@ -271,7 +271,7 @@ class TimeSeriesDataLoader(BaseDataLoader):
 
         # Drop unnecessary columns
         columns_to_drop = [
-            'AILMENT_NUMBER', 'TARGET_ZONE', 'TARGET_XY', 'GAZE_XY',
+            'TARGET_ZONE', 'TARGET_XY', 'GAZE_XY',
             'CURRENT_IMAGE', 'IN_SACCADE', 'Hit', 'GAZE_IA_X', 'GAZE_IA_Y'
         ]
         existing_columns_to_drop = [col for col in columns_to_drop if col in df.columns]

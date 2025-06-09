@@ -49,7 +49,7 @@ def create_fold_assignments(df, n_folds=5, seed=42):
 def process_participant(participant_id, n_folds=5, window_size=100, seed=42):
     """
     Process a single participant's data with cross-validation.
-    Preserves all original data points with their test/train status and predictions.
+    Preserves all original data points with their test/train status, predictions, and AILMENT_NUMBER.
 
     Args:
         participant_id: ID of the participant to process
@@ -65,9 +65,11 @@ def process_participant(participant_id, n_folds=5, window_size=100, seed=42):
     os.makedirs(output_dir, exist_ok=True)
 
     # Load the participant's data
+    csv_path = Path(__file__).parent.parent / "fwd_data" / 'Nodule_Categorized_Fixation_Data_1_18.csv'
+
     config = DataConfig(
-        data_path='data/Categorized_Fixation_Data_1_18.csv',
-        approach_num=6,
+        data_path=str(csv_path),
+        approach_num=15,
         normalize=True,
         per_slice_target=True,
         participant_id=participant_id
@@ -119,7 +121,6 @@ def process_participant(participant_id, n_folds=5, window_size=100, seed=42):
 
         print(f"Training data: {len(train_df)} points, Test data: {len(test_df)} points")
 
-        # Create sliding windows for the model
         train_windows, train_labels, train_point_indices = create_windows_with_indices(
             train_df, window_size=window_size)
         test_windows, test_labels, test_point_indices = create_windows_with_indices(
@@ -196,7 +197,8 @@ def process_participant(participant_id, n_folds=5, window_size=100, seed=42):
             print(f"  F1 Score: {f1:.4f}")
             print(f"  Precision: {precision:.4f}")
             print(f"  Recall: {recall:.4f}")
-
+            cm = confusion_matrix(test_labels, test_preds)
+            print(f"Confusion Matrix: {cm}")
             # Store metrics
             fold_metrics.append({
                 'fold': fold,
@@ -236,13 +238,13 @@ def process_participant(participant_id, n_folds=5, window_size=100, seed=42):
             test_df['fold'] = fold
             train_df['fold'] = fold
 
-            # Combine results
+            # Combine results - this preserves all original columns including AILMENT_NUMBER
             fold_df = pd.concat([train_df, test_df])
 
             # Store in the results dictionary
             fold_results[fold] = fold_df
 
-            # Save to CSV
+            # Save to CSV - this will include AILMENT_NUMBER
             fold_df.to_csv(f"{output_dir}/fold_{fold}_results.csv", index=False)
 
         except Exception as e:
@@ -253,6 +255,7 @@ def process_participant(participant_id, n_folds=5, window_size=100, seed=42):
     all_results = pd.concat([fold_results[fold] for fold in range(n_folds) if not fold_results[fold].empty])
 
     # Create a "combined" dataframe that includes all points with their fold assignments
+    # This will automatically include AILMENT_NUMBER since it's in the original columns
     combined_df = all_results[original_columns + ['fold', 'set', 'prediction', 'probability']]
     combined_df.to_csv(f"{output_dir}/all_folds_results.csv", index=False)
 
@@ -288,18 +291,20 @@ def process_participant(participant_id, n_folds=5, window_size=100, seed=42):
 def create_windows_with_indices(df, feature_columns=None, window_size=100):
     """
     Create windows from dataframe while keeping track of original data point indices.
+    AILMENT_NUMBER is not included in the features but is preserved in the original dataframe.
 
     Args:
-        df: DataFrame with eye tracking data
-        feature_columns: List of feature columns to use
+        df: DataFrame with eye tracking data (includes AILMENT_NUMBER)
+        feature_columns: List of feature columns to use for training (excludes AILMENT_NUMBER)
         window_size: Size of the sliding window
 
     Returns:
-        windows: Array of shape [n_windows, window_size, n_features]
+        windows: Array of shape [n_windows, window_size, n_features] (only training features)
         labels: Array of shape [n_windows]
         point_indices: List of lists containing the original point indices for each window
     """
     if feature_columns is None:
+        # Define feature columns for training - explicitly exclude AILMENT_NUMBER
         feature_columns = [
             'Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X',
             'CURRENT_FIX_IA_Y', 'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT'
@@ -324,7 +329,7 @@ def create_windows_with_indices(df, feature_columns=None, window_size=100):
             end_idx = start_idx + window_size
             window = trial_df.iloc[start_idx:end_idx]
 
-            # Extract features for this window
+            # Extract ONLY the training features for this window (excludes AILMENT_NUMBER)
             window_features = window[feature_columns].values
 
             # Check if this window contains a target
@@ -348,13 +353,13 @@ def main():
     all_participant_metrics = []
 
     # Process each participant
-    for participant_id in range(1, 40):
+    for participant_id in range(1, 2):
         try:
             avg_metrics = process_participant(
                 participant_id=participant_id,
                 n_folds=5,
                 window_size=100,
-                seed=42
+                seed=0
             )
 
             if avg_metrics:
@@ -394,3 +399,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    # Approach 15
+    # Participant 1 Average Metrics:
+    #   Accuracy: 0.3571 ± 0.0423
+    #   F1 Score: 0.2680 ± 0.0541
+    #   Precision: 0.1644 ± 0.0427
+    #   Recall: 0.7919 ± 0.1176
