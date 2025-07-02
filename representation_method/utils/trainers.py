@@ -2041,7 +2041,6 @@ class EnsembleTrainer:
         if minority_weight != 1.0:
             all_model_probs *= minority_weight
 
-        # 3) Average across models and threshold
         avg_probs = all_model_probs.mean(axis=0)  # shape (n_samples,)
         final_preds = (avg_probs >= threshold).astype(int)
 
@@ -2098,9 +2097,12 @@ class EnsembleTrainer:
             print(k)
             print(v)
         cm= confusion_matrix(true_labels,predictions)
-        print(cm)
         report = classification_report(true_labels, predictions)
-
+        print(report)
+        print("\nConfusion Matrix:\n")
+        print("   Predicted 0  Predicted 1\n")
+        print(f"Actual 0   {cm[0, 0]:<10} {cm[0, 1]:<10}\n")
+        print(f"Actual 1   {cm[1, 0]:<10} {cm[1, 1]:<10}\n")
         if self.save_path:
             with open(os.path.join(self.save_path, 'evaluation_results.txt'), 'w') as f:
                 f.write("Classification Report:\n")

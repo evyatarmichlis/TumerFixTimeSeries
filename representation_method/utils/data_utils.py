@@ -290,6 +290,83 @@ def create_dynamic_time_series_with_metadata(df, feature_columns=None, window_si
     return np.array(windows), np.array(labels), metadata
 
 
+def create_dynamic_time_series_with_ailment(df, feature_columns, window_size=100,window_step=1):
+    """
+    Modified version that tracks AILMENT_NUMBER in metadata (POST-PROCESSING ONLY)
+    AILMENT_NUMBER is NOT used for training - only for evaluation tracking
+
+    Returns:
+        windows: Array of window features (for training)
+        labels: Array of window labels (for training)
+        metadata: List of metadata dicts containing ailment positions (for post-processing)
+        ailment_locations: Array of ailment positions per window (similar to target_locations)
+    """
+    windows = []
+    labels = []
+    metadata = []
+    ailment_locations = []  # New: track ailment positions like target_locations
+
+    # Process each trial
+    for (participant_id, trial_id), trial_df in df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX']):
+        trial_length = len(trial_df)
+        trial_df = trial_df.reset_index(drop=True)
+
+        for start_idx in range(0, trial_length - window_size + 1,window_step):
+            end_idx = start_idx + window_size
+            window = trial_df.iloc[start_idx:end_idx]
+
+            # Extract target information (for training labels)
+            target_array = window['target'].values
+            window_target_positions = np.where(target_array == 1)[0]
+
+            # Extract window features (ONLY the specified feature columns - NO AILMENT_NUMBER)
+            window_features = window[feature_columns].values
+
+            # POST-PROCESSING ONLY: Track AILMENT_NUMBER information for evaluation
+            # This is NOT used for training, only for measuring performance
+            ailment_numbers = window['AILMENT_NUMBER'].values if 'AILMENT_NUMBER' in window.columns else np.array([])
+
+            # Find positions where ailments occur (relative to window start)
+            window_ailment_positions = np.where(ailment_numbers != -1)[0]
+
+            # Get unique ailments and their details
+            valid_ailments = ailment_numbers[ailment_numbers != -1] if len(ailment_numbers) > 0 else np.array([])
+            unique_ailments = list(set(valid_ailments)) if len(valid_ailments) > 0 else []
+
+            # Store window data (features only - no ailment info)
+            windows.append(window_features)
+            labels.append(int(len(window_target_positions) > 0))
+            ailment_locations.append(window_ailment_positions)  # Store ailment positions like target_locations
+
+            # Store detailed metadata including AILMENT_NUMBER info (for post-processing evaluation only)
+            window_meta = {
+                'participant_id': participant_id,
+                'trial_id': trial_id,
+                'window_start_idx': start_idx,
+                'window_end_idx': end_idx,
+                'target_positions': window_target_positions.tolist(),
+                'has_target': int(len(window_target_positions) > 0),
+                # POST-PROCESSING EVALUATION DATA (not used in training):
+                'ailment_positions': window_ailment_positions.tolist(),  # Positions where ailments occur
+                'ailment_numbers': unique_ailments,  # Unique ailments in this window
+                'has_valid_ailment': len(unique_ailments) > 0,
+                'ailment_details': []  # Detailed info about each ailment position
+            }
+
+            # POST-PROCESSING: Find detailed info for each ailment occurrence (for evaluation only)
+            for pos, ailment in enumerate(ailment_numbers):
+                if ailment != -1:
+                    window_meta['ailment_details'].append({
+                        'relative_position': pos,  # Position within window (0 to window_size-1)
+                        'absolute_position': start_idx + pos,  # Position in original trial
+                        'ailment_number': str(ailment)
+                    })
+
+            metadata.append(window_meta)
+
+    return np.array(windows), np.array(labels), metadata, np.array(ailment_locations, dtype=object)
+
+
 def create_dynamic_time_series(df: pd.DataFrame, feature_columns=None, save_dir=None,
                                load_existing=False, participant_id=1, split_type='train',
                                window_size=10, pad_value=0):
@@ -639,7 +716,7 @@ def split_train_test_for_time_series(df, input_columns= None, target_column='tar
 
     if input_columns is None:
         input_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X', 'CURRENT_FIX_IA_Y',
-                   'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT']
+                   'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT',"AILMENT_NUMBER"]
 
     df['group'] = df[split_columns].apply(
         lambda row: '_'.join(row.values.astype(str)), axis=1

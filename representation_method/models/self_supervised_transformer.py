@@ -270,8 +270,9 @@ class TargetLocalizer:
                 attention_scores = output[-1][-1]
         return attention_scores.cpu().numpy()
 
-    def localize_targets(self, window_data: torch.Tensor, target_positions, window_start, supervised=False):
-        """Return similarity score, actual values, and precision/recall metrics"""
+    def localize_targets(self, window_data: torch.Tensor, target_positions,
+                                                        window_start, window_metadata, supervised=False):
+        """Enhanced version that tracks ailment positions alongside target positions"""
         attentions = self.analyze_attention(window_data, supervised).squeeze()
         avg_attention = attentions.mean(axis=0)
         token_attentions = avg_attention.mean(axis=0)
@@ -290,9 +291,10 @@ class TargetLocalizer:
         results["abs_top_k_positions"] = [idx + window_start for idx in top_k_indices]
         results["abs_target_locations"] = [pos + window_start for pos in target_positions]
 
+        # Original target matching logic
         matched_targets = set()
         matched_predictions = set()
-        tolerance = 10
+        tolerance = 0
 
         for pred_pos in top_k_indices:
             for target_idx, target_pos in enumerate(target_positions):
@@ -306,6 +308,7 @@ class TargetLocalizer:
         recall = true_positives / len(target_positions) if any(target_positions) else 0.0
         f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
 
+        # Calculate similarity score
         for target_pos in target_positions:
             min_distance = float('inf')
             for attention_argmax in top_k_indices:
@@ -317,16 +320,76 @@ class TargetLocalizer:
 
         results["similarity_score"] /= len(target_positions) if len(target_positions) > 0 else 1
 
+        # NEW: Ailment tracking logic
+        ailment_results = self.track_ailments_in_predictions(
+            top_k_indices, window_metadata, tolerance=tolerance
+        )
+
         results.update({
             "precision": precision,
             "recall": recall,
             "f1_score": f1,
             "true_positives": true_positives,
             "num_predictions": len(top_k_indices),
-            "num_targets": len(target_positions)
+            "num_targets": len(target_positions),
+            # Add ailment tracking results
+            **ailment_results
         })
 
         return results
+
+    def track_ailments_in_predictions(self,predicted_positions, window_metadata, tolerance=1):
+        """
+        Track which ailments are found by the model's predictions within a window
+
+        Args:
+            predicted_positions: List of positions where model predicts targets
+            window_metadata: Metadata containing ailment information for this window
+            tolerance: Tolerance for matching predicted positions to ailment positions
+
+        Returns:
+            Dictionary with ailment tracking results
+        """
+        ailment_results = {
+            'ailments_in_window': set(),
+            'ailments_found_by_model': set(),
+            'ailment_positions_found': [],
+            'total_ailment_positions_in_window': 0,
+            'ailment_positions_matched': 0,
+            'ailment_detection_success': False
+        }
+
+        # Extract ailment information from metadata
+        if not window_metadata.get('has_valid_ailment', False):
+            return ailment_results
+
+        ailment_positions = window_metadata.get('ailment_positions', [])
+        ailment_numbers = window_metadata.get('ailment_numbers', [])
+        ailment_details = window_metadata.get('ailment_details', [])
+
+        # Track all ailments present in this window
+        ailment_results['ailments_in_window'] = set(ailment_numbers)
+        ailment_results['total_ailment_positions_in_window'] = len(ailment_positions)
+
+        # Check which ailment positions are matched by model predictions
+        matched_ailment_positions = set()
+        found_ailments = set()
+
+        for pred_pos in predicted_positions:
+            for i, ailment_pos in enumerate(ailment_positions):
+                if abs(pred_pos - ailment_pos) <= tolerance:
+                    matched_ailment_positions.add(ailment_pos)
+                    for detail in ailment_details:
+                        if detail['relative_position'] == ailment_pos:
+                            found_ailments.add(detail['ailment_number'])
+                            break
+
+        ailment_results['ailment_positions_matched'] = len(matched_ailment_positions)
+        ailment_results['ailments_found_by_model'] = found_ailments
+        ailment_results['ailment_positions_found'] = list(matched_ailment_positions)
+        ailment_results['ailment_detection_success'] = len(found_ailments) > 0
+
+        return ailment_results
 
 
 def calculate_metrics(df):
@@ -345,13 +408,19 @@ def calculate_metrics(df):
     return {'precision': precision, 'recall': recall, 'f1': f1_score}
 
 
-def dynamic_topk_by_threshold(token_attentions: np.ndarray, std_multiplier: float = 2.0) -> List[int]:
-    """Return indices of all positions whose attention > mean + (std_multiplier * std)."""
-    mean_attn = np.mean(token_attentions)
-    std_attn = np.std(token_attentions)
-    threshold = mean_attn + std_multiplier * std_attn
-    top_indices = np.where(token_attentions > threshold)[0].tolist()
-    return top_indices
+def dynamic_topk_by_threshold(attns: np.ndarray,
+                              std_multiplier: float = 2.0,
+                              fallback_k: int = 3) -> List[int]:
+    """
+    Return indices above mean+multiplier*std; if none, return top `fallback_k`.
+    """
+    mean_attn = np.mean(attns)
+    std_attn  = np.std(attns)
+    thresh    = mean_attn + std_multiplier * std_attn
+    idxs      = np.where(attns > thresh)[0]
+    if len(idxs) == 0:
+         idxs = np.argsort(attns)[-fallback_k:]
+    return idxs.tolist()
 
 
 def create_dataset(windows, labels, tokenizer, feature_columns):
