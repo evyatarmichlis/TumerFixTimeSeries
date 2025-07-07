@@ -400,6 +400,10 @@ def explore_data(selected_features, feature_to_test):
 csv_path = Path(__file__).parent.parent / "EKG data" / "ML_ECG_Data.csv"
 df = pd.read_csv(csv_path, engine='python', on_bad_lines='skip')
 df['target'] = np.where(df['LOCATION_TYPE'] == 'MI_HIT', 1, 0)
+df = df[df['RECORDING_SESSION_LABEL'] == 'P001']
+
+print(df.columns)
+quit(1)
 # Load the participant's data
 # config = DataConfig(
 #     data_path='data/Categorized_Fixation_Data_1_18.csv',
@@ -416,7 +420,6 @@ df['target'] = np.where(df['LOCATION_TYPE'] == 'MI_HIT', 1, 0)
 #     data_format="legacy"
 # )
 
-df = df[df['RECORDING_SESSION_LABEL'] == 'P001']
 
 # Filter rows: keep only those where CURRENT_FIX_INTEREST_AREA_LABEL is a number between 1 and 15
 # df = df[df['CURRENT_FIX_INTEREST_AREA_LABEL'].apply(lambda x: str(x).isdigit())]

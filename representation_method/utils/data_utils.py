@@ -716,7 +716,9 @@ def split_train_test_for_time_series(df, input_columns= None, target_column='tar
 
     if input_columns is None:
         input_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X', 'CURRENT_FIX_IA_Y',
-                   'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT',"AILMENT_NUMBER"]
+                   'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT',"AILMENT_NUMBER",'rolling_mean_10',
+    'rolling_std_10',
+    'signal_derivative']
 
     df['group'] = df[split_columns].apply(
         lambda row: '_'.join(row.values.astype(str)), axis=1

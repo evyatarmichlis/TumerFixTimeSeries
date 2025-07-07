@@ -1810,6 +1810,40 @@ class EnsembleTrainer:
         self.best_val_losses = []
         self.best_threshold = []
 
+    def find_best_threshold(self, val_loader):
+        """
+        Find the best prediction threshold by evaluating on a validation set.
+        """
+        print("Finding best threshold on validation set...")
+        all_probs = []
+        all_labels = []
+
+        for model in self.models:
+            model.eval()
+
+        with torch.no_grad():
+            for data, target in val_loader:
+                data = data.to(self.device)
+                # Get probabilities for the positive class (class 1)
+                # We average the probabilities from all models in the ensemble
+                batch_probs = torch.stack([torch.softmax(model(data), dim=1)[:, 1] for model in self.models]).mean(
+                    dim=0)
+                all_probs.extend(batch_probs.cpu().numpy())
+                all_labels.extend(target.cpu().numpy())
+
+        best_f1 = 0
+        best_threshold = 0.5
+        thresholds = np.arange(0.1, 1.0, 0.05)
+
+        for threshold in thresholds:
+            preds = (np.array(all_probs) > threshold).astype(int)
+            f1 = f1_score(all_labels, preds, zero_division=0)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_threshold = threshold
+
+        print(f"Best threshold found: {best_threshold:.2f} with F1 score: {best_f1:.4f}")
+        return best_threshold
     def create_weighted_loader(self, dataset, batch_size, majority_weight=0.5):
         """Create a DataLoader with weighted sampling (lower weight for majority class)"""
         # Extract labels from TensorDataset

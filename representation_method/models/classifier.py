@@ -100,6 +100,47 @@ class TimeSeriesTransformer(nn.Module):
 
         return x
 
+class GradientLocalizer:
+    def __init__(self, model, device):
+        """
+        Localizes the most important row in a window using gradient saliency.
+
+        Args:
+            model: The trained Stage 1 model (a single model from your ensemble).
+            device: The torch device ('cuda' or 'cpu').
+        """
+        self.model = model.to(device)
+        self.model.eval()
+        self.device = device
+
+    def localize_target(self, window_tensor):
+        """
+        Finds the index of the most salient row in a given window.
+
+        Args:
+            window_tensor: A single window tensor of shape (1, num_features, window_size).
+                           It should be scaled and ready for the model.
+
+        Returns:
+            The index (0, 1, or 2 for window_size=3) of the most likely target row.
+        """
+        window_tensor = window_tensor.to(self.device)
+
+        window_tensor.requires_grad = True
+
+        output = self.model(window_tensor)
+        positive_class_score = output[0, 1]
+
+        positive_class_score.backward()
+
+        saliency = window_tensor.grad.data.abs()
+
+
+        saliency_scores = saliency.sum(dim=1).squeeze(0)
+
+        predicted_index = torch.argmax(saliency_scores).item()
+
+        return predicted_index
 
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, dilation=1):
@@ -221,6 +262,48 @@ class ComplexCNNClassifier(nn.Module):
         x = self.dropout(x)
         x = self.fc(x)  # (B, 2)
         return x
+class CNN1DModel(nn.Module):
+    def __init__(self, input_dim, window_size, output_classes=2):
+        """
+        A robust 1D CNN model that uses Adaptive Pooling to handle
+        various window sizes without crashing.
+        """
+        super(CNN1DModel, self).__init__()
+
+        # We don't need window_size for the architecture anymore, but it's good practice to keep it
+        self.window_size = window_size
+
+        self.conv_block1 = nn.Sequential(
+            nn.Conv1d(in_channels=input_dim, out_channels=32, kernel_size=3, padding=1),
+            nn.BatchNorm1d(32),  # BatchNorm helps stabilize training
+            nn.ReLU(),
+            nn.AdaptiveMaxPool1d(output_size=16)  # Guarantees output length is 16
+        )
+
+        self.conv_block2 = nn.Sequential(
+            nn.Conv1d(in_channels=32, out_channels=64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.AdaptiveMaxPool1d(output_size=8)  # Guarantees output length is 8
+        )
+
+        # The flattened size is now predictable and fixed, regardless of window_size
+        flattened_size = 64 * 8
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(flattened_size, 128),
+            nn.ReLU(),
+            nn.Dropout(0.5),  # Increased dropout for more regularization
+            nn.Linear(128, output_classes)
+        )
+
+    def forward(self, x):
+        # Input x has shape (batch_size, input_dim, window_size)
+        out = self.conv_block1(x)
+        out = self.conv_block2(out)
+        out = self.classifier(out)
+        return out
 
 
 class CombinedModel(nn.Module):
