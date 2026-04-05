@@ -315,6 +315,16 @@ def create_dynamic_time_series_with_ailment(df, feature_columns, window_size=100
             end_idx = start_idx + window_size
             window = trial_df.iloc[start_idx:end_idx]
 
+            # Collect all slice names for this window (ordered, with repeats) and unique set
+            slice_col = 'CURRENT_FIX_COMPONENT_IMAGE_FILE'
+            if slice_col in window.columns:
+                _slice_series = window[slice_col].astype(str)
+                window_slice_list = _slice_series.tolist()            # all slices in order
+                window_unique_slices = list(pd.unique(_slice_series))  # unique slices (order of first appearance)
+            else:
+                window_slice_list = []
+                window_unique_slices = []
+
             # Extract target information (for training labels)
             target_array = window['target'].values
             window_target_positions = np.where(target_array == 1)[0]
@@ -350,7 +360,9 @@ def create_dynamic_time_series_with_ailment(df, feature_columns, window_size=100
                 'ailment_positions': window_ailment_positions.tolist(),  # Positions where ailments occur
                 'ailment_numbers': unique_ailments,  # Unique ailments in this window
                 'has_valid_ailment': len(unique_ailments) > 0,
-                'ailment_details': []  # Detailed info about each ailment position
+                'ailment_details': [],  # Detailed info about each ailment position
+                'window_slices': window_slice_list,          # ALL slices in this window (ordered)
+                'window_unique_slices': window_unique_slices # UNIQUE slice names in this window
             }
 
             # POST-PROCESSING: Find detailed info for each ailment occurrence (for evaluation only)
@@ -716,9 +728,7 @@ def split_train_test_for_time_series(df, input_columns= None, target_column='tar
 
     if input_columns is None:
         input_columns = ['Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X', 'CURRENT_FIX_IA_Y',
-                   'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT',"AILMENT_NUMBER",'rolling_mean_10',
-    'rolling_std_10',
-    'signal_derivative']
+                   'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT',"AILMENT_NUMBER"]
 
     df['group'] = df[split_columns].apply(
         lambda row: '_'.join(row.values.astype(str)), axis=1

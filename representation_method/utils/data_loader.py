@@ -420,7 +420,7 @@ class LegacyDataLoader(BaseDataLoader):
             self.df = IdentSubRec.get_df_for_training(data_file_path = self.config.data_path,approach_num=self.config.approach_num)
             self.df = self._add_gaze_features(self.df)
             self.df = self._normalize_pupil_size(self.df)
-            self._print_data_info()
+            # self._print_data_info()
             return self.df
 
 

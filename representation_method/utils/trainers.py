@@ -380,7 +380,7 @@ class CombinedModelTrainer(BaseTrainer):
 
         # Collect all predictions and labels
         with torch.no_grad():
-            for inputs, labels in tqdm(val_loader, desc='Collecting predictions'):
+            for inputs, labels in (val_loader):
                 inputs = inputs.to(self.device)
                 outputs = self.model(inputs)
                 probabilities = torch.sigmoid(outputs[:, 0]).cpu().numpy()
@@ -394,7 +394,7 @@ class CombinedModelTrainer(BaseTrainer):
         thresholds = np.linspace(0.5, 0.95, n_thresholds)
         results = []
 
-        for threshold in tqdm(thresholds, desc='Finding optimal threshold'):
+        for threshold in (thresholds):
             predictions = (all_probs >= threshold).astype(int)
 
             # Calculate metrics
@@ -562,7 +562,7 @@ class CombinedModelTrainer(BaseTrainer):
         if self.save_path:
             self._plot_training_curves(train_losses, val_losses, train_accs, val_accs,'classifer')
 
-        print("\nFinding optimal threshold...")
+        # print("\nFinding optimal threshold...")
         best_threshold, best_f1, _ = self.find_optimal_threshold(val_loader)
 
         return best_threshold
@@ -1752,14 +1752,14 @@ class TripletAutoencoderTrainer(BaseTrainer):
                     print(f"Early stopping triggered after {epoch + 1} epochs")
                     break
 
-            # Print progress
-            print(f"\nEpoch {epoch + 1}/{epochs}")
-            print(f"Train - Total: {train_metrics['total_loss']:.4f}, "
-                  f"Recon: {train_metrics['recon_loss']:.4f}, "
-                  f"Triplet: {train_metrics['triplet_loss']:.4f}")
-            print(f"Val - Total: {val_metrics['total_loss']:.4f}, "
-                  f"Recon: {val_metrics['recon_loss']:.4f}, "
-                  f"Triplet: {val_metrics['triplet_loss']:.4f}")
+            # # Print progress
+            # print(f"\nEpoch {epoch + 1}/{epochs}")
+            # print(f"Train - Total: {train_metrics['total_loss']:.4f}, "
+            #       f"Recon: {train_metrics['recon_loss']:.4f}, "
+            #       f"Triplet: {train_metrics['triplet_loss']:.4f}")
+            # print(f"Val - Total: {val_metrics['total_loss']:.4f}, "
+            #       f"Recon: {val_metrics['recon_loss']:.4f}, "
+            #       f"Triplet: {val_metrics['triplet_loss']:.4f}")
 
         # Final embedding visualization
         self.plot_embedding_space(val_loader)
@@ -1779,11 +1779,11 @@ def calculate_weights_and_ratios(labels):
     undersample_ratio = min(1.0, 1.0 / imbalance_ratio)  # Cap at 1.0 (retain all majority samples)
     minority_weight = imbalance_ratio
     majority_weight = 1.0  # Base weight for majority
-
-    print(f"Class Distribution: {dict(zip(unique_labels, counts))}")
-    print(f"Imbalance Ratio: {imbalance_ratio:.2f}")
-    print(f"Selected Parameters - undersample_ratio: {undersample_ratio}, "
-          f"minority_weight: {minority_weight}, majority_weight: {majority_weight}")
+    #
+    # print(f"Class Distribution: {dict(zip(unique_labels, counts))}")
+    # print(f"Imbalance Ratio: {imbalance_ratio:.2f}")
+    # print(f"Selected Parameters - undersample_ratio: {undersample_ratio}, "
+    #       f"minority_weight: {minority_weight}, majority_weight: {majority_weight}")
 
     return undersample_ratio, minority_weight, majority_weight
 
@@ -2026,7 +2026,7 @@ class EnsembleTrainer:
         self.best_val_losses = []
 
         for i in range(self.n_models):
-            print(f"model:{i/self.n_models}")
+            # print(f"model:{i/self.n_models}")
             # Create new model instance
             model = self.base_model_class(**self.model_params).to(self.device)
             optimizer = optimizer_class(model.parameters(), **optimizer_params)
@@ -2045,18 +2045,17 @@ class EnsembleTrainer:
             self.models.append(trained_model)
             self.best_val_losses.append(best_val_loss)
             self.best_threshold.append(best_threshold)
-            print(f"Model {i+1}/{self.n_models} trained. Best val loss: {best_val_loss:.4f}, "
-                  f"Minority class F1: {minority_f1:.4f}")
+            # print(f"Model {i+1}/{self.n_models} trained. Best val loss: {best_val_loss:.4f}, "
+            #       f"Minority class F1: {minority_f1:.4f}")
 
-    def predict(self, data_loader, threshold=0.5, minority_weight=1.0):
+    def predict(self, data_loader, threshold=0.5, minority_weight=1.0,unanimous = False):
         """
         Ensemble predict by averaging class-1 probabilities and
         thresholding at `threshold`. If minority_weight > 1,
         we multiply all p(class=1) by that factor before averaging.
         """
-        all_model_probs = []  # will be shape (n_models, n_samples)
+        all_model_probs = []
 
-        # 1) Gather per-model p(class=1) for every sample
         for model in self.models:
             model.eval()
             probs_1 = []
@@ -2065,18 +2064,21 @@ class EnsembleTrainer:
                 for data, _ in data_loader:
                     data = data.to(self.device)
                     outputs = model(data)
-                    probs = F.softmax(outputs, dim=1)[:, 1]  # take class=1 prob
+                    probs = F.softmax(outputs, dim=1)[:, 1]
                     probs_1.extend(probs.cpu().numpy())
 
             all_model_probs.append(probs_1)
 
-        # 2) Convert to array and weight the minority class if desired
-        all_model_probs = np.array(all_model_probs)  # shape (n_models, n_samples)
+        all_model_probs = np.array(all_model_probs)
         if minority_weight != 1.0:
             all_model_probs *= minority_weight
 
         avg_probs = all_model_probs.mean(axis=0)  # shape (n_samples,)
         final_preds = (avg_probs >= threshold).astype(int)
+        if unanimous:
+            model_probs = np.stack(all_model_probs)
+
+            final_preds = (model_probs >= threshold).all(axis=0).astype(int)
 
         return final_preds
 
@@ -2114,29 +2116,29 @@ class EnsembleTrainer:
             predictions = self.predict(test_loader, minority_weight=weight,threshold=0.9)
 
             results = self._calculate_metrics(true_labels, predictions)
-            for k,v in results.items():
-                print(k)
-                print(v)
-            print(f"\nMinority Weight: {weight}")
-            print(confusion_matrix(true_labels, predictions))
+            # for k,v in results.items():
+            #     # print(k)
+            #     # print(v)
+            # print(f"\nMinority Weight: {weight}")
+            # print(confusion_matrix(true_labels, predictions))
 
         accuracy = accuracy_score(true_labels, predictions)
         f1 = f1_score(true_labels, predictions, average='weighted')
-
-        print(f"\nEnsemble Results:")
-        print(f"Accuracy: {accuracy:.4f}")
-        print(f"F1 Score: {f1:.4f}")
+        #
+        # print(f"\nEnsemble Results:")
+        # print(f"Accuracy: {accuracy:.4f}")
+        # print(f"F1 Score: {f1:.4f}")
         results = self._calculate_metrics(true_labels, predictions)
         for k,v in results.items():
             print(k)
             print(v)
         cm= confusion_matrix(true_labels,predictions)
         report = classification_report(true_labels, predictions)
-        print(report)
-        print("\nConfusion Matrix:\n")
-        print("   Predicted 0  Predicted 1\n")
-        print(f"Actual 0   {cm[0, 0]:<10} {cm[0, 1]:<10}\n")
-        print(f"Actual 1   {cm[1, 0]:<10} {cm[1, 1]:<10}\n")
+        # print(report)
+        # print("\nConfusion Matrix:\n")
+        # print("   Predicted 0  Predicted 1\n")
+        # print(f"Actual 0   {cm[0, 0]:<10} {cm[0, 1]:<10}\n")
+        # print(f"Actual 1   {cm[1, 0]:<10} {cm[1, 1]:<10}\n")
         if self.save_path:
             with open(os.path.join(self.save_path, 'evaluation_results.txt'), 'w') as f:
                 f.write("Classification Report:\n")
@@ -2181,7 +2183,7 @@ class EnsembleTrainer:
 
         # Collect all predictions and labels
         with torch.no_grad():
-            for inputs, labels in tqdm(val_loader, desc='Collecting predictions'):
+            for inputs, labels in (val_loader):
                 inputs = inputs.to(self.device)
                 outputs = model(inputs)
                 probabilities = torch.sigmoid(outputs[:, 0]).cpu().numpy()
@@ -2195,7 +2197,7 @@ class EnsembleTrainer:
         thresholds = np.linspace(0.5, 0.95, n_thresholds)
         results = []
 
-        for threshold in tqdm(thresholds, desc='Finding optimal threshold'):
+        for threshold in (thresholds):
             predictions = (all_probs >= threshold).astype(int)
 
             # Calculate metrics
@@ -2229,7 +2231,7 @@ class EnsembleTrainer:
                          and r['recall'] >= min_recall]
 
         if not valid_results:
-            print("No threshold satisfies the criteria. Consider relaxing constraints.")
+            # print("No threshold satisfies the criteria. Consider relaxing constraints.")
             # Return the result with the lowest FP/TP ratio that meets minimum recall
             valid_results = [r for r in results if r['recall'] >= min_recall]
             if valid_results:

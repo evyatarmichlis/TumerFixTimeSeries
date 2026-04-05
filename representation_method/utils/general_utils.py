@@ -6,6 +6,7 @@ import random
 import numpy as np
 import pandas as pd
 import torch
+from sklearn.metrics import confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
 
 
 def seed_everything(seed):
@@ -29,96 +30,119 @@ def reconstruct_and_evaluate_efficiency(
         stage2_results,
         test_df,
         test_metadata,
-        strategy='majority'
+        strategy='majority',
+        default_window_size: int = 3,
 ):
     """
-    Reconstructs predictions and evaluates efficiency, allowing the user to choose
-    the voting strategy for overlapping windows.
+    Reconstructs predictions and evaluates efficiency with selectable voting strategy.
 
-    Args:
-        stage2_results (list of dicts): Results from the Stage 2 loop.
-        test_df (pd.DataFrame): The original, full test DataFrame.
-        test_metadata (list of dicts): Metadata for all test set windows.
-        strategy (str): The voting strategy to use.
-                        'majority': A row is positive if it gets at least 50% of the possible votes.
-                        'any': A row is positive if it gets at least one vote (OR logic).
-
-    Returns:
-        pd.DataFrame: A new DataFrame with the final predictions.
-        dict: A dictionary containing efficiency and performance metrics.
+    strategy ∈ {
+        'majority'           : row positive if >= 50% of covering windows voted for it (unweighted)
+        'any'                : row positive if ≥ 1 window voted for it (OR)
+        'all'                : row positive only if *every* covering window voted for it
+        'majority_weighted'  : like 'majority', but each window contributes a weight equal to its
+                               per-window frequency feature if available (else 1)
+    }
     """
     if not stage2_results:
         print("Warning: No Stage 2 results to process. Returning empty DataFrame.")
         return pd.DataFrame(), {}
 
-    if strategy not in ['majority', 'any']:
-        raise ValueError("Strategy must be either 'majority' or 'any'.")
+    valid_strategies = {'majority', 'any', 'all', 'majority_weighted'}
+    if strategy not in valid_strategies:
+        raise ValueError(f"Strategy must be one of {sorted(valid_strategies)}.")
 
     print("\n" + "=" * 60)
     print(f"Reconstructing Final Predictions using '{strategy.upper()}' STRATEGY")
     print("=" * 60)
 
-    # --- SETUP: Canvases for voting ---
-    max_index = test_df.index.max() + 1
-    prediction_canvas = np.zeros(max_index, dtype=int)  # Counts "yes" votes
+    # Choose a weight column if present (supports both the new and old name)
+    weight_col = None
+    if 'WINDOW_MAX_SLICE_FREQ' in test_df.columns:
+        weight_col = 'WINDOW_MAX_SLICE_FREQ'
+    elif 'WINDOW_UNIQUE_SLICES' in test_df.columns:
+        weight_col = 'WINDOW_UNIQUE_SLICES'
 
-    # Voter canvas is only needed for the 'majority' strategy
-    if strategy == 'majority':
-        voter_canvas = np.zeros(max_index, dtype=int)
+    # Canvases
+    max_index = int(test_df.index.max()) + 1
+    prediction_canvas = np.zeros(max_index, dtype=float)   # yes-votes (possibly weighted)
+    voter_canvas = np.zeros(max_index, dtype=int)          # number of covering windows
+    voter_weight_canvas = np.zeros(max_index, dtype=float) # sum of window weights (for weighted majority)
 
-    # --- VOTE ACCUMULATION ---
+    # ----- accumulate votes -----
     for result in stage2_results:
-        window_meta_index = result['window_index']
-        predicted_row_relative = result['predicted_row']
+        w_idx = result['window_index']
+        pred_rel = int(result['predicted_row'])
 
-        window_meta = test_metadata[window_meta_index]
+        wm = test_metadata[w_idx]
+        wlen = int(wm.get('window_size', wm.get('window_length', default_window_size)))
+
+        # rows from this trial
         trial_df = test_df[
-            (test_df['RECORDING_SESSION_LABEL'] == window_meta['participant_id']) &
-            (test_df['TRIAL_INDEX'] == window_meta['trial_id'])
-            ]
+            (test_df['RECORDING_SESSION_LABEL'] == wm['participant_id']) &
+            (test_df['TRIAL_INDEX'] == wm['trial_id'])
+        ]
 
-        window_start_abs_trial = window_meta['window_start_idx']
-        window_size = 3  # Assuming window size is 3, make dynamic if needed
-        absolute_indices_in_window = trial_df.index[window_start_abs_trial: window_start_abs_trial + window_size]
+        start_abs = int(wm['window_start_idx'])
+        abs_idx_in_window = trial_df.index[start_abs: start_abs + wlen]
+        if len(abs_idx_in_window) == 0:
+            continue
 
-        # Update "yes" vote canvas (used by both strategies)
-        if predicted_row_relative < len(absolute_indices_in_window):
-            predicted_absolute_index = absolute_indices_in_window[predicted_row_relative]
-            prediction_canvas[predicted_absolute_index] += 1
+        # window weight (used only in majority_weighted)
+        if strategy == 'majority_weighted' and weight_col is not None:
+            try:
+                win_weight = float(test_df.loc[abs_idx_in_window[-1], weight_col])
+            except Exception:
+                win_weight = 1.0
+        else:
+            win_weight = 1.0
 
-        # Update voter canvas (only for 'majority' strategy)
-        if strategy == 'majority':
-            voter_canvas[absolute_indices_in_window] += 1
+        # every covered row gets an “opportunity”
+        voter_canvas[abs_idx_in_window] += 1
+        if strategy == 'majority_weighted':
+            voter_weight_canvas[abs_idx_in_window] += win_weight
 
-    # --- DECISION MAKING BASED ON STRATEGY ---
+        # positive vote for the predicted row
+        if 0 <= pred_rel < len(abs_idx_in_window):
+            pred_abs = abs_idx_in_window[pred_rel]
+            if strategy == 'majority_weighted':
+                prediction_canvas[pred_abs] += win_weight
+            else:
+                prediction_canvas[pred_abs] += 1.0
+
+    # ----- decide -----
     if strategy == 'majority':
         final_predictions = np.zeros(max_index, dtype=int)
-        # Find all rows that were part of at least one positive window
-        relevant_indices = np.where(voter_canvas > 0)[0]
-        for i in relevant_indices:
-            # Majority vote: "yes" votes must be >= 50% of opportunities
-            if prediction_canvas[i] >= (voter_canvas[i] / 2.0):
-                final_predictions[i] = 1
-    else:  # 'any' strategy
-        # OR logic: at least one "yes" vote is enough
+        relevant = np.nonzero(voter_canvas > 0)[0]
+        half = voter_canvas / 2.0
+        final_predictions[relevant] = (prediction_canvas[relevant] >= half[relevant]).astype(int)
+    elif strategy == 'majority_weighted':
+        final_predictions = np.zeros(max_index, dtype=int)
+        relevant = np.nonzero(voter_weight_canvas > 0)[0]
+        half_weight = voter_weight_canvas / 2.0
+        final_predictions[relevant] = (prediction_canvas[relevant] >= half_weight[relevant]).astype(int)
+    elif strategy == 'any':
         final_predictions = (prediction_canvas > 0).astype(int)
+    else:  # 'all'
+        final_predictions = np.zeros(max_index, dtype=int)
+        relevant = np.nonzero(voter_canvas > 0)[0]
+        final_predictions[relevant] = (prediction_canvas[relevant] == voter_canvas[relevant]).astype(int)
 
-    # --- Reconstruct DataFrame and Calculate Metrics (same for both strategies) ---
+    # ----- reconstruct & metrics -----
     reconstructed_df = test_df.copy()
     reconstructed_df['pipeline_prediction'] = final_predictions[reconstructed_df.index]
     final_predicted_df = reconstructed_df[reconstructed_df['pipeline_prediction'] == 1].copy()
 
-    # ... (the rest of the function for calculating metrics is identical) ...
     original_rows = len(test_df)
     predicted_rows = len(final_predicted_df)
     reduction_percentage = (1 - (predicted_rows / original_rows)) * 100 if original_rows > 0 else 0
-    compression_ratio = original_rows / predicted_rows if predicted_rows > 0 else float('inf')
+    compression_ratio = (original_rows / predicted_rows) if predicted_rows > 0 else float('inf')
 
-    true_positives = final_predicted_df['target'].sum()
-    precision = true_positives / predicted_rows if predicted_rows > 0 else 0
-    total_actual_positives = test_df['target'].sum()
-    recall = true_positives / total_actual_positives if total_actual_positives > 0 else 0
-    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+    true_positives = float(final_predicted_df['target'].sum()) if predicted_rows > 0 else 0.0
+    precision = (true_positives / predicted_rows) if predicted_rows > 0 else 0.0
+    total_actual_positives = float(test_df['target'].sum()) if original_rows > 0 else 0.0
+    recall = (true_positives / total_actual_positives) if total_actual_positives > 0 else 0.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
 
     print(f"Original test data had {original_rows:,} rows.")
     print(f"Pipeline flagged {predicted_rows:,} specific rows as targets.")
@@ -132,13 +156,46 @@ def reconstruct_and_evaluate_efficiency(
 
     metrics = {
         'strategy': strategy,
-        'original_rows': original_rows,
-        'predicted_rows': predicted_rows,
-        'data_reduction_percent': reduction_percentage,
-        'compression_ratio': compression_ratio,
-        'final_precision': precision,
-        'final_recall': recall,
-        'final_f1_score': f1,
+        'original_rows': int(original_rows),
+        'predicted_rows': int(predicted_rows),
+        'data_reduction_percent': float(reduction_percentage),
+        'compression_ratio': float(compression_ratio),
+        'final_precision': float(precision),
+        'final_recall': float(recall),
+        'final_f1_score': float(f1),
     }
 
     return final_predicted_df, metrics
+
+
+
+def evaluate_reconstructed_predictions(y_true, y_pred, strategy_name):
+    """
+    Calculates and prints performance metrics for the reconstructed row-level predictions.
+    This evaluates the end-to-end pipeline performance after Stage 2.
+
+    Args:
+        y_true (pd.Series or np.array): Ground truth labels (0 or 1).
+        y_pred (pd.Series or np.array): Predicted labels (0 or 1).
+        strategy_name (str): The name of the reconstruction strategy (e.g., 'Majority', 'Any').
+    """
+    # Ensure a 2x2 confusion matrix by specifying labels, handles cases with no positives.
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+
+    # Calculate metrics
+    accuracy = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred, zero_division=0)
+    recall = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+
+    print(f"\n--- Final Row-Level Performance (Strategy: {strategy_name}) ---")
+    print(f"  Accuracy:  {accuracy:.4f}")
+    print(f"  Precision: {precision:.4f} (Of all rows flagged as targets, how many were correct?)")
+    print(f"  Recall:    {recall:.4f} (Of all true target rows, how many were found?)")
+    print(f"  F1 Score:  {f1:.4f}")
+
+    print("\n  Confusion Matrix:")
+    print("             Predicted 0   Predicted 1")
+    print(f"  Actual 0   {cm[0, 0]:<13d} {cm[0, 1]:<13d}")
+    print(f"  Actual 1   {cm[1, 0]:<13d} {cm[1, 1]:<13d}")
+    print("-" * 60)

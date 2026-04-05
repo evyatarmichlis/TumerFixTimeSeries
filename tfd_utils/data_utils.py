@@ -1,703 +1,438 @@
+import os
 import json
-from typing import Union, List
-
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import MinMaxScaler, Normalizer, StandardScaler
-from sklearn.utils import resample
-from tqdm import tqdm
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from pathlib import Path
+from typing import Dict, List
+from collections import Counter, defaultdict
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+from torch.utils.data import DataLoader, TensorDataset
 
-from tfd_utils.logger_utils import print_and_log
+# Import your existing modules
+from representation_method.utils.general_utils import seed_everything, evaluate_reconstructed_predictions
+from representation_method.utils.data_loader import load_eye_tracking_data, DataConfig
+from representation_method.utils.data_utils import (
+    create_dynamic_time_series, split_train_test_for_time_series,
+    create_dynamic_time_series_with_ailment
+)
+from representation_method.utils.trainers import EnsembleTrainer
+from representation_method.models.classifier import CombinedModel, CNN1DModel, GradientLocalizer
 
-
-def load_config_file(config_file_path):
-    with open(config_file_path, 'r') as config_file:
-        kwargs = json.load(config_file)
-    return kwargs
-
-
-def dtype_range(dtype):
-    if np.issubdtype(dtype, np.integer):
-        return np.iinfo(dtype).min, np.iinfo(dtype).max
-    elif np.issubdtype(dtype, np.floating):
-        return np.finfo(dtype).min, np.finfo(dtype).max
-    elif np.issubdtype(dtype, np.object_):
-        return "N/A", "N/A"
-    else:
-        return "Unknown Type"
-
-
-def letter_to_num(letter):
-    return ord(letter.upper()) - ord('A') + 1
-
-
-def convert_zone_value(value):
-    if value[0].isdigit():
-        # If the first character is a digit, assume the format is '6F'
-        num_part = value[:-1]
-        letter_part = value[-1]
-    else:
-        # Otherwise, assume the format is 'F6'
-        letter_part = value[0]
-        num_part = value[1:]
-
-    # Convert the letter to a number if necessary
-    letter_num = letter_to_num(letter_part) if not letter_part.isdigit() else int(letter_part)
-    # The numeric part is always assumed to be a number, so convert it
-    num = int(num_part)
-
-    return letter_num, num
+FEATURE_COLUMNS = [
+    'Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X',
+    'CURRENT_FIX_IA_Y', 'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT',
+    'WINDOW_MAX_SLICE_FREQ'
+]
 
 
-def features_scaler(df, features_to_scale, scaler_type='minmax'):
-    if scaler_type == 'minmax':
-        scaler = MinMaxScaler(feature_range=(0, 1))
-    elif scaler_type == 'zscore':
-        scaler = StandardScaler()
-    elif scaler_type == 'l2':
-        scaler = Normalizer(norm='l2')
-    else:
-        raise ValueError("Invalid scaler type. Choose 'minmax', 'zscore', or 'l2'.")
-    print_and_log(f'Normalizing using a {scaler_type} scaler')
+# ==========================================
+# 1. VISUALIZATION & PLOTTING HELPERS
+# ==========================================
 
-    def scale_column(column):
-        return scaler.fit_transform(column.values.reshape(-1, 1)).flatten()
+def plot_participant_panel_of_trial_heatmaps(meta: list[dict], test_df: pd.DataFrame, positive_indices: np.ndarray,
+                                             out_dir: str, img_col: str = "CURRENT_FIX_COMPONENT_IMAGE_FILE",
+                                             top_k_per_trial: int = 80) -> None:
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    panel_out = Path(out_dir) / "participant_panels"
+    panel_out.mkdir(parents=True, exist_ok=True)
 
-    for feature in features_to_scale:
-        # Apply scaling per trial ('RECORDING_SESSION_LABEL' & 'TRIAL_INDEX'):
-        groupby_features = ['RECORDING_SESSION_LABEL']
-        if 'TRIAL_INDEX' in df.keys():
-            groupby_features.append('TRIAL_INDEX')
-        df[feature] = df.groupby(groupby_features)[feature].transform(scale_column)
-        # df[feature] = df.groupby(['RECORDING_SESSION_LABEL', 'TRIAL_INDEX',
-        #                           'CURRENT_FIX_INDEX'])[feature].transform(scale_column)
-        # df[feature] = scale_column(df[feature])  # Apply scaling to the whole feature column
+    pred_by_trial = defaultdict(Counter)
+    parts_set = set()
+    for i in positive_indices:
+        if 0 <= i < len(meta):
+            m = meta[i]
+            trial_key = (m.get("participant_id"), m.get("trial_id"))
+            parts_set.add(m.get("participant_id"))
+            for s in set(map(str, m.get("window_unique_slices", m.get("window_slices", [])))):
+                pred_by_trial[trial_key][s] += 1
 
+    gt_by_trial = defaultdict(set)
+    if img_col in test_df.columns:
+        for (pid, tid), sub in test_df.groupby(["RECORDING_SESSION_LABEL", "TRIAL_INDEX"]):
+            if "target" in sub.columns:
+                gt_slices = set(map(str, sub.loc[sub["target"] == 1, img_col].astype(str).unique()))
+                gt_by_trial[(pid, tid)] = gt_slices
+                parts_set.add(pid)
+
+    participants = sorted([p for p in parts_set if p is not None])
+    for pid in participants:
+        trials = sorted({tid for (p, tid) in list(pred_by_trial.keys()) + list(gt_by_trial.keys()) if p == pid})
+        if not trials: continue
+
+        per_trial_M, per_trial_labels, per_trial_titles, per_trial_widths = [], [], [], []
+
+        for tid in trials:
+            trial_key = (pid, tid)
+            counter = pred_by_trial.get(trial_key, Counter())
+            gt_set = gt_by_trial.get(trial_key, set())
+            sub = test_df[(test_df["RECORDING_SESSION_LABEL"] == pid) & (test_df["TRIAL_INDEX"] == tid)]
+            ordered_all = list(dict.fromkeys(sub[img_col].astype(str).tolist()))
+            all_slices = set(counter.keys()) | set(gt_set)
+            ordered = [s for s in ordered_all if s in all_slices]
+            if top_k_per_trial: ordered = ordered[:top_k_per_trial]
+            n = len(ordered)
+            if n == 0: continue
+
+            counts = np.array([counter.get(s, 0) for s in ordered], dtype=float)
+            density = counts / counts.max() if counts.max() > 0 else counts
+            gt_vec = np.array([1.0 if s in gt_set else 0.0 for s in ordered], dtype=float)
+            per_trial_M.append(np.vstack([density[None, :], gt_vec[None, :]]))
+            per_trial_labels.append(ordered)
+            per_trial_titles.append(f"Trial {tid}")
+            per_trial_widths.append(n)
+
+        if not per_trial_M: continue
+
+        n_trials = len(per_trial_M)
+        fig, axes = plt.subplots(n_trials, 1,
+                                 figsize=(max(12.0, 0.18 * max(per_trial_widths)), max(3.0, 2.2 * n_trials)),
+                                 constrained_layout=True)
+        if n_trials == 1: axes = [axes]
+
+        for ax, M, labels, title in zip(axes, per_trial_M, per_trial_labels, per_trial_titles):
+            n = M.shape[1]
+            ax.imshow(M, aspect='auto', interpolation='nearest', vmin=0.0, vmax=1.0, cmap='viridis')
+            gt_overlay = np.zeros_like(M)
+            gt_overlay[1, :] = M[1, :]
+            gt_masked = np.ma.masked_where(gt_overlay == 0, gt_overlay)
+            ax.imshow(gt_masked, aspect='auto', interpolation='nearest', vmin=0.0, vmax=1.0,
+                      cmap=plt.matplotlib.colors.ListedColormap([[0, 0, 0, 0], [0, 1, 0, 0.85]]))
+            ax.set_yticks([0, 1])
+            ax.set_yticklabels(["Pred", "GT"])
+            xticks = np.arange(0, n, max(1, n // 40))
+            ax.set_xticks(xticks)
+            ax.set_xticklabels([labels[i] for i in xticks], rotation=90, fontsize=8)
+            ax.set_title(title, fontsize=11)
+
+        fig.colorbar(axes[0].images[0], ax=axes, fraction=0.02, pad=0.01).set_label('Normalized density', rotation=90)
+        fig.suptitle(f"Participant {pid} — Per-trial slice density vs. GT (2 rows per trial)", fontsize=13)
+        fig.savefig(panel_out / f"participant_{pid}.png", dpi=150)
+        plt.close(fig)
+
+
+def plot_participant_slice_heatmap_with_gt(meta: list[dict], test_df: pd.DataFrame, positive_indices: np.ndarray,
+                                           out_dir: str, img_col: str = "CURRENT_FIX_COMPONENT_IMAGE_FILE",
+                                           top_k_per_trial: int = 80) -> None:
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    part_out = Path(out_dir) / "participant_heatmaps"
+    part_out.mkdir(parents=True, exist_ok=True)
+
+    pred_by_trial = defaultdict(Counter)
+    parts_set = set()
+    for i in positive_indices:
+        if 0 <= i < len(meta):
+            m = meta[i]
+            trial_key = (m.get("participant_id"), m.get("trial_id"))
+            parts_set.add(m.get("participant_id"))
+            for s in set(map(str, m.get("window_unique_slices", m.get("window_slices", [])))):
+                pred_by_trial[trial_key][s] += 1
+
+    gt_by_trial = defaultdict(set)
+    if img_col in test_df.columns:
+        for (pid, tid), sub in test_df.groupby(["RECORDING_SESSION_LABEL", "TRIAL_INDEX"]):
+            if "target" in sub.columns:
+                gt_slices = set(map(str, sub.loc[sub["target"] == 1, img_col].astype(str).unique()))
+                gt_by_trial[(pid, tid)] = gt_slices
+                parts_set.add(pid)
+
+    participants = sorted([p for p in parts_set if p is not None])
+    for pid in participants:
+        trials = sorted({tid for (p, tid) in list(pred_by_trial.keys()) + list(gt_by_trial.keys()) if p == pid})
+        if not trials: continue
+
+        per_trial_density, per_trial_gt, trial_widths, trial_labels = [], [], [], []
+
+        for tid in trials:
+            trial_key = (pid, tid)
+            counter = pred_by_trial.get(trial_key, Counter())
+            gt_set = gt_by_trial.get(trial_key, set())
+            sub = test_df[(test_df["RECORDING_SESSION_LABEL"] == pid) & (test_df["TRIAL_INDEX"] == tid)]
+            ordered_all = list(dict.fromkeys(sub[img_col].astype(str).tolist()))
+            all_slices = set(counter.keys()) | set(gt_set)
+            ordered = [s for s in ordered_all if s in all_slices]
+            if top_k_per_trial: ordered = ordered[:top_k_per_trial]
+            n = len(ordered)
+            if n == 0: continue
+
+            counts = np.array([counter.get(s, 0) for s in ordered], dtype=float)
+            per_trial_density.append(counts / counts.max() if counts.max() > 0 else counts)
+            per_trial_gt.append(np.array([1.0 if s in gt_set else 0.0 for s in ordered], dtype=float))
+            trial_widths.append(n)
+            trial_labels.append(tid)
+
+        if not per_trial_density: continue
+
+        total_cols = int(np.sum(trial_widths))
+        total_rows = 2 * len(per_trial_density)
+        M, GT = np.zeros((total_rows, total_cols), dtype=float), np.zeros((total_rows, total_cols), dtype=float)
+
+        col_offsets = np.cumsum([0] + trial_widths[:-1])
+        for k, (dens, gtv, w) in enumerate(zip(per_trial_density, per_trial_gt, trial_widths)):
+            r0, c0 = 2 * k, int(col_offsets[k])
+            M[r0, c0:c0 + w] = dens
+            M[r0 + 1, c0:c0 + w] = 0.0
+            GT[r0 + 1, c0:c0 + w] = gtv
+
+        fig, ax = plt.subplots(figsize=(max(12.0, 0.03 * total_cols), max(3.0, 0.55 * total_rows)))
+        im = ax.imshow(M, aspect='auto', interpolation='nearest', vmin=0.0, vmax=1.0, cmap='viridis')
+        ax.imshow(np.ma.masked_where(GT == 0, GT), aspect='auto', interpolation='nearest', vmin=0.0, vmax=1.0,
+                  cmap=plt.matplotlib.colors.ListedColormap([[0, 0, 0, 0], [0, 1, 0, 0.85]]))
+
+        yticks, ylabels = [], []
+        for k, tid in enumerate(trial_labels):
+            yticks.extend([2 * k, 2 * k + 1])
+            ylabels.extend([f"Trial {tid} — Pred", f"Trial {tid} — GT"])
+        ax.set_yticks(yticks)
+        ax.set_yticklabels(ylabels)
+
+        boundaries = list(col_offsets) + [total_cols]
+        ax.set_xticks([(boundaries[i] + boundaries[i + 1]) / 2 for i in range(len(trial_widths))])
+        ax.set_xticklabels([f"T{t}" for t in trial_labels], rotation=0)
+        for b in boundaries: ax.axvline(b - 0.5, color='white', linewidth=0.5, alpha=0.6)
+
+        ax.set_title(f"Participant {pid} | Slice prediction density vs. GT (two rows per trial)")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Normalized density')
+        fig.tight_layout()
+        fig.savefig(part_out / f"participant_{pid}.png", dpi=150)
+        plt.close(fig)
+
+
+# ==========================================
+# 2. FEATURE ENGINEERING & FILTERING
+# ==========================================
+
+def _filter_isolated_windows(predictions: np.ndarray, metadata: list, neighbor_radius: int = 2, min_neighbors: int = 1,
+                             group_key: str = "trial_id") -> np.ndarray:
+    if predictions.ndim != 1:
+        predictions = predictions.ravel()
+    pos_idx = np.where(predictions == 1)[0]
+    if pos_idx.size == 0:
+        return pos_idx
+
+    groups = [m.get(group_key) for m in metadata]
+    kept = []
+    n = len(predictions)
+    for i in pos_idx:
+        g = groups[i]
+        left = max(0, i - neighbor_radius)
+        right = min(n - 1, i + neighbor_radius)
+        cnt = sum(1 for j in range(left, right + 1) if j != i and predictions[j] == 1 and groups[j] == g)
+        if cnt >= min_neighbors:
+            kept.append(i)
+    return np.array(kept, dtype=int)
+
+
+def add_window_max_slice_freq(df: pd.DataFrame, window_size: int, img_col: str = "CURRENT_FIX_COMPONENT_IMAGE_FILE",
+                              group_cols=("RECORDING_SESSION_LABEL", "TRIAL_INDEX"),
+                              out_col: str = "WINDOW_MAX_SLICE_FREQ") -> pd.DataFrame:
+    from collections import deque
+    if img_col not in df.columns: raise KeyError(f"Expected '{img_col}'")
+
+    def _rolling_maxfreq(s: pd.Series) -> pd.Series:
+        q = deque()
+        freq = defaultdict(int)
+        out, w = [], max(1, int(window_size))
+        for v in s.astype(str).tolist():
+            q.append(v)
+            freq[v] += 1
+            if len(q) > w:
+                left = q.popleft()
+                freq[left] -= 1
+                if freq[left] == 0: del freq[left]
+            out.append(max(freq.values()) if freq else 0)
+        return pd.Series(out, index=s.index, dtype=float)
+
+    df[out_col] = df.groupby(list(group_cols))[img_col].apply(_rolling_maxfreq).reset_index(
+        level=list(range(len(group_cols))), drop=True)
+    df[out_col] = df[out_col].fillna(1.0).astype(float)
     return df
 
 
-def update_target_to_before_target(df):
-    df = df.copy()
-    starts = (df['target'] == 1) & (df['target'].shift(1, fill_value=0) == 0)
-    before_start = starts.shift(-1, fill_value=False)
-    # df.loc[before_start, 'target'] = True
-    df['target'] = before_start
+def add_image_visit_count(df: pd.DataFrame, img_col: str = "CURRENT_FIX_COMPONENT_IMAGE_FILE",
+                          out_col: str = "IMG_VISIT_COUNT",
+                          id_cols: tuple[str, ...] = ("RECORDING_SESSION_LABEL", "TRIAL_INDEX")) -> pd.DataFrame:
+    run_col = "__img_run_id__"
+    df[run_col] = df.groupby(list(id_cols))[img_col].transform(lambda s: (s != s.shift()).cumsum())
+    df[out_col] = df.groupby(list(id_cols) + [img_col])[run_col].transform("nunique").astype(float)
+    del df[run_col]
     return df
 
 
-def update_target_to_after_target(df):
-    df = df.copy()
-    ends = (df['target'] == 1) & (df['target'].shift(-1, fill_value=0) == 0)
-    after_start = ends.shift(1, fill_value=False)
-    # df.loc[after_start, 'target'] = True
-    df['target'] = after_start
-    return df
+# ==========================================
+# 3. CORE PIPELINE RUNNER
+# ==========================================
 
+def two_step_pipeline(participant_id, window_size=100, seed=42, remove_isolated: bool = False, neighbor_radius: int = 2,
+                      min_neighbors: int = 1):
+    seed_everything(seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def mark_surrounding_rows(row, df, ia_x: str = 'CURRENT_FIX_IA_X', ia_y: str = 'CURRENT_FIX_IA_Y', unit: int = 1):
-    if row['target']:
-        x, y = row[ia_x], row[ia_y]
-        recording_session_label, trial_index = row['RECORDING_SESSION_LABEL'], row['TRIAL_INDEX']
-        # Mark rows where X and Y are within 'unit' of the current row
-        surrounding_mask = ((df[ia_x].between(x - unit, x + unit)) &
-                            (df[ia_y].between(y - unit, y + unit)) &
-                            ~((df[ia_x] == x) & (df[ia_y] == y)) &
-                            (df['RECORDING_SESSION_LABEL'] == recording_session_label) &
-                            (df['TRIAL_INDEX'] == trial_index) &
-                            (df['target'] == False)
-                            )
-        # if 'CURRENT_FIX_COMPONENT_IMAGE_NUMBER' in df.keys():
-        #     component_image_number = row['CURRENT_FIX_COMPONENT_IMAGE_NUMBER']
-        #     surrounding_mask &= (df['CURRENT_FIX_COMPONENT_IMAGE_NUMBER'] == component_image_number)
-        df.loc[surrounding_mask, 'to_update'] = True
+    feature_columns_train = [
+        'Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X',
+        'CURRENT_FIX_IA_Y', 'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT'
+    ]
 
+    # 1. Load Data
+    dir_path = Path(__file__).parent.parent.parent / "fwd_data"
+    csv_path = dir_path / 'Combined_Participants_CT_23_12_25.csv'
 
-def stratified_group_split_independent_unique(df, target_col, group_col, test_size, n_splits):
-    unique_groups = df[group_col].unique()
-    group_targets = df.groupby(group_col)[target_col].first()
+    config = DataConfig(data_path=csv_path, approach_num=6, normalize=True, per_slice_target=True,
+                        participant_id=participant_id)
+    df = load_eye_tracking_data(data_path=config.data_path, approach_num=config.approach_num,
+                                participant_id=config.participant_id, data_format="legacy")
 
-    test_groups = []
-    for _ in range(n_splits):
-        # Stratified sampling without replacement for each split
-        sampled_groups = resample(
-            unique_groups,
-            n_samples=test_size,
-            stratify=group_targets,
-            replace=False,  # No replacement within each split
-            random_state=None  # Different sample each time
+    df.fillna(method='bfill', inplace=True)
+    df.fillna(method='ffill', inplace=True)
+
+    # 2. Split data
+    train_df, test_df = split_train_test_for_time_series(df, test_size=0.2, random_state=seed)
+    train_df, val_df = split_train_test_for_time_series(train_df, test_size=0.2, random_state=seed)
+
+    gt_ailments_df = test_df.loc[
+        test_df['AILMENT_NUMBER'] != -1, ['RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'AILMENT_NUMBER']].drop_duplicates()
+    total_unique_ailments_in_test = len(gt_ailments_df)
+
+    # 3. Create windows
+    X_train, Y_train, train_metadata, _ = create_dynamic_time_series_with_ailment(train_df, feature_columns_train,
+                                                                                  window_size=window_size)
+    X_val, Y_val, val_metadata, _ = create_dynamic_time_series_with_ailment(val_df, feature_columns_train,
+                                                                            window_size=window_size)
+    X_test, Y_test, test_metadata, _ = create_dynamic_time_series_with_ailment(test_df, feature_columns_train,
+                                                                               window_size=window_size)
+
+    save_dir = f'results/ailment_tracking_participant_{participant_id}'
+    os.makedirs(save_dir, exist_ok=True)
+
+    # ==========================================
+    # STEP 1: WINDOW-LEVEL PREDICTION
+    # ==========================================
+    print("\nSTEP 1: Window-Level Prediction")
+
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train.reshape(-1, X_train.shape[-1])).reshape(X_train.shape)
+    X_val_scaled = scaler.transform(X_val.reshape(-1, X_val.shape[-1])).reshape(X_val.shape)
+    X_test_scaled = scaler.transform(X_test.reshape(-1, X_test.shape[-1])).reshape(X_test.shape)
+
+    X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32).permute(0, 2, 1)
+    X_val_tensor = torch.tensor(X_val_scaled, dtype=torch.float32).permute(0, 2, 1)
+    X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32).permute(0, 2, 1)
+
+    Y_train_tensor = torch.tensor(Y_train, dtype=torch.long)
+    Y_val_tensor = torch.tensor(Y_val, dtype=torch.long)
+    Y_test_tensor = torch.tensor(Y_test, dtype=torch.long)
+
+    train_dataset = TensorDataset(X_train_tensor, Y_train_tensor)
+    val_loader = DataLoader(TensorDataset(X_val_tensor, Y_val_tensor), batch_size=32, shuffle=False)
+    test_loader = DataLoader(TensorDataset(X_test_tensor, Y_test_tensor), batch_size=32, shuffle=False)
+
+    ensemble_save_path = os.path.join(save_dir, 'ensemble_models')
+    os.makedirs(ensemble_save_path, exist_ok=True)
+
+    ensemble_trainer = EnsembleTrainer(
+        base_model_class=CNN1DModel,
+        model_params={'input_dim': X_train_tensor.shape[1], 'window_size': window_size, 'output_classes': 2},
+        n_models=10,
+        device=device,
+        save_path=ensemble_save_path
+    )
+
+    class_counts = np.bincount(Y_train)
+    weights = 1.0 / class_counts
+
+    ensemble_trainer.train_ensemble(
+        train_dataset=train_dataset,
+        val_loader=val_loader,
+        batch_size=32,
+        epochs=50,
+        criterion=nn.CrossEntropyLoss(),
+        optimizer_class=optim.Adam,
+        optimizer_params={'lr': 0.001},
+        majority_weight=weights[0] if len(weights) > 1 else 0.1
+    )
+
+    test_predictions = ensemble_trainer.predict(test_loader, minority_weight=1, threshold=0.92, unanimous=False)
+
+    if remove_isolated:
+        kept_indices = _filter_isolated_windows(
+            predictions=test_predictions,
+            metadata=test_metadata,
+            neighbor_radius=neighbor_radius,
+            min_neighbors=min_neighbors,
+            group_key="trial_id",
         )
-        test_groups.append(sampled_groups)
+        new_preds = np.zeros_like(test_predictions)
+        new_preds[kept_indices] = 1
+        test_predictions = new_preds
 
-    return np.array(test_groups)
+    # ==========================================
+    # STEP 2: TARGET LOCALIZATION
+    # ==========================================
+    print("\nSTEP 2: Target Localization within Predicted Positive Windows")
+    positive_indices = np.where(test_predictions == 1)[0]
+
+    if len(positive_indices) == 0:
+        print("No positive windows for Stage 2.")
+        return
+
+    stage1_model_for_loc = ensemble_trainer.models[0]
+    localizer = GradientLocalizer(stage1_model_for_loc, device)
+    all_stage2_results = []
+
+    for idx in positive_indices:
+        window_metadata = test_metadata[idx]
+        window_tensor = X_test_tensor[idx].unsqueeze(0)
+        predicted_row = localizer.localize_target(window_tensor.clone())
+        true_target_positions = window_metadata.get('target_positions', [])
+
+        ailment_found = 'None'
+        for detail in window_metadata.get('ailment_details', []):
+            if detail['relative_position'] == predicted_row:
+                ailment_found = detail['ailment_number']
+                break
+
+        all_stage2_results.append({
+            'window_index': idx,
+            'predicted_row': predicted_row,
+            'true_targets': true_target_positions,
+            'is_correct': 1 if predicted_row in true_target_positions else 0,
+            'ailment_found': ailment_found,
+            'ailments_in_window': window_metadata.get('ailment_numbers', [])
+        })
+
+    # Output heatmaps
+    plot_participant_panel_of_trial_heatmaps(test_metadata, test_df, positive_indices,
+                                             out_dir=os.path.join(save_dir, "slice_level"), top_k_per_trial=200)
+    plot_participant_slice_heatmap_with_gt(test_metadata, test_df, positive_indices,
+                                           out_dir=os.path.join(save_dir, "slice_level"), top_k_per_trial=80)
+
+    # Calculate final baseline accuracy
+    results_df = pd.DataFrame(all_stage2_results)
+    true_positive_windows_df = results_df[results_df['true_targets'].apply(len) > 0]
+
+    if not true_positive_windows_df.empty:
+        print(f"Stage 2 Pinpointing Accuracy (on TP windows): {true_positive_windows_df['is_correct'].mean():.4f}")
+
+    found_ailments = set(results_df[results_df['ailment_found'] != 'None']['ailment_found'])
+    print(f"Stage 2 found ailments: {sorted(list(found_ailments))}")
+    print(f"Stage 2 found ailments coverage: {len(found_ailments)}/{total_unique_ailments_in_test}")
 
 
-def get_df_for_training(
-        data_file_path: Union[str, List[str]],
-        augment: bool = False,
-        normalize: bool = False,
-        return_bool_asking_if_processed_data: bool = False,
-        take_every_x_rows: int = 1,
-        change_target_to_before_target: bool = False,
-        change_target_to_after_target: bool = False,
-        remove_surrounding_to_hits: int = 0,
-        update_surrounding_to_hits: int = 0,
-        approach_num: int = 0,
-        match_non_targets_to_targets: bool = False,
-):
-    nrows = None  # Read all the rows
-    # Original keys for the processed data:
-    orig_pr_data_keys = ['AILMENT_NUMBER','RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_INDEX', 'Pupil_Size',
-                         'CURRENT_FIX_DURATION', 'CURRENT_FIX_INTEREST_AREA_LABEL', 'CURRENT_FIX_COMPONENT_COUNT',
-                         'CURRENT_FIX_COMPONENT_INDEX', 'CURRENT_FIX_COMPONENT_DURATION', 'Zones', 'Hit']
-    # Original keys for the formatted processed data:
-    orig_f_pr_data_keys = ['AILMENT_NUMBER','RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_COMPONENT_IMAGE_NUMBER',
-                           'CURRENT_FIX_COMPONENT_IMAGE_FILE', 'CURRENT_FIX_INDEX', 'Pupil_Size',
-                           'CURRENT_FIX_DURATION', 'CURRENT_FIX_INTEREST_AREA_LABEL', 'CURRENT_FIX_COMPONENT_COUNT',
-                           'CURRENT_FIX_COMPONENT_INDEX', 'CURRENT_FIX_COMPONENT_DURATION', 'Zones', 'Hit']
-    # Original keys for the categorized processed data:
-    orig_cat_f_data_keys = ['AILMENT_NUMBER','RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_COMPONENT_IMAGE_NUMBER',
-                            'CURRENT_FIX_COMPONENT_IMAGE_FILE', 'CURRENT_FIX_INDEX', 'Pupil_Size',
-                            'CURRENT_FIX_DURATION', 'CURRENT_FIX_INTEREST_AREA_LABEL', 'CURRENT_FIX_COMPONENT_COUNT',
-                            'CURRENT_FIX_COMPONENT_INDEX', 'CURRENT_FIX_COMPONENT_DURATION', 'Zones', 'Hit',
-                            'SCAN_TYPE', 'SLICE_TYPE', 'LOCATION_TYPE']
-    # Original keys for the raw data:
-    orig_raw_data_keys = ['AILMENT_NUMBER','RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'CURRENT_FIX_INDEX', 'SAMPLE_INDEX',
-                          'SAMPLE_START_TIME', 'IN_BLINK', 'IN_SACCADE', 'Pupil_Size', 'TARGET_ZONE', 'TARGET_XY',
-                          'GAZE_IA', 'GAZE_XY', 'Hit']
-    # Original keys for the generalists / experts / med students data:
-    orig_gen_data_keys = ['BUTTON', 'CURRENT_FIX_PUPIL', 'CURRENT_IMAGE', 'EVENT', 'EVENT_ACCURACY', 'EVENT_END',
-                          'EVENT_START', 'EVENT_TO_TARGET_DISTANCE', 'EVENT_X', 'EVENT_Y', 'EVENT_ZONE',
-                          'FIXATION_DURATION', 'GROUP', 'NODULE_ALL', 'NODULE_FORWARD', 'POSSIBLE_GRID_LOCATIONS',
-                          'RECORDING_SESSION_LABEL', 'SLICE_ALL', 'SLICE_FIXATION_DURATION', 'SLICE_FIXATION_END',
-                          'SLICE_FIXATION_START', 'SLICE_FORWARD', 'SLICE_TYPE', 'TARGET_X', 'TARGET_Y', 'TARGET_ZONE',
-                          'TRIAL', 'TRIAL_FIX_INDEX', 'TRIMMED_SLICE_FIXATION_DURATION']
-
-    # unique_in_raw = ['SAMPLE_INDEX', 'SAMPLE_START_TIME', 'IN_BLINK', 'IN_SACCADE',
-    #                  'TARGET_ZONE', 'TARGET_XY', 'GAZE_IA', 'GAZE_XY']
-    # unique_in_processed = ['CURRENT_FIX_DURATION', 'CURRENT_FIX_INTEREST_AREA_LABEL', 'CURRENT_FIX_COMPONENT_COUNT',
-    #                        'CURRENT_FIX_COMPONENT_INDEX', 'CURRENT_FIX_COMPONENT_DURATION', 'Zones']
-
-    if take_every_x_rows <= 0:
-        raise ValueError('Can take data with jumps of positive number of rows ONLY')
-    if take_every_x_rows != 1:
-        print_and_log(f'Taking data with jumps of {take_every_x_rows} rows', logging_type='warning')
-
-    def skip_rows(x):
-        return x % take_every_x_rows != 0  # If <take_every_x_rows == 1> then all the data is used
-
-    if isinstance(data_file_path, str):
-        data_file_path = [data_file_path]
-    dfs = []
-    data_file_path_loop = data_file_path if len(data_file_path) == 1 else tqdm(data_file_path, desc='Loading files')
-    for data_fp in data_file_path_loop:
-        if data_fp.endswith('.xlsx'):
-            data_fp_df = pd.read_excel(data_fp, nrows=nrows, skiprows=skip_rows)
-        elif data_fp.endswith('.csv'):
-            data_fp_df = pd.read_csv(data_fp,nrows=nrows,skiprows=skip_rows,engine='python',  on_bad_lines='skip')
-        else:
-            raise ValueError(f'Unsupported file type for {data_fp}')
-        dfs.append(data_fp_df)
-    df = pd.concat(dfs, ignore_index=True)
-    df.reset_index(drop=True, inplace=True)
-    # Save the original index as a column:
-    df['original_index'] = df.index
-
-    # print_and_log(f'Df len before - {len(df)}')
-    # df = df[df['RECORDING_SESSION_LABEL'] == 23]
-    # print_and_log(f'Df len after - {len(df)}')
-
-    # for col in df.columns:
-    #     print(f"Column: {col}, Type: {df[col].dtype}, Type Min/Max: {dtype_range(df[col].dtype)}, "
-    #           f"Value Min/Max: {df[col].min()}/{df[col].max()}")
-
-    # for data_key in ('AILMENT_NUMBER', 'Unnamed: 0'):
-    #     if data_key in df.keys():  # Undesired data
-    #         df = df.drop(data_key, axis=1)
-
-    df_keys = sorted(list(df.keys()))
-    if 'original_index' in df_keys:
-        df_keys.remove('original_index')
-
-    is_pr_data = len(df_keys) == len(orig_pr_data_keys) and sorted(df_keys) == sorted(orig_pr_data_keys)
-    is_f_pr_data = len(df_keys) == len(orig_f_pr_data_keys) and sorted(df_keys) == sorted(orig_f_pr_data_keys)
-    is_cat_f_pr_data = (len(df_keys) == len(orig_cat_f_data_keys) and
-                        sorted(df_keys) == sorted(orig_cat_f_data_keys))
-    is_gen_data = len(df_keys) == len(orig_gen_data_keys) and sorted(df_keys) == sorted(orig_gen_data_keys)
-    gen_data = False
-    processed_data = False
-    if is_pr_data or is_f_pr_data or is_cat_f_pr_data:
-        processed_data = True
-    elif len(df_keys) == len(orig_raw_data_keys) and sorted(df_keys) == sorted(orig_raw_data_keys):
-        processed_data = False
-    elif is_gen_data:
-        gen_data = True
-    else:
-        raise ValueError(f'Given file does not contain supported keys. Supported keys are either:\n'
-                         f'{orig_pr_data_keys}\n'
-                         f'Or:\n{orig_f_pr_data_keys}\n'
-                         f'Or:\n{orig_cat_f_data_keys}\n'
-                         f'Or:\n{orig_raw_data_keys}\n'
-                         f'Got:\n{df_keys}')
-
-    print_and_log(f'The original xlsx size is ({df.shape[0]} rows) X ({df.shape[1]} columns)')
-
-    # invalid_value, invalid_ia_str_value = 0, '@0'
-    invalid_value, invalid_ia_str_value = -1, '?-1'  # Remember, 'Zone' have '0' as the invalid value for this key.
-    df = df.replace(to_replace='.', value=invalid_value)
-    df = df.replace(to_replace=np.nan, value=invalid_value)
-
-    if not gen_data:
-        # Keys types conversions:
-        df['RECORDING_SESSION_LABEL'] = df['RECORDING_SESSION_LABEL'].astype(np.int8)
-        df['TRIAL_INDEX'] = df['TRIAL_INDEX'].astype(np.int8)
-        df['CURRENT_FIX_INDEX'] = df['CURRENT_FIX_INDEX'].astype(np.int16)
-        df['Pupil_Size'] = df['Pupil_Size'].astype(float).astype(np.int16)
-    if processed_data:
-        # Updated '-1' to an (X, Y) value that would be converted to (-1, -1) - the '?' sign would be converted to -1
-        df['CURRENT_FIX_INTEREST_AREA_LABEL'] = df['CURRENT_FIX_INTEREST_AREA_LABEL'].replace(
-            to_replace=str(invalid_value), value=invalid_ia_str_value)
-        df['CURRENT_FIX_INTEREST_AREA_LABEL'] = df['CURRENT_FIX_INTEREST_AREA_LABEL'].replace(
-            to_replace=invalid_value, value=invalid_ia_str_value)
-        # Create two new columns
-        df['CURRENT_FIX_IA_X'] = df['CURRENT_FIX_INTEREST_AREA_LABEL'].apply(lambda x: letter_to_num(x[0]))
-        df['CURRENT_FIX_IA_Y'] = df['CURRENT_FIX_INTEREST_AREA_LABEL'].apply(lambda x: int(x[1:]))
-        df = df.drop('CURRENT_FIX_INTEREST_AREA_LABEL', axis=1)
-
-        # Updating '0' to an (X, Y) value that would be converted to (-1, -1) - the '?' sign would be converted to -1
-        # df['Zones'] = df['Zones'].replace(to_replace='0', value=invalid_ia_str_value)
-        # df['Zones'] = df['Zones'].replace(to_replace=0, value=invalid_ia_str_value)
-        # df['Zones'] = df['Zones'].replace(to_replace=str(invalid_value), value=invalid_ia_str_value)
-        # df['Zones'] = df['Zones'].replace(to_replace=invalid_value, value=invalid_ia_str_value)
-        # df['Zones'] = df['Zones'].str.split(r',\s*')  # Split the 'Zones' column on comma with arbitrary number of spaces
-        # df = df.explode('Zones')  # Split the list items into separate rows
-        # Create two new columns
-        # df['Zones_X'] = df['Zones'].apply(lambda x: letter_to_num(x[0]))
-        # df['Zones_Y'] = df['Zones'].apply(lambda x: int(x[1:]))
-        # df['Zones_X'] = df['Zones'].apply(lambda x: convert_zone_value(x)[0])
-        # df['Zones_Y'] = df['Zones'].apply(lambda x: convert_zone_value(x)[1])
-        df = df.drop(labels='Zones', axis=1)
-
-        # Keys types conversions:
-        df['CURRENT_FIX_DURATION'] = df['CURRENT_FIX_DURATION'].astype(np.int32)
-        df['CURRENT_FIX_IA_X'] = df['CURRENT_FIX_IA_X'].astype(np.int8)
-        df['CURRENT_FIX_IA_Y'] = df['CURRENT_FIX_IA_Y'].astype(np.int8)
-        df['CURRENT_FIX_COMPONENT_COUNT'] = df['CURRENT_FIX_COMPONENT_COUNT'].astype(np.int16)
-        df['CURRENT_FIX_COMPONENT_INDEX'] = df['CURRENT_FIX_COMPONENT_INDEX'].astype(np.int16)
-        df['CURRENT_FIX_COMPONENT_DURATION'] = df['CURRENT_FIX_COMPONENT_DURATION'].astype(np.int16)
-        # df['Zones_X'] = df['Zones_X'].astype(np.int8)
-        # df['Zones_Y'] = df['Zones_Y'].astype(np.int8)
-        if 'CURRENT_FIX_COMPONENT_IMAGE_NUMBER' in df.keys():
-            df['CURRENT_FIX_COMPONENT_IMAGE_NUMBER'] = df['CURRENT_FIX_COMPONENT_IMAGE_NUMBER'].astype(np.int16)
-        # for drop_key in ['CURRENT_FIX_COMPONENT_IMAGE_FILE']:  # 'SCAN_TYPE', 'SLICE_TYPE', 'LOCATION_TYPE'
-        #     if drop_key in df.keys():
-        #         df = df.drop(labels=drop_key, axis=1)
-    elif gen_data:
-        # Updating '0' to an (X, Y) value that would be converted to (-1, -1) - the '?' sign would be converted to -1
-        # df['EVENT_ZONE'] = df['EVENT_ZONE'].replace(to_replace='0', value=invalid_ia_str_value)
-        # df['EVENT_ZONE'] = df['EVENT_ZONE'].replace(to_replace=0, value=invalid_ia_str_value)
-        # df['EVENT_ZONE'] = df['EVENT_ZONE'].replace(to_replace=str(invalid_value), value=invalid_ia_str_value)
-        # df['EVENT_ZONE'] = df['EVENT_ZONE'].replace(to_replace=invalid_value, value=invalid_ia_str_value)
-        # df['EVENT_ZONE'] = df['EVENT_ZONE'].str.split(r',\s*')  # Split on comma with arbitrary number of spaces
-        # df = df.explode('EVENT_ZONE')  # Split the list items into separate rows
-        # Create two new columns
-        # df['EVENT_ZONE_X'] = df['EVENT_ZONE'].apply(lambda x: letter_to_num(x[0]))
-        # df['EVENT_ZONE_Y'] = df['EVENT_ZONE'].apply(lambda x: int(x[1:]))
-        # df['ZONE_X'] = df['EVENT_ZONE'].apply(lambda x: convert_zone_value(x)[0])
-        # df['ZONE_Y'] = df['EVENT_ZONE'].apply(lambda x: convert_zone_value(x)[1])
-        df = df.drop(labels='EVENT_ZONE', axis=1)
-
-        # Keys types conversions:
-        # df['ZONE_X'] = df['ZONE_X'].astype(np.int8)
-        # df['ZONE_Y'] = df['ZONE_Y'].astype(np.int8)
-        df['TRIAL_FIX_INDEX'] = df['TRIAL_FIX_INDEX'].astype(np.int16)
-        df['EVENT_START'] = df['EVENT_START'].astype(np.int32)
-        df['EVENT_END'] = df['EVENT_END'].astype(np.int32)
-        df['FIXATION_DURATION'] = df['FIXATION_DURATION'].astype(np.int32)
-        df['SLICE_FIXATION_START'] = df['SLICE_FIXATION_START'].astype(np.int32)
-        df['SLICE_FIXATION_END'] = df['SLICE_FIXATION_END'].astype(np.int32)
-        df['SLICE_FIXATION_DURATION'] = df['SLICE_FIXATION_DURATION'].astype(np.int32)
-        df['CURRENT_FIX_PUPIL'] = df['CURRENT_FIX_PUPIL'].astype(np.int16)
-    else:  # Raw data
-        # Updated '-1' to an (X, Y) value that would be converted to (-1, -1) - the '?' sign would be converted to -1
-        df['GAZE_IA'] = df['GAZE_IA'].replace(to_replace=str(invalid_value), value=invalid_ia_str_value)
-        df['GAZE_IA'] = df['GAZE_IA'].replace(to_replace=invalid_value, value=invalid_ia_str_value)
-        # Create two new columns
-        df['GAZE_IA_X'] = df['GAZE_IA'].apply(lambda x: letter_to_num(x[0]))
-        df['GAZE_IA_Y'] = df['GAZE_IA'].apply(lambda x: int(x[1:]))
-        df = df.drop('GAZE_IA', axis=1)
-
-        # Keys types conversions:
-        df['GAZE_IA_X'] = df['GAZE_IA_X'].astype(np.int8)
-        df['GAZE_IA_Y'] = df['GAZE_IA_Y'].astype(np.int8)
-        df['SAMPLE_INDEX'] = df['SAMPLE_INDEX'].astype(np.int16)
-        df['SAMPLE_START_TIME'] = df['SAMPLE_START_TIME'].astype(np.int32)
-        df['IN_BLINK'] = df['IN_BLINK'].astype(bool)
-        df['IN_SACCADE'] = df['IN_SACCADE'].astype(bool)
-
-        # These three parameters will not be used in training:
-        df = df.drop('TARGET_ZONE', axis=1)
-        df = df.drop('TARGET_XY', axis=1)
-        df = df.drop('GAZE_XY', axis=1)
-
-    if not gen_data:
-        for key in df.keys():
-            if key in ('CURRENT_FIX_COMPONENT_IMAGE_FILE', 'SCAN_TYPE', 'SLICE_TYPE', 'LOCATION_TYPE','AILMENT_NUMBER'):
-                continue
-            if ((df[key] < 0) & (df[key] != invalid_value)).any():
-                raise ValueError(f'Df at key <{key}> contains negative non invalid_value ({invalid_value}) values')
-
-    if normalize:  # Normalize data points used in training:
-        print_and_log('Normalizing data points used in training')
-        if processed_data:
-            features_to_scale = [
-                'CURRENT_FIX_INDEX',
-                'Pupil_Size',
-                'CURRENT_FIX_DURATION',
-                'CURRENT_FIX_COMPONENT_COUNT',
-                'CURRENT_FIX_COMPONENT_DURATION',
-                # 'CURRENT_FIX_IA_X',
-                # 'CURRENT_FIX_IA_Y',
-            ]
-            # Unused features:
-            #   'RECORDING_SESSION_LABEL' - Not used in training
-            #   'TRIAL_INDEX' - Not used in training
-            #   'Zones' - Not used in training
-            #   'Hit'- Boolean
-            #   'CURRENT_FIX_COMPONENT_INDEX' - Because this parameter values range is very small
-            #   'CURRENT_FIX_COMPONENT_IMAGE_NUMBER'
-        elif gen_data:
-            features_to_scale = [
-                'TRIAL_FIX_INDEX',
-                'FIXATION_DURATION',
-                'SLICE_FIXATION_DURATION',
-                'CURRENT_FIX_PUPIL',
-            ]
-        else:
-            features_to_scale = ['CURRENT_FIX_INDEX',
-                                 'Pupil_Size',
-                                 'SAMPLE_INDEX',
-                                 'SAMPLE_START_TIME']
-            # Unused features:
-            #   'RECORDING_SESSION_LABEL' - Not used in training
-            #   'TRIAL_INDEX' - Not used in training
-            #   'TARGET_ZONE' - Not used in training
-            #   'TARGET_XY' - Not used in training
-            #   'GAZE_XY' - Not used in training
-            #   'Hit' - Boolean
-            #   'IN_BLINK' - Boolean
-            #   'IN_SACCADE' - Boolean
-            #   'GAZE_IA_X' - Because this parameter values range only from 1 to 12
-            #   'GAZE_IA_Y' - Because this parameter values range only from 1 to 12
-            # TODO: Try with 'GAZE_IA_X', 'GAZE_IA_Y'
-        print_and_log(f'Normalizing this features:\n{features_to_scale}')
-        scaler_type = 'minmax'
-        # scaler_type = 'zscore'
-        # scaler_type = 'l2'
-        df = features_scaler(df=df, features_to_scale=features_to_scale, scaler_type=scaler_type)
-
-    if augment:
-        print_and_log('Augmenting data')
-        pos_inds = df['Pupil_Size'] > 0
-        df.loc[pos_inds, 'Pupil_Size'] += np.random.randint(-10, 11, df.loc[pos_inds, 'Pupil_Size'].shape[0])
-
-        # df_tmp = pd.DataFrame()
-        #
-        # directions = list(itertools.product([-1, 0, 1], repeat=2))
-        # directions.remove((0, 0))
-        #
-        # for dx, dy in directions:
-        #     df_copy = df.copy()
-        #     df_copy['CURRENT_FIX_IA_X'] += dx
-        #     df_copy['CURRENT_FIX_IA_Y'] += dy
-        #     df_tmp = pd.concat([df_tmp, df_copy], ignore_index=True)
-        # df = pd.concat([df, df_tmp], ignore_index=True)
-
-    # Clean interest areas point out of the grid:
-    print_and_log(f'Len of df before cleanup of out of the 12X12 grid interest areas - {len(df)}')
-    if processed_data:
-        ia_x = 'CURRENT_FIX_IA_X'
-        ia_y = 'CURRENT_FIX_IA_Y'
-    elif gen_data:
-        ia_x = 'ZONE_X'
-        ia_y = 'ZONE_Y'
-    else:
-        ia_x = 'GAZE_IA_X'
-        ia_y = 'GAZE_IA_Y'
-    df = df[(df[ia_x] >= 0) & (df[ia_x] <= 12)]
-    df = df[(df[ia_y] >= 0) & (df[ia_y] <= 12)]
-    df = df.reset_index(drop=True)  # Reset the index after the cleanup, important for data splits
-    print_and_log(f'Len df after - {len(df)}')
-
-    # # For data viewing
-    # for key in df.keys():
-    #     print_and_log(f'For key {key} got uniques - {sorted(set(df[key]))}')
-
-    # df = df.replace(-1, np.nan)
-
-    # # Reduce <target = false> data points to the size of the <target = true> data points for balance:
-    # print(f'Down-sampling target == False:\nSize before was {len(df)}')
-    # true_df = df[df['target']]
-    # false_df = df[~df['target']]
-    # sampled_false_df = false_df.sample(n=len(true_df))
-    # df = pd.concat([true_df, sampled_false_df]).reset_index(drop=True)  # To shuffle - df.sample(frac=1)
-    # print(f'Size after is {len(df)}')
-
-    # # Good for ML/DL, convert categorical data to dummy-data / indicator-data
-    # df = pd.get_dummies(df, columns='CURRENT_FIX_INTEREST_AREA_LABEL')
-
-    if change_target_to_before_target:
-        # Update the preceding data point to the hit(s) to be the point of interest
-        df = update_target_to_before_target(df=df)
-
-    if change_target_to_after_target:
-        # Update the succeeding data point to the hit(s) to be the point of interest
-        df = update_target_to_after_target(df)
-
-    if remove_surrounding_to_hits or update_surrounding_to_hits:
-        if remove_surrounding_to_hits and update_surrounding_to_hits:
-            raise ValueError('Can not remove and update surrounding to hits at the same time')
-
-        ia_x, ia_y = ('CURRENT_FIX_IA_X', 'CURRENT_FIX_IA_Y') if processed_data else ('GAZE_IA_X', 'GAZE_IA_Y')
-        df['to_update'] = False
-        df.apply(lambda row: mark_surrounding_rows(row=row,
-                                                   df=df,
-                                                   ia_x=ia_x,
-                                                   ia_y=ia_y,
-                                                   unit=remove_surrounding_to_hits or update_surrounding_to_hits),
-                 axis=1)
-
-        print_and_log(f'Sum of values in the <to_update> column that are True - {df["to_update"].sum()}')
-        if update_surrounding_to_hits:
-            print_and_log('Updating to <True> rows surrounding the rows where <target == True>')
-            df.loc[df['to_update'], 'target'] = True
-        else:
-            print_and_log('Removing rows surrounding the rows where <target == True>')
-            print_and_log(f'Df length before removal of rows surrounding hits rows - {len(df)}')
-            df = df[~df['to_update']]
-            print_and_log(f'Df length after - {len(df)}')
-        df.drop('to_update', axis=1, inplace=True)
-
-    # print_and_log("Removing rows where SLICE_TYPE == 'ABNORMAL_SLICE'")
-    # print_and_log(f'Len df before removal of rows where SLICE_TYPE == "ABNORMAL_SLICE" - {len(df)}')
-    # df = df[df['SLICE_TYPE'] != 'ABNORMAL_SLICE']
-    # print_and_log(f'Len df after - {len(df)}')
-
-    # print_and_log("Removing rows where SLICE_TYPE == 'NODULE_SLICE':")
-    # print_and_log(f'Df len before - {len(df)}')
-    # df = df[df['SLICE_TYPE'] != 'NODULE_SLICE']
-    # print_and_log(f'Len df after - {len(df)}')
-
-    # print_and_log(f'Number of targets before updating non-normal slices to targets is {df["target"].sum()}')
-    # df.loc[df['SCAN_TYPE'] != 'NORMAL', 'target'] = True
-    # print_and_log(f'Number of targets after updating non-normal slices to targets is {df["target"].sum()}')
-
-    # print_and_log('Take only the first participant:')
-    # print_and_log(f'Df len before - {len(df)}')
-    # df = df[df['RECORDING_SESSION_LABEL'] == 1]
-    # print_and_log(f'Df len after - {len(df)}')
-
-    # print_and_log('Take only half of the normal data rows:')
-    # print_and_log(f'Df len before - {len(df)}')
-    # normal_scans = df[df['SCAN_TYPE'] == 'NORMAL'].iloc[::2]
-    # other_scans = df[df['SCAN_TYPE'] != 'NORMAL']
-    # df = pd.concat([normal_scans, other_scans])
-    # df = df.sort_index()
-    # print_and_log(f'Df len after - {len(df)}')
-
-    # >>> set(df['SCAN_TYPE'])
-    # {'ABNORMAL', 'NORMAL'}
-    # >>> set(df['SLICE_TYPE'])
-    # {'NORMAL_SLICE', 'ABNORMAL_SLICE', 'NODULE_SLICE'}
-    # >>> set(df['LOCATION_TYPE'])
-    # {'NORMAL_MISS', 'NODULE_SURROUND', 'NODULE_HIT', 'ABNORMAL_MISS', 'NODULE_MISS'}
-
-    # # Remove normal scans:
-    # print_and_log('Removing non abnormal scans:')
-    # print_and_log(f'Len df before removal of non abnormal scans - {len(df)}')
-    # df = df[~df['SLICE_TYPE'].isin(('NORMAL', 'NORMAL_SLICE'))]
-    # print_and_log(f'Len df after - {len(df)}')
-
-    if approach_num <= 0:
-        print_and_log(f'No approach (Given approach number {approach_num}). No changes to the data')
-    elif approach_num in (1, 2, 3, 4, 5):
-        raise ValueError(f'Unsupported approach - {approach_num}. Scan Type prediction is not supported on an ML model')
-    elif approach_num == 6:
-        print_and_log('==================================\n'
-                      'Approach 6.\n'
-                      'Include - normal slices,\n'
-                      '          abnormal slices,\n'
-                      '          non-hit nodule slices\n'
-                      'Exclude - none\n'
-                      'Prediction level - slice types\n'
-                      'Prediction target - nodule slices\n'
-                      '==================================\n')
-        df['target'] = np.where(df['SLICE_TYPE'] == 'NODULE_SLICE', True, False)
-        print_and_log(f'Number of targets after updating targets to be the nodule-slice - {df["target"].sum()}')
-    elif approach_num == 7:
-        print_and_log('=================================\n'
-                      'Approach 7.\n'
-                      'Include - normal slices,\n'
-                      '          nodule slices\n'
-                      'Exclude - abnormal slices\n'
-                      'Prediction level - slice type\n'
-                      'Prediction target - nodule slice\n'
-                      '=================================\n')
-        print_and_log(f'Len df before removal of rows where SLICE_TYPE == "ABNORMAL_SLICE" - {len(df)}')
-        df = df[df['SLICE_TYPE'] != 'ABNORMAL_SLICE']
-        print_and_log(f'Len df after - {len(df)}')
-
-        df.loc[:, 'target'] = np.where(df['SLICE_TYPE'] == 'NODULE_SLICE', True, False)
-        print_and_log(f'Number of targets after updating targets to be the nodule-slice - {df["target"].sum()}')
-    elif approach_num == 8:
-        print_and_log('====================================\n'
-                      'Approach 8.\n'
-                      'Include - normal miss zone,\n'
-                      '          abnormal miss zone,\n'
-                      '          nodule miss zone,\n'
-                      '          nodule surround zone,\n'
-                      '          nodule hit zone\n'
-                      'Exclude - none\n'
-                      'Prediction level - zone type\n'
-                      'Prediction target - nodule hit zone\n'
-                      '====================================\n')
-        df.loc[:, 'target'] = np.where(df['LOCATION_TYPE'] == 'NODULE_HIT', True, False)
-        print_and_log(f'Number of targets after updating targets to be the nodule-hit-zone - {df["target"].sum()}')
-    elif approach_num == 9:
-        print_and_log('====================================\n'
-                      'Approach 9.\n'
-                      'Include - normal miss zone,\n'
-                      '          nodule hit zone\n'
-                      'Exclude - abnormal miss zone,\n'
-                      '          nodule miss zone,\n'
-                      '          nodule surround zone\n'
-                      'Prediction level - zone type\n'
-                      'Prediction target - nodule hit zone\n'
-                      '====================================')
-        print_and_log(f"Len df before removal of rows where LOCATION_TYPE in "
-                      f"('ABNORMAL_MISS', 'NODULE_MISS', 'NODULE_SURROUND') - {len(df)}")
-        df = df[~df['LOCATION_TYPE'].isin(('ABNORMAL_MISS', 'NODULE_MISS', 'NODULE_SURROUND'))]
-        print_and_log(f'Len df after - {len(df)}')
-
-        df['target'] = np.where(df['LOCATION_TYPE'] == 'NODULE_HIT', True, False)
-        print_and_log(f'Number of targets after updating targets to be the nodule-hit-zone - {df["target"].sum()}')
-    elif approach_num == 10:
-        print_and_log('====================================\n'
-                      'Approach 10.\n'
-                      'Include - Experts & Generalists\n'
-                      'Exclude - Medical-students\n'
-                      'Prediction level - Scan\n'
-                      'Prediction target - Generalists\n'
-                      '====================================')
-        target_group = 'EXPERT'
-        group_to_remove = 'MED_STUDENT'  # 'GENERALIST', 'MED_STUDENT', 'EXPERT'
-
-        # Target is true if <target_group>, false otherwise:
-        df.loc[:, 'target'] = (df['GROUP'] == target_group).astype(bool)
-        # Remove rows where the 'GROUP' value is <group_to_remove>:
-        print_and_log(f'Len df before removal of rows where GROUP == {group_to_remove} - {len(df)}')
-        df = df[df['GROUP'] != group_to_remove]
-        print_and_log(f'Len df after - {len(df)}')
-        df.reset_index(drop=True, inplace=True)
-    elif approach_num == 11:
-        print_and_log('====================================\n'
-                      'Approach 11.\n'
-                      'Include - Experts & Medical-students\n'
-                      'Exclude - Generalists\n'
-                      'Prediction level - Scan\n'
-                      'Prediction target - Generalists\n'
-                      '====================================')
-        target_group = 'EXPERT'
-        group_to_remove = 'GENERALIST'  # 'GENERALIST', 'MED_STUDENT', 'EXPERT'
-
-        # Target is true if <target_group>, false otherwise:
-        df.loc[:, 'target'] = (df['GROUP'] == target_group).astype(bool)
-        # Remove rows where the 'GROUP' value is <group_to_remove>:
-        print_and_log(f'Len df before removal of rows where GROUP == {group_to_remove} - {len(df)}')
-        df = df[df['GROUP'] != group_to_remove]
-        print_and_log(f'Len df after - {len(df)}')
-        df.reset_index(drop=True, inplace=True)
-    elif approach_num == 12:
-        print_and_log('====================================\n'
-                      'Approach 12.\n'
-                      'Include - Generalists & Medical-students\n'
-                      'Exclude - Experts\n'
-                      'Prediction level - Scan\n'
-                      'Prediction target - Generalists\n'
-                      '====================================')
-        target_group = 'GENERALIST'
-        group_to_remove = 'EXPERTS'  # 'GENERALIST', 'MED_STUDENT', 'EXPERT'
-
-        # Target is true if <target_group>, false otherwise:
-        df.loc[:, 'target'] = (df['GROUP'] == target_group).astype(bool)
-        # Remove rows where the 'GROUP' value is <group_to_remove>:
-        print_and_log(f'Len df before removal of rows where GROUP == {group_to_remove} - {len(df)}')
-        df = df[df['GROUP'] != group_to_remove]
-        print_and_log(f'Len df after - {len(df)}')
-        df.reset_index(drop=True, inplace=True)
-    elif approach_num == 15:
-        print_and_log('====================================\n'
-                      'Approach 15.\n'
-                      'Include - normal miss zone,\n'
-                      '          abnormal miss zone,\n'
-                      '          nodule miss zone,\n'
-                      '          nodule surround zone,\n'
-                      '          nodule hit zone\n'
-                      'Exclude - none\n'
-                      'Prediction level - zone type\n'
-                      'Prediction target - any fixation in AILMENT_NUMBER\n'
-                      '                    with nodule hit zone\n'
-                      '====================================\n')
-
-        # First, identify all AILMENT_NUMBERs that contain any NODULE_HIT
-        ailments_with_hits = df[df['LOCATION_TYPE'] == 'NODULE_HIT']['AILMENT_NUMBER'].unique()
-
-        # Remove any invalid values (like -1, NaN, etc.) if they exist
-        ailments_with_hits = ailments_with_hits[ailments_with_hits != -1]  # Assuming -1 is invalid
-        ailments_with_hits = ailments_with_hits[~pd.isna(ailments_with_hits)]  # Remove NaN values
-
-        # Set target to True for all fixations in ailments that have any nodule hits
-        df.loc[:, 'target'] = df['AILMENT_NUMBER'].isin(ailments_with_hits)
-
-        # Log some statistics for verification
-        total_ailments = df['AILMENT_NUMBER'].nunique()
-        ailments_with_hits_count = len(ailments_with_hits)
-        total_positive_fixations = df['target'].sum()
-        total_fixations = len(df)
-
-        print_and_log(f'Statistics for Approach 15:\n'
-                      f'Total unique ailments: {total_ailments}\n'
-                      f'Ailments with nodule hits: {ailments_with_hits_count}\n'
-                      f'Total positive fixations: {total_positive_fixations}\n'
-                      f'Total fixations: {total_fixations}\n'
-                      f'Positive ratio: {total_positive_fixations / total_fixations:.4f}\n')
-    else:
-        raise ValueError(f'Unsupported approach - {approach_num}')
-
-    if match_non_targets_to_targets:
-        # Match non-targets to targets:
-        print_and_log('Match non-targets to targets')
-        non_targets = df[~df['target']]
-        targets = df[df['target']]
-        sampled_non_targets = non_targets.sample(n=len(targets), random_state=42)
-        df = pd.concat([targets, sampled_non_targets]).reset_index(drop=True).sample(frac=1, random_state=42)
-
-    # Reset the index after all the changes:
-    df.reset_index(drop=True, inplace=True)
-
-    # Analyze the distribution of the target variable ('Hit'):
-    print_and_log('The distribution of the target variable (Hit):')
-    print_and_log(df['target'].value_counts(normalize=True))
-    print_and_log(df['target'].value_counts(normalize=False))
-
-    # df['label_change'] = (df['RECORDING_SESSION_LABEL'] != df['RECORDING_SESSION_LABEL'].shift()).cumsum()
-    # # Create a dictionary to map unique combinations to new numeric labels
-    # label_dict = {combo: i + 1 for i, combo in
-    #               enumerate(df.groupby(['RECORDING_SESSION_LABEL', 'label_change']).groups.keys())}
-    # # Create UNIQUE_SESSION_LABEL using the mapping
-    # df['RECORDING_SESSION_LABEL'] = df.apply(
-    #     lambda row: label_dict[(row['RECORDING_SESSION_LABEL'], row['label_change'])], axis=1)
-    # df = df.drop('label_change', axis=1)
-
-    if return_bool_asking_if_processed_data:
-        return df, processed_data, gen_data
-    return df
+if __name__ == "__main__":
+    for part in range(35, 36):
+        print(f"\n{'#' * 20} participant_id {part} {'#' * 20}")
+        try:
+            two_step_pipeline(
+                participant_id=part,
+                window_size=10,
+                seed=0,
+                remove_isolated=True,
+                neighbor_radius=1,
+                min_neighbors=1
+            )
+        except Exception as e:
+            print(f"Error processing participant {part}: {e}")

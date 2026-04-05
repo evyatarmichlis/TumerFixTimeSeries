@@ -1,390 +1,485 @@
 import os
+import json
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from pathlib import Path
+from typing import Dict, List
+from collections import Counter, defaultdict
+import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 from torch.utils.data import DataLoader, TensorDataset
 
-from representation_method.EKG_2_step_pipeline import reconstruct_and_evaluate_efficiency
-# Import your existing modules
-from representation_method.utils.general_utils import seed_everything
+# Import your existing modules (GradientLocalizer removed)
+from representation_method.utils.general_utils import seed_everything, evaluate_reconstructed_predictions
 from representation_method.utils.data_loader import load_eye_tracking_data, DataConfig
-from representation_method.utils.data_utils import create_dynamic_time_series, split_train_test_for_time_series, \
+from representation_method.utils.data_utils import (
+    create_dynamic_time_series, split_train_test_for_time_series,
     create_dynamic_time_series_with_ailment
-from representation_method.utils.trainers import EnsembleTrainer
-from representation_method.models.classifier import CombinedModel, CNN1DModel, GradientLocalizer
-
-# Import supervised transformer components
-from representation_method.models.supervised_transformer import (
-    IntegratedEyeTrackingTransformer,
-    EyeTrackingTokenizer,
-    TargetLocalizer,
-    create_dataset,
-    custom_collate,
-    train_multi_task
 )
-from representation_method.models.self_supervised_transformer import calculate_metrics
+from representation_method.utils.trainers import EnsembleTrainer
+from representation_method.models.classifier import CombinedModel, CNN1DModel
+
+FEATURE_COLUMNS = [
+    'Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X',
+    'CURRENT_FIX_IA_Y', 'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT',
+    'WINDOW_MAX_SLICE_FREQ'
+]
 
 
-def track_ailments_in_predictions(predicted_positions, window_metadata, tolerance=1):
-    """
-    Track which ailments are found by the model's predictions within a window
+# ==========================================
+# 1. VISUALIZATION & PLOTTING HELPERS
+# ==========================================
+# (Kept your existing plotting functions intact)
 
-    Args:
-        predicted_positions: List of positions where model predicts targets
-        window_metadata: Metadata containing ailment information for this window
-        tolerance: Tolerance for matching predicted positions to ailment positions
+def plot_participant_panel_of_trial_heatmaps(meta: list[dict], test_df: pd.DataFrame, positive_indices: np.ndarray,
+                                             out_dir: str, img_col: str = "CURRENT_FIX_COMPONENT_IMAGE_FILE",
+                                             top_k_per_trial: int = 80) -> None:
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    panel_out = Path(out_dir) / "participant_panels"
+    panel_out.mkdir(parents=True, exist_ok=True)
 
-    Returns:
-        Dictionary with ailment tracking results
-    """
-    ailment_results = {
-        'ailments_in_window': set(),
-        'ailments_found_by_model': set(),
-        'ailment_positions_found': [],
-        'total_ailment_positions_in_window': 0,
-        'ailment_positions_matched': 0,
-        'ailment_detection_success': False
-    }
+    pred_by_trial = defaultdict(Counter)
+    parts_set = set()
+    for i in positive_indices:
+        if 0 <= i < len(meta):
+            m = meta[i]
+            trial_key = (m.get("participant_id"), m.get("trial_id"))
+            parts_set.add(m.get("participant_id"))
+            for s in set(map(str, m.get("window_unique_slices", m.get("window_slices", [])))):
+                pred_by_trial[trial_key][s] += 1
 
-    # Extract ailment information from metadata
-    if not window_metadata.get('has_valid_ailment', False):
-        return ailment_results
+    gt_by_trial = defaultdict(set)
+    if img_col in test_df.columns:
+        for (pid, tid), sub in test_df.groupby(["RECORDING_SESSION_LABEL", "TRIAL_INDEX"]):
+            if "target" in sub.columns:
+                gt_slices = set(map(str, sub.loc[sub["target"] == 1, img_col].astype(str).unique()))
+                gt_by_trial[(pid, tid)] = gt_slices
+                parts_set.add(pid)
 
-    ailment_positions = window_metadata.get('ailment_positions', [])
-    ailment_numbers = window_metadata.get('ailment_numbers', [])
-    ailment_details = window_metadata.get('ailment_details', [])
+    participants = sorted([p for p in parts_set if p is not None])
+    for pid in participants:
+        trials = sorted({tid for (p, tid) in list(pred_by_trial.keys()) + list(gt_by_trial.keys()) if p == pid})
+        if not trials: continue
 
-    # Track all ailments present in this window
-    ailment_results['ailments_in_window'] = set(ailment_numbers)
-    ailment_results['total_ailment_positions_in_window'] = len(ailment_positions)
+        per_trial_M, per_trial_labels, per_trial_titles, per_trial_widths = [], [], [], []
 
-    # Check which ailment positions are matched by model predictions
-    matched_ailment_positions = set()
-    found_ailments = set()
+        for tid in trials:
+            trial_key = (pid, tid)
+            counter = pred_by_trial.get(trial_key, Counter())
+            gt_set = gt_by_trial.get(trial_key, set())
+            sub = test_df[(test_df["RECORDING_SESSION_LABEL"] == pid) & (test_df["TRIAL_INDEX"] == tid)]
+            ordered_all = list(dict.fromkeys(sub[img_col].astype(str).tolist()))
+            all_slices = set(counter.keys()) | set(gt_set)
+            ordered = [s for s in ordered_all if s in all_slices]
+            if top_k_per_trial: ordered = ordered[:top_k_per_trial]
+            n = len(ordered)
+            if n == 0: continue
 
-    for pred_pos in predicted_positions:
-        for i, ailment_pos in enumerate(ailment_positions):
-            if abs(pred_pos - ailment_pos) <= tolerance:
-                matched_ailment_positions.add(ailment_pos)
-                # Find which ailment number this position corresponds to
-                for detail in ailment_details:
-                    if detail['relative_position'] == ailment_pos:
-                        found_ailments.add(detail['ailment_number'])
-                        break
+            counts = np.array([counter.get(s, 0) for s in ordered], dtype=float)
+            density = counts / counts.max() if counts.max() > 0 else counts
+            gt_vec = np.array([1.0 if s in gt_set else 0.0 for s in ordered], dtype=float)
+            per_trial_M.append(np.vstack([density[None, :], gt_vec[None, :]]))
+            per_trial_labels.append(ordered)
+            per_trial_titles.append(f"Trial {tid}")
+            per_trial_widths.append(n)
 
-    ailment_results['ailment_positions_matched'] = len(matched_ailment_positions)
-    ailment_results['ailments_found_by_model'] = found_ailments
-    ailment_results['ailment_positions_found'] = list(matched_ailment_positions)
-    ailment_results['ailment_detection_success'] = len(found_ailments) > 0
+        if not per_trial_M: continue
 
-    return ailment_results
+        n_trials = len(per_trial_M)
+        fig, axes = plt.subplots(n_trials, 1,
+                                 figsize=(max(12.0, 0.18 * max(per_trial_widths)), max(3.0, 2.2 * n_trials)),
+                                 constrained_layout=True)
+        if n_trials == 1: axes = [axes]
 
-def modified_stage2_evaluation_with_ailment_tracking(transformer_model, tokenizer, feature_columns,
-                                                     eval_windows, eval_metadata, device):
-    """
-    Modified Stage 2 evaluation that tracks ailments found by the model
-    """
-    localizer = TargetLocalizer(transformer_model, device)
+        for ax, M, labels, title in zip(axes, per_trial_M, per_trial_labels, per_trial_titles):
+            n = M.shape[1]
+            ax.imshow(M, aspect='auto', interpolation='nearest', vmin=0.0, vmax=1.0, cmap='viridis')
+            gt_overlay = np.zeros_like(M)
+            gt_overlay[1, :] = M[1, :]
+            gt_masked = np.ma.masked_where(gt_overlay == 0, gt_overlay)
+            ax.imshow(gt_masked, aspect='auto', interpolation='nearest', vmin=0.0, vmax=1.0,
+                      cmap=plt.matplotlib.colors.ListedColormap([[0, 0, 0, 0], [0, 1, 0, 0.85]]))
+            ax.set_yticks([0, 1])
+            ax.set_yticklabels(["Pred", "GT"])
+            xticks = np.arange(0, n, max(1, n // 40))
+            ax.set_xticks(xticks)
+            ax.set_xticklabels([labels[i] for i in xticks], rotation=90, fontsize=8)
+            ax.set_title(title, fontsize=11)
 
-    print("Evaluating target localization with ailment tracking...")
-    all_results = []
-
-    # Track overall ailment statistics
-    total_ailments_in_eval_windows = set()
-    ailments_found_by_stage2 = set()
-    windows_with_successful_ailment_detection = 0
-    total_ailment_positions_in_eval = 0
-    ailment_positions_found_by_stage2 = 0
-
-    for window, meta in zip(eval_windows, eval_metadata):
-        if meta.get('has_valid_ailment', False):
-            total_ailments_in_eval_windows.update(meta.get('ailment_numbers', []))
-            total_ailment_positions_in_eval += len(meta.get('ailment_positions', []))
-
-        # Tokenize and run model
-        window_df = pd.DataFrame(window, columns=feature_columns)
-        tokenized_window = tokenizer.tokenize(window_df, feature_columns)
-        window_tensor = torch.tensor(tokenized_window, dtype=torch.long).unsqueeze(0)
-
-        # Get standard localize_targets results first
-        results = localizer.localize_targets(
-            window_tensor,
-            meta['target_positions'],  # Ground truth target positions
-            0,
-            window_metadata=meta,
-            supervised=True
-        )
-
-        ailment_results = track_ailments_in_predictions(
-            results.get('top_k_positions', []), meta, tolerance=1
-        )
-
-        # Merge results
-        results.update(ailment_results)
-
-        # Track ailments found
-        found_ailments = results.get('ailments_found_by_model', set())
-        ailments_found_by_stage2.update(found_ailments)
-
-        if results.get('ailment_detection_success', False):
-            windows_with_successful_ailment_detection += 1
-
-        ailment_positions_found_by_stage2 += results.get('ailment_positions_matched', 0)
-
-        # Add metadata for tracking
-        results.update({
-            'participant_id': meta['participant_id'],
-            'trial_id': meta['trial_id'],
-            'window_has_ailments': meta.get('has_valid_ailment', False),
-            'ailments_in_window': list(meta.get('ailment_numbers', [])),
-        })
-
-        all_results.append(results)
-
-    # Calculate Stage 2 ailment detection metrics
-    stage2_ailment_detection_rate = len(ailments_found_by_stage2) / len(
-        total_ailments_in_eval_windows) if total_ailments_in_eval_windows else 0
-    stage2_ailment_position_precision = ailment_positions_found_by_stage2 / total_ailment_positions_in_eval if total_ailment_positions_in_eval > 0 else 0
-
-    print(f"\nStage 2 Ailment Detection Results:")
-    print(f"  Total unique ailments in eval windows: {len(total_ailments_in_eval_windows)}")
-    print(f"  Ailments found by Stage 2: {len(ailments_found_by_stage2)}")
-    print(
-        f"  Stage 2 ailment detection rate: {stage2_ailment_detection_rate:.4f} ({stage2_ailment_detection_rate * 100:.2f}%)")
-    print(f"  Found ailments: {sorted(list(ailments_found_by_stage2))}")
-    print(
-        f"  Windows with successful ailment detection: {windows_with_successful_ailment_detection}/{len(eval_windows)}")
-    print(f"  Ailment positions found: {ailment_positions_found_by_stage2}/{total_ailment_positions_in_eval}")
-    print(f"  Ailment position precision: {stage2_ailment_position_precision:.4f}")
-
-    # Calculate traditional target detection metrics
-    if len(all_results) > 0:
-        results_df = pd.DataFrame(all_results)
-        target_metrics = calculate_metrics(results_df)
-
-        print(f"\nStage 2 Target Detection Results:")
-        print(f"  Target Precision: {target_metrics['precision']:.4f}")
-        print(f"  Target Recall: {target_metrics['recall']:.4f}")
-        print(f"  Target F1 Score: {target_metrics['f1']:.4f}")
-    else:
-        target_metrics = {'precision': 0, 'recall': 0, 'f1': 0}
-
-    return {
-        'target_metrics': target_metrics,
-        'ailment_metrics': {
-            'total_ailments_in_eval': len(total_ailments_in_eval_windows),
-            'ailments_found': len(ailments_found_by_stage2),
-            'detection_rate': stage2_ailment_detection_rate,
-            'found_ailments': sorted(list(ailments_found_by_stage2)),
-            'successful_windows': windows_with_successful_ailment_detection,
-            'ailment_position_precision': stage2_ailment_position_precision,
-            'total_ailment_positions': total_ailment_positions_in_eval,
-            'ailment_positions_found': ailment_positions_found_by_stage2
-        },
-        'detailed_results': all_results
-    }
+        fig.colorbar(axes[0].images[0], ax=axes, fraction=0.02, pad=0.01).set_label('Normalized density', rotation=90)
+        fig.suptitle(f"Participant {pid} — Per-trial slice density vs. GT (2 rows per trial)", fontsize=13)
+        fig.savefig(panel_out / f"participant_{pid}.png", dpi=150)
+        plt.close(fig)
 
 
+def plot_participant_slice_heatmap_with_gt(meta: list[dict], test_df: pd.DataFrame, positive_indices: np.ndarray,
+                                           out_dir: str, img_col: str = "CURRENT_FIX_COMPONENT_IMAGE_FILE",
+                                           top_k_per_trial: int = 80) -> None:
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    part_out = Path(out_dir) / "participant_heatmaps"
+    part_out.mkdir(parents=True, exist_ok=True)
+
+    pred_by_trial = defaultdict(Counter)
+    parts_set = set()
+    for i in positive_indices:
+        if 0 <= i < len(meta):
+            m = meta[i]
+            trial_key = (m.get("participant_id"), m.get("trial_id"))
+            parts_set.add(m.get("participant_id"))
+            for s in set(map(str, m.get("window_unique_slices", m.get("window_slices", [])))):
+                pred_by_trial[trial_key][s] += 1
+
+    gt_by_trial = defaultdict(set)
+    if img_col in test_df.columns:
+        for (pid, tid), sub in test_df.groupby(["RECORDING_SESSION_LABEL", "TRIAL_INDEX"]):
+            if "target" in sub.columns:
+                gt_slices = set(map(str, sub.loc[sub["target"] == 1, img_col].astype(str).unique()))
+                gt_by_trial[(pid, tid)] = gt_slices
+                parts_set.add(pid)
+
+    participants = sorted([p for p in parts_set if p is not None])
+    for pid in participants:
+        trials = sorted({tid for (p, tid) in list(pred_by_trial.keys()) + list(gt_by_trial.keys()) if p == pid})
+        if not trials: continue
+
+        per_trial_density, per_trial_gt, trial_widths, trial_labels = [], [], [], []
+
+        for tid in trials:
+            trial_key = (pid, tid)
+            counter = pred_by_trial.get(trial_key, Counter())
+            gt_set = gt_by_trial.get(trial_key, set())
+            sub = test_df[(test_df["RECORDING_SESSION_LABEL"] == pid) & (test_df["TRIAL_INDEX"] == tid)]
+            ordered_all = list(dict.fromkeys(sub[img_col].astype(str).tolist()))
+            all_slices = set(counter.keys()) | set(gt_set)
+            ordered = [s for s in ordered_all if s in all_slices]
+            if top_k_per_trial: ordered = ordered[:top_k_per_trial]
+            n = len(ordered)
+            if n == 0: continue
+
+            counts = np.array([counter.get(s, 0) for s in ordered], dtype=float)
+            per_trial_density.append(counts / counts.max() if counts.max() > 0 else counts)
+            per_trial_gt.append(np.array([1.0 if s in gt_set else 0.0 for s in ordered], dtype=float))
+            trial_widths.append(n)
+            trial_labels.append(tid)
+
+        if not per_trial_density: continue
+
+        total_cols = int(np.sum(trial_widths))
+        total_rows = 2 * len(per_trial_density)
+        M, GT = np.zeros((total_rows, total_cols), dtype=float), np.zeros((total_rows, total_cols), dtype=float)
+
+        col_offsets = np.cumsum([0] + trial_widths[:-1])
+        for k, (dens, gtv, w) in enumerate(zip(per_trial_density, per_trial_gt, trial_widths)):
+            r0, c0 = 2 * k, int(col_offsets[k])
+            M[r0, c0:c0 + w] = dens
+            M[r0 + 1, c0:c0 + w] = 0.0
+            GT[r0 + 1, c0:c0 + w] = gtv
+
+        fig, ax = plt.subplots(figsize=(max(12.0, 0.03 * total_cols), max(3.0, 0.55 * total_rows)))
+        im = ax.imshow(M, aspect='auto', interpolation='nearest', vmin=0.0, vmax=1.0, cmap='viridis')
+        ax.imshow(np.ma.masked_where(GT == 0, GT), aspect='auto', interpolation='nearest', vmin=0.0, vmax=1.0,
+                  cmap=plt.matplotlib.colors.ListedColormap([[0, 0, 0, 0], [0, 1, 0, 0.85]]))
+
+        yticks, ylabels = [], []
+        for k, tid in enumerate(trial_labels):
+            yticks.extend([2 * k, 2 * k + 1])
+            ylabels.extend([f"Trial {tid} — Pred", f"Trial {tid} — GT"])
+        ax.set_yticks(yticks)
+        ax.set_yticklabels(ylabels)
+
+        boundaries = list(col_offsets) + [total_cols]
+        ax.set_xticks([(boundaries[i] + boundaries[i + 1]) / 2 for i in range(len(trial_widths))])
+        ax.set_xticklabels([f"T{t}" for t in trial_labels], rotation=0)
+        for b in boundaries: ax.axvline(b - 0.5, color='white', linewidth=0.5, alpha=0.6)
+
+        ax.set_title(f"Participant {pid} | Slice prediction density vs. GT (two rows per trial)")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Normalized density')
+        fig.tight_layout()
+        fig.savefig(part_out / f"participant_{pid}.png", dpi=150)
+        plt.close(fig)
 
 
-def stage2_evaluation_for_fp_windows(transformer_model, tokenizer, feature_columns,
-                                                     eval_windows, eval_metadata, device):
-    """
-    Modified Stage 2 evaluation that tracks ailments found by the model
-    """
-    localizer = TargetLocalizer(transformer_model, device)
+# ==========================================
+# 2. FEATURE ENGINEERING, FILTERING & DENSITY HELPERS
+# ==========================================
 
-    print("Evaluating target localization with ailment tracking...")
-    all_results = []
-    fp_positions = 0
-    for window, meta in zip(eval_windows, eval_metadata):
-        # Tokenize and run model
-        window_df = pd.DataFrame(window, columns=feature_columns)
-        tokenized_window = tokenizer.tokenize(window_df, feature_columns)
-        window_tensor = torch.tensor(tokenized_window, dtype=torch.long).unsqueeze(0)
+def _filter_isolated_windows(predictions: np.ndarray, metadata: list, neighbor_radius: int = 2, min_neighbors: int = 1,
+                             group_key: str = "trial_id") -> np.ndarray:
+    if predictions.ndim != 1:
+        predictions = predictions.ravel()
+    pos_idx = np.where(predictions == 1)[0]
+    if pos_idx.size == 0:
+        return pos_idx
 
-        results = localizer.localize_targets(
-            window_tensor,
-            meta['target_positions'],  # Ground truth target positions
-            0,
-            window_metadata=meta,
-            supervised=True
-        )
-        fp_positions+= results['num_predictions']
-        results.update({
-            'participant_id': meta['participant_id'],
-            'trial_id': meta['trial_id'],
-        })
-
-        all_results.append(results)
-
-    print(f"\nStage 2 FP rows number is  {fp_positions}:")
-
-def calculate_overall_pipeline_ailment_detection(stage1_ailments_found, stage2_ailments_found,
-                                                 total_unique_ailments_in_test):
-    """
-    Calculate overall pipeline performance for ailment detection
-    """
-    # Union of ailments found in both stages (since Stage 2 operates on Stage 1 positives)
-    # In practice, Stage 2 ailments should be a subset of Stage 1 ailments
-    overall_ailments_found = stage1_ailments_found.union(stage2_ailments_found)
-
-    # Calculate detection rates
-    stage1_detection_rate = len(
-        stage1_ailments_found) / total_unique_ailments_in_test if total_unique_ailments_in_test > 0 else 0
-    stage2_detection_rate = len(stage2_ailments_found) / len(stage1_ailments_found) if stage1_ailments_found else 0
-    overall_detection_rate = len(
-        overall_ailments_found) / total_unique_ailments_in_test if total_unique_ailments_in_test > 0 else 0
-
-    # Calculate how much Stage 2 improves upon Stage 1
-    stage2_improvement = len(stage2_ailments_found) / len(stage1_ailments_found) if stage1_ailments_found else 0
-
-    print(f"\nOverall Pipeline Ailment Detection:")
-    print(
-        f"  Stage 1 found: {len(stage1_ailments_found)}/{total_unique_ailments_in_test} ({stage1_detection_rate:.4f})")
-    print(f"  Stage 2 confirmed: {len(stage2_ailments_found)}/{len(stage1_ailments_found)} ({stage2_improvement:.4f})")
-    print(
-        f"  Overall pipeline: {len(overall_ailments_found)}/{total_unique_ailments_in_test} ({overall_detection_rate:.4f})")
-
-    # Show which ailments were lost between stages
-    lost_ailments = stage1_ailments_found - stage2_ailments_found
-    if lost_ailments:
-        print(f"  Ailments lost in Stage 2: {sorted(list(lost_ailments))}")
-
-    return {
-        'stage1_detection_rate': stage1_detection_rate,
-        'stage2_improvement_rate': stage2_improvement,
-        'overall_detection_rate': overall_detection_rate,
-        'stage1_ailments': sorted(list(stage1_ailments_found)),
-        'stage2_ailments': sorted(list(stage2_ailments_found)),
-        'overall_ailments': sorted(list(overall_ailments_found)),
-        'lost_ailments': sorted(list(lost_ailments))
-    }
+    groups = [m.get(group_key) for m in metadata]
+    kept = []
+    n = len(predictions)
+    for i in pos_idx:
+        g = groups[i]
+        left = max(0, i - neighbor_radius)
+        right = min(n - 1, i + neighbor_radius)
+        cnt = sum(1 for j in range(left, right + 1) if j != i and predictions[j] == 1 and groups[j] == g)
+        if cnt >= min_neighbors:
+            kept.append(i)
+    return np.array(kept, dtype=int)
 
 
-def two_step_pipeline(participant_id, window_size=100, seed=42):
-    """
-    Two-step pipeline with AILMENT_NUMBER tracking
-    """
-    print(f"Running Two-Step Pipeline with AILMENT_NUMBER Tracking for Participant {participant_id}")
-    print(f"Window size: {window_size}, Seed: {seed}")
-    print("=" * 60)
-    print("NOTE: AILMENT_NUMBER is used ONLY for post-processing evaluation")
-    print("      It is NOT used during training - only for measuring performance")
-    print("=" * 60)
+def _dilate_mask(mask: np.ndarray, k: int) -> np.ndarray:
+    """Expands 1s in a binary mask by k steps in both directions."""
+    idx = np.where(mask == 1)[0]
+    out = np.zeros_like(mask)
+    n = len(mask)
+    for i in idx:
+        out[max(0, i - k): min(n, i + k + 1)] = 1
+    return out
 
+
+def get_window_rows(meta_item: dict, source_df: pd.DataFrame) -> pd.DataFrame:
+    """Safely and robustly extracts the exact 10 fixation rows for a window."""
+    # Try different index keys that might be in your metadata
+    idxs = meta_item.get("row_indices") or meta_item.get("indices") or meta_item.get("abs_indices") or meta_item.get(
+        "global_indices")
+
+    if idxs is not None:
+        try:
+            # Try absolute positional indexing first
+            return source_df.iloc[idxs]
+        except Exception:
+            try:
+                # Fallback to label-based indexing if the dataframe kept original indices
+                return source_df.loc[idxs]
+            except Exception:
+                pass
+
+    # Fallback for start/end spans
+    for s_key, e_key in (("start_index", "end_index"), ("start_row", "end_row"), ("start", "stop")):
+        if s_key in meta_item and e_key in meta_item and meta_item[s_key] is not None and meta_item[e_key] is not None:
+            try:
+                return source_df.iloc[int(meta_item[s_key]): int(meta_item[e_key]) + 1]
+            except Exception:
+                pass
+
+    return pd.DataFrame()
+
+
+def evaluate_location_voting(meta, test_df, positive_indices, tau=0.90, img_col="CURRENT_FIX_COMPONENT_IMAGE_FILE",
+                             x_col="CURRENT_FIX_IA_X", y_col="CURRENT_FIX_IA_Y"):
+    pred_by_trial = defaultdict(Counter)
+
+    # 1. Cast Votes: Look at every POSITIVE window and extract the (Slice, X, Y) locations
+    for i in positive_indices:
+        if 0 <= i < len(meta):
+            m = meta[i]
+            key = (m.get("participant_id"), m.get("trial_id"))
+
+            # Pull the actual 10 fixation events for this window
+            rows = get_window_rows(m, test_df)
+            if not rows.empty:
+                # Count each UNIQUE (Slice, X, Y) location present in this specific window
+                locs = rows[[img_col, x_col, y_col]].drop_duplicates()
+                for _, row in locs.iterrows():
+                    loc_tuple = (str(row[img_col]), row[x_col], row[y_col])
+                    pred_by_trial[key][loc_tuple] += 1
+
+    # 2. Extract Ground Truth Grid Locations
+    gt_by_trial = defaultdict(set)
+    if img_col in test_df.columns:
+        for (pid, tid), sub in test_df.groupby(["RECORDING_SESSION_LABEL", "TRIAL_INDEX"]):
+            if "target" in sub.columns:
+                gt_rows = sub[sub["target"] == 1]
+                for _, row in gt_rows.iterrows():
+                    loc_tuple = (str(row[img_col]), row[x_col], row[y_col])
+                    gt_by_trial[(pid, tid)].add(loc_tuple)
+
+    overall_TP = overall_FP = overall_FN = overall_TN = 0
+    flagged_locations_data = []
+
+    # 3. Evaluate: Iterate over ALL trials in the test set (This fixes the missing TNs!)
+    for (pid, tid), sub in test_df.groupby(["RECORDING_SESSION_LABEL", "TRIAL_INDEX"]):
+
+        # Get ALL unique physical grid locations the radiologist visited in this trial
+        all_locs = sub[[img_col, x_col, y_col]].drop_duplicates()
+        ordered_locs = [(str(r[img_col]), r[x_col], r[y_col]) for _, r in all_locs.iterrows()]
+
+        if not ordered_locs: continue
+
+        counter = pred_by_trial.get((pid, tid), Counter())
+        gt_set = gt_by_trial.get((pid, tid), set())
+
+        # Calculate density for every location visited
+        counts = np.array([counter.get(loc, 0) for loc in ordered_locs], dtype=float)
+        dens = counts / counts.max() if counts.max() > 0 else counts
+        gt_vec = np.array([1.0 if loc in gt_set else 0.0 for loc in ordered_locs], dtype=float)
+
+        # Threshold voting
+        P = (dens >= tau).astype(int)
+        G = gt_vec.astype(int)
+
+        tp = int(np.sum(P * G))
+        fp = int(np.sum(P * (1 - G)))
+        fn = int(np.sum(G * (1 - P)))
+        tn = int(len(P) - tp - fp - fn)  # TN is now correctly "all the rest" of the locations
+
+        overall_TP += tp
+        overall_FP += fp
+        overall_FN += fn
+        overall_TN += tn
+
+        # Save the locations that crossed the threshold
+        for (s_name, x, y), pred_val, true_val, density_val in zip(ordered_locs, P, G, dens):
+            if pred_val == 1:
+                flagged_locations_data.append({
+                    'participant_id': pid, 'trial_id': tid, 'slice_name': s_name,
+                    'grid_x': x, 'grid_y': y, 'density': density_val, 'is_true_positive': bool(true_val)
+                })
+
+    prec = overall_TP / (overall_TP + overall_FP) if (overall_TP + overall_FP) else 0.0
+    rec = overall_TP / (overall_TP + overall_FN) if (overall_TP + overall_FN) else 0.0
+
+    print(f"\n--- STEP 3: GRID LOCATION Voting Results (Tau={tau}) ---")
+    print(f"Grid Precision: {prec:.4f} | Recall: {rec:.4f}")
+    print(f"TP: {overall_TP} | FP: {overall_FP} | FN: {overall_FN} | TN: {overall_TN}")
+
+    metrics = {'TP': overall_TP, 'FP': overall_FP, 'FN': overall_FN, 'TN': overall_TN, 'Precision': prec, 'Recall': rec}
+    return pd.DataFrame(flagged_locations_data), metrics
+
+
+# ==========================================
+# THRESHOLD VOTING EVALUATORS
+# ==========================================
+
+def evaluate_slice_voting(meta, test_df, positive_indices, tau=0.90, tol_k=5,
+                          img_col="CURRENT_FIX_COMPONENT_IMAGE_FILE"):
+    pred_by_trial = defaultdict(Counter)
+
+    # 1. Vote
+    for i in positive_indices:
+        if 0 <= i < len(meta):
+            m = meta[i]
+            key = (m.get("participant_id"), m.get("trial_id"))
+            for s in set(map(str, m.get("window_unique_slices", m.get("window_slices", [])))):
+                pred_by_trial[key][s] += 1
+
+    # 2. GT
+    gt_by_trial = defaultdict(set)
+    if img_col in test_df.columns:
+        for (pid, tid), sub in test_df.groupby(["RECORDING_SESSION_LABEL", "TRIAL_INDEX"]):
+            if "target" in sub.columns:
+                gt_by_trial[(pid, tid)] = set(map(str, sub.loc[sub["target"] == 1, img_col].astype(str).unique()))
+
+    overall_TP = overall_FP = overall_FN = overall_TN = 0
+    flagged_slices_data = []
+
+    # 3. Evaluate maintaining contiguous slice order for dilation
+    for (pid, tid), sub in test_df.groupby(["RECORDING_SESSION_LABEL", "TRIAL_INDEX"]):
+        ordered_all = list(dict.fromkeys(sub[img_col].astype(str).tolist()))
+        if not ordered_all: continue
+
+        counter = pred_by_trial.get((pid, tid), Counter())
+        gt_set = gt_by_trial.get((pid, tid), set())
+
+        counts = np.array([counter.get(s, 0) for s in ordered_all], dtype=float)
+        dens = counts / counts.max() if counts.max() > 0 else counts
+        gt_vec = np.array([1.0 if s in gt_set else 0.0 for s in ordered_all], dtype=float)
+
+        P = (dens >= tau).astype(int)
+        G = gt_vec.astype(int)
+
+        # APPLY TOLERANCE (Dilation)
+        if tol_k > 0:
+            Pd = _dilate_mask(P, tol_k)
+            Gd = _dilate_mask(G, tol_k)
+        else:
+            Pd, Gd = P, G
+
+        tp = int(np.sum(P * Gd))
+        fp = int(np.sum(P * (1 - Gd)))
+        fn = int(np.sum(G * (1 - Pd)))
+        tn = int(len(P) - tp - fp - fn)
+
+        overall_TP += tp
+        overall_FP += fp
+        overall_FN += fn
+        overall_TN += tn
+
+        for s_name, pred_val, true_val, density_val in zip(ordered_all, P, G, dens):
+            if pred_val == 1:
+                flagged_slices_data.append({
+                    'participant_id': pid, 'trial_id': tid, 'slice_name': s_name,
+                    'density': density_val, 'is_true_positive': bool(true_val)
+                })
+
+    prec = overall_TP / (overall_TP + overall_FP) if (overall_TP + overall_FP) else 0.0
+    rec = overall_TP / (overall_TP + overall_FN) if (overall_TP + overall_FN) else 0.0
+
+    print(f"\n--- STEP 2: SLICE Voting Results (Tau={tau}, Tol={tol_k}) ---")
+    print(f"Slice Precision: {prec:.4f} | Recall: {rec:.4f}")
+    print(f"TP: {overall_TP} | FP: {overall_FP} | FN: {overall_FN} | TN: {overall_TN}")
+
+    metrics = {'TP': overall_TP, 'FP': overall_FP, 'FN': overall_FN, 'TN': overall_TN, 'Precision': prec, 'Recall': rec}
+    return pd.DataFrame(flagged_slices_data), metrics
+
+
+
+# ==========================================
+# 3. CORE PIPELINE RUNNER
+# ==========================================
+
+def two_step_pipeline(participant_id, window_size=100, seed=42, remove_isolated: bool = False, neighbor_radius: int = 2,
+                      min_neighbors: int = 1, tau: float = 0.90):
     seed_everything(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Feature columns (ONLY these are used for training - NO AILMENT_NUMBER)
-    feature_columns = [
+    feature_columns_train = [
         'Pupil_Size', 'CURRENT_FIX_DURATION', 'CURRENT_FIX_IA_X',
-        'CURRENT_FIX_IA_Y', 'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT',
+        'CURRENT_FIX_IA_Y', 'CURRENT_FIX_INDEX', 'CURRENT_FIX_COMPONENT_COUNT'
     ]
 
-    print(f"Training features (AILMENT_NUMBER excluded): {feature_columns}")
+    # 1. Load Data
+    dir_path = Path(__file__).parent.parent.parent / "fwd_data"
+    csv_path = dir_path / 'Nodule_Categorized_Fixation_Data_1_18.csv'
 
-    # 1. Load and split data
-    csv_path = str(Path(__file__).parent.parent.parent / "fwd_data" / 'Nodule_Categorized_Fixation_Data_1_18.csv')
+    config = DataConfig(data_path=csv_path, approach_num=6, normalize=True, per_slice_target=True,
+                        participant_id=participant_id)
+    df = load_eye_tracking_data(data_path=config.data_path, approach_num=config.approach_num,
+                                participant_id=config.participant_id, data_format="legacy")
 
-    config = DataConfig(
-        data_path=csv_path,
-        approach_num=6,
-        normalize=True,
-        per_slice_target=True,
-        participant_id=participant_id
-    )
+    df.bfill(inplace=True)
+    df.ffill(inplace=True)
 
-    df = load_eye_tracking_data(
-        data_path=config.data_path,
-        approach_num=config.approach_num,
-        participant_id=config.participant_id,
-        data_format="legacy"
-    )
-
-
-    SIGNAL_COL = 'Pupil_Size'
-    df['rolling_mean_10'] = df[SIGNAL_COL].rolling(window=10, min_periods=1).mean()
-    df['rolling_std_10'] = df[SIGNAL_COL].rolling(window=10, min_periods=1).std()
-
-    # Calculate rate of change (derivative)
-    df['signal_derivative'] = df[SIGNAL_COL].diff().fillna(0)
-
-    # Fill any potential NaN values created by rolling std
-    df.fillna(method='bfill', inplace=True)
-    df.fillna(method='ffill', inplace=True)
-
-    # Split data
+    # 2. Split data
     train_df, test_df = split_train_test_for_time_series(df, test_size=0.2, random_state=seed)
     train_df, val_df = split_train_test_for_time_series(train_df, test_size=0.2, random_state=seed)
 
-    print(f"Data split - Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
+    gt_ailments_df = test_df.loc[
+        test_df['AILMENT_NUMBER'] != -1, ['RECORDING_SESSION_LABEL', 'TRIAL_INDEX', 'AILMENT_NUMBER']].drop_duplicates()
+    total_unique_ailments_in_test = len(gt_ailments_df)
 
-    # Count total ailments in test set for baseline (POST-PROCESSING EVALUATION ONLY)
-    test_ailments = test_df[test_df['AILMENT_NUMBER'] != -1]['AILMENT_NUMBER'].unique()
-    total_unique_ailments_in_test = len(test_ailments)
-    total_ailment_instances_in_test = len(test_df[test_df['AILMENT_NUMBER'] != -1])
+    # 3. Create windows
+    X_train, Y_train, train_metadata, _ = create_dynamic_time_series_with_ailment(train_df, feature_columns_train,
+                                                                                  window_size=window_size)
+    X_val, Y_val, val_metadata, _ = create_dynamic_time_series_with_ailment(val_df, feature_columns_train,
+                                                                            window_size=window_size)
+    X_test, Y_test, test_metadata, _ = create_dynamic_time_series_with_ailment(test_df, feature_columns_train,
+                                                                               window_size=window_size)
 
-    print(f"\nPOST-PROCESSING: AILMENT_NUMBER Statistics in Test Set (for evaluation only):")
-    print(f"  Total unique ailments: {total_unique_ailments_in_test}")
-    print(f"  Total ailment instances (rows): {total_ailment_instances_in_test}")
-    print(f"  Unique ailment numbers: {sorted(test_ailments)}")
-    print(f"  (These are NOT used for training - only for measuring final performance)")
-
-    # 2. Create windows with ailment tracking
-
-    X_train, Y_train, train_metadata, train_ailment_locations = create_dynamic_time_series_with_ailment(
-        train_df, feature_columns, window_size=window_size
-    )
-    X_val, Y_val, val_metadata, val_ailment_locations = create_dynamic_time_series_with_ailment(
-        val_df, feature_columns, window_size=window_size
-    )
-    X_test, Y_test, test_metadata, test_ailment_locations = create_dynamic_time_series_with_ailment(
-        test_df, feature_columns, window_size=window_size
-    )
-
-    print(f"\nWindows created - Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
-
-    # Count windows with ailments
-    test_windows_with_ailments = sum(1 for meta in test_metadata if meta['has_valid_ailment'])
-    test_total_ailment_positions = sum(len(positions) for positions in test_ailment_locations)
-
-    print(f"Test windows with valid ailments: {test_windows_with_ailments}/{len(test_metadata)}")
-    print(f"Total ailment positions in test windows: {test_total_ailment_positions}")
-
-    # Show some example ailment locations for verification
-    if len(test_metadata) > 0:
-        example_with_ailments = [meta for meta in test_metadata[:5] if meta['has_valid_ailment']]
-        if example_with_ailments:
-            print(f"\nExample window with ailments:")
-            example = example_with_ailments[0]
-            print(f"  Window: Participant {example['participant_id']}, Trial {example['trial_id']}")
-            print(f"  Ailment positions: {example['ailment_positions']}")
-            print(f"  Ailment numbers: {example['ailment_numbers']}")
-            print(f"  Ailment details: {example['ailment_details'][:3]}...")  # Show first 3
-
-    # Create save directory
-    save_dir = f'results/ailment_tracking_participant_{participant_id}'
+    save_dir = f'new_res/ailment_tracking_participant_{participant_id}'
     os.makedirs(save_dir, exist_ok=True)
 
-    # ===== STEP 1: WINDOW-LEVEL PREDICTION =====
-    print("\nSTEP 1: Window-Level Prediction (using only eye-tracking features)")
-    print("-" * 40)
-    print("Training features used:", feature_columns)
-    print("AILMENT_NUMBER: NOT used in training")
+    # ==========================================
+    # STEP 1: WINDOW-LEVEL PREDICTION
+    # ==========================================
+    print("\nSTEP 1: Window-Level Prediction")
 
-    # Scale features
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train.reshape(-1, X_train.shape[-1])).reshape(X_train.shape)
     X_val_scaled = scaler.transform(X_val.reshape(-1, X_val.shape[-1])).reshape(X_val.shape)
     X_test_scaled = scaler.transform(X_test.reshape(-1, X_test.shape[-1])).reshape(X_test.shape)
 
-    # Convert to tensors
     X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32).permute(0, 2, 1)
     X_val_tensor = torch.tensor(X_val_scaled, dtype=torch.float32).permute(0, 2, 1)
     X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32).permute(0, 2, 1)
@@ -393,15 +488,10 @@ def two_step_pipeline(participant_id, window_size=100, seed=42):
     Y_val_tensor = torch.tensor(Y_val, dtype=torch.long)
     Y_test_tensor = torch.tensor(Y_test, dtype=torch.long)
 
-    # Create datasets and loaders
     train_dataset = TensorDataset(X_train_tensor, Y_train_tensor)
-    val_dataset = TensorDataset(X_val_tensor, Y_val_tensor)
-    test_dataset = TensorDataset(X_test_tensor, Y_test_tensor)
+    val_loader = DataLoader(TensorDataset(X_val_tensor, Y_val_tensor), batch_size=32, shuffle=False)
+    test_loader = DataLoader(TensorDataset(X_test_tensor, Y_test_tensor), batch_size=32, shuffle=False)
 
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
-
-    # Train ensemble
     ensemble_save_path = os.path.join(save_dir, 'ensemble_models')
     os.makedirs(ensemble_save_path, exist_ok=True)
 
@@ -410,571 +500,123 @@ def two_step_pipeline(participant_id, window_size=100, seed=42):
         model_params={'input_dim': X_train_tensor.shape[1], 'window_size': window_size, 'output_classes': 2},
         n_models=10,
         device=device,
-        save_path=os.path.join(save_dir, 'ensemble_models')
+        save_path=ensemble_save_path
     )
 
-    # Calculate class weights
     class_counts = np.bincount(Y_train)
     weights = 1.0 / class_counts
 
-    print("Training ensemble...")
     ensemble_trainer.train_ensemble(
         train_dataset=train_dataset,
         val_loader=val_loader,
         batch_size=32,
-        epochs=50,  # Reduced for testing
+        epochs=50,
         criterion=nn.CrossEntropyLoss(),
         optimizer_class=optim.Adam,
         optimizer_params={'lr': 0.001},
         majority_weight=weights[0] if len(weights) > 1 else 0.1
     )
 
-    # Evaluate Step 1
-    test_predictions = ensemble_trainer.predict(test_loader, minority_weight=1, threshold=0.9)
+    test_predictions = ensemble_trainer.predict(test_loader, minority_weight=1, threshold=0.92, unanimous=False)
 
-    # DEBUG: Check prediction counts
-    print(f"\nDEBUG - Step 1 Predictions:")
-    print(f"  Length of test_predictions: {len(test_predictions)}")
-    print(f"  Length of Y_test: {len(Y_test)}")
-    print(f"  Length of test_metadata: {len(test_metadata)}")
-    print(f"  Predicted positive (1): {np.sum(test_predictions == 1)}")
-    print(f"  Predicted negative (0): {np.sum(test_predictions == 0)}")
+    if remove_isolated:
+        kept_indices = _filter_isolated_windows(
+            predictions=test_predictions,
+            metadata=test_metadata,
+            neighbor_radius=neighbor_radius,
+            min_neighbors=min_neighbors,
+            group_key="trial_id",
+        )
+        new_preds = np.zeros_like(test_predictions)
+        new_preds[kept_indices] = 1
+        test_predictions = new_preds
 
-    # Calculate Step 1 metrics properly
-    step1_accuracy = accuracy_score(Y_test, test_predictions)
-    step1_precision = precision_score(Y_test, test_predictions, zero_division=0)
-    step1_recall = recall_score(Y_test, test_predictions, zero_division=0)
-    step1_f1 = f1_score(Y_test, test_predictions, zero_division=0)
-    step1_cm = confusion_matrix(Y_test, test_predictions)
+    # Compute Step 1 Metrics
+    step1_tp = int(np.sum((Y_test == 1) & (test_predictions == 1)))
+    step1_fp = int(np.sum((Y_test == 0) & (test_predictions == 1)))
+    step1_tn = int(np.sum((Y_test == 0) & (test_predictions == 0)))
+    step1_fn = int(np.sum((Y_test == 1) & (test_predictions == 0)))
+    step1_prec = step1_tp / (step1_tp + step1_fp) if (step1_tp + step1_fp) else 0.0
+    step1_rec = step1_tp / (step1_tp + step1_fn) if (step1_tp + step1_fn) else 0.0
 
-    print(f"\nStep 1 Results:")
-    print(f"  Accuracy: {step1_accuracy:.4f}")
-    print(f"  Precision: {step1_precision:.4f}")
-    print(f"  Recall: {step1_recall:.4f}")
-    print(f"  F1 Score: {step1_f1:.4f}")
-    print(f"\nConfusion Matrix:")
-    print("   Predicted 0  Predicted 1")
-    print(f"Actual 0   {step1_cm[0, 0]:<10} {step1_cm[0, 1]:<10}")
-    print(f"Actual 1   {step1_cm[1, 0]:<10} {step1_cm[1, 1]:<10}")
+    print(f"\n--- STEP 1: WINDOW Prediction Results ---")
+    print(f"Window Precision: {step1_prec:.4f} | Recall: {step1_rec:.4f}")
+    print(f"TP: {step1_tp} | FP: {step1_fp} | FN: {step1_fn} | TN: {step1_tn}")
 
-    step1_positive_indices = np.where(test_predictions == 1)[0]
-    step_1_negative_indices =  np.where(test_predictions == 0)[0]
-    print(f"\nDEBUG - Positive Windows:")
-    print(f"  step1_positive_indices length: {len(step1_positive_indices)}")
-    print(f"  Should match predicted positive count: {np.sum(test_predictions == 1)}")
+    step1_metrics = {'TP': step1_tp, 'FP': step1_fp, 'FN': step1_fn, 'TN': step1_tn, 'Precision': step1_prec,
+                     'Recall': step1_rec}
 
-    step1_ailments_found = set()
-    step1_windows_with_ailments = 0
-    step_1_true_pos_trials_ailments = set()
-    step_1_pos_trials_ailments = set()
-    for idx in step1_positive_indices:
-        if idx < len(test_metadata):
-            meta = test_metadata[idx]
-            step_1_pos_trials_ailments.update(str(meta['trial_id']))
-            if meta['has_valid_ailment']:
-                step_1_true_pos_trials_ailments.update(str(meta['trial_id']))
-                step1_windows_with_ailments += 1
-                step1_ailments_found.update(meta['ailment_numbers'])
-        else:
-            print(f"WARNING: Index {idx} out of range for test_metadata (length: {len(test_metadata)})")
-
-    step_1_neg_trials_ailments = set()
-    for idx in step_1_negative_indices:
-        if idx < len(test_metadata):
-            meta = test_metadata[idx]
-            step_1_neg_trials_ailments.update(str(meta['trial_id']))
-        else:
-            print(f"WARNING: Index {idx} out of range for test_metadata (length: {len(test_metadata)})")
-    print(f"  step1_true_positive_trials_with_ailments: {step_1_true_pos_trials_ailments}")
-    print(f"  step1_positive_trials_with_ailments: {step_1_pos_trials_ailments}")
-    print(f"  step1_neg_trials_with_ailments: {step_1_neg_trials_ailments}")
-
-    step1_ailment_coverage = len(
-        step1_ailments_found) / total_unique_ailments_in_test if total_unique_ailments_in_test > 0 else 0
-
-    print(f"\nStep 1 - POST-PROCESSING Ailment Tracking:")
-    print(f"  Predicted positive windows: {len(step1_positive_indices)}")
-    print(f"  Positive windows with ailments: {step1_windows_with_ailments}")
-    print(f"  Unique ailments found: {len(step1_ailments_found)}/{total_unique_ailments_in_test}")
-    print(f"  Ailment coverage: {step1_ailment_coverage:.4f}")
-    print(f"  Found ailments: {sorted(step1_ailments_found)}")
-
-    print("\nSTEP 2: Target Localization within Predicted Positive Windows")
-    print("-" * 60)
+    # ==========================================
+    # STEP 2 & 3: TARGET LOCALIZATION (Density Voting)
+    # ==========================================
     positive_indices = np.where(test_predictions == 1)[0]
+
+    # Generate Heatmaps
+    plot_participant_panel_of_trial_heatmaps(test_metadata, test_df, positive_indices,
+                                             out_dir=os.path.join(save_dir, "slice_level"), top_k_per_trial=200)
+    plot_participant_slice_heatmap_with_gt(test_metadata, test_df, positive_indices,
+                                           out_dir=os.path.join(save_dir, "slice_level"), top_k_per_trial=80)
+
     if len(positive_indices) == 0:
         print("No positive windows for Stage 2.")
-    else:
-        # Use the first model from the trained ensemble for localization
-        stage1_model_for_loc = ensemble_trainer.models[0]
-        localizer = GradientLocalizer(stage1_model_for_loc, device)
-        all_stage2_results = []
+        return {'step1': step1_metrics, 'step2': None, 'step3': None}
 
-        for idx in positive_indices:
-            window_metadata = test_metadata[idx]
-            window_tensor = X_test_tensor[idx].unsqueeze(0)
-            predicted_row = localizer.localize_target(window_tensor.clone())  # Use clone to avoid grad issues
-            true_target_positions = window_metadata.get('target_positions', [])
-            is_correct = 1 if predicted_row in true_target_positions else 0
-            ailment_found = 'None'
-            for detail in window_metadata.get('ailment_details', []):
-                if detail['relative_position'] == predicted_row:
-                    ailment_found = detail['ailment_number']
-                    break
+    # Step 2: Slice Evaluation (Tolerance = 5 slices)
+    flagged_slices_df, slice_metrics = evaluate_slice_voting(
+        meta=test_metadata, test_df=test_df, positive_indices=positive_indices, tau=tau, tol_k=5
+    )
+    flagged_slices_df.to_csv(os.path.join(save_dir, f"step2_slices_tau_{tau:.2f}.csv"), index=False)
 
-            all_stage2_results.append({
-                'window_index': idx,
-                'predicted_row': predicted_row,
-                'true_targets': true_target_positions,
-                'is_correct': is_correct,
-                'ailment_found': ailment_found,
-                'ailments_in_window': window_metadata.get('ailment_numbers', [])
-            })
+    # Step 3: Location Evaluation
+    flagged_locs_df, loc_metrics = evaluate_location_voting(
+        meta=test_metadata, test_df=test_df, positive_indices=positive_indices, tau=tau
+    )
+    flagged_locs_df.to_csv(os.path.join(save_dir, f"step3_locations_tau_{tau:.2f}.csv"), index=False)
 
-        # --- Calculate Stage 2 Metrics ---
-        results_df = pd.DataFrame(all_stage2_results)
-        true_positive_windows_df = results_df[results_df['true_targets'].apply(len) > 0]
-        if not true_positive_windows_df.empty:
-            stage2_accuracy = true_positive_windows_df['is_correct'].mean()
-            print(f"Stage 2 Pinpointing Accuracy (on TP windows): {stage2_accuracy:.4f}")
+    return {'step1': step1_metrics, 'step2': slice_metrics, 'step3': loc_metrics}
 
-        found_ailments = set(results_df[results_df['ailment_found'] != 'None']['ailment_found'])
-        print(f"Stage 2 found ailments: {sorted(list(found_ailments))}")
-        print(f"Stage 2 found ailments:{len(found_ailments)}/{total_unique_ailments_in_test}")
-        if all_stage2_results:
-            # Call the new function to get the final results
-            final_df, efficiency_metrics = reconstruct_and_evaluate_efficiency(
-                all_stage2_results,
-                test_df,
-                test_metadata ,
-                strategy = 'majority'
+
+# ==========================================
+# MAIN EXECUTION & SUMMARY GENERATION
+# ==========================================
+if __name__ == "__main__":
+    participants = range(1, 40)  # Adjust your range as needed
+    tau_threshold = 0.90
+
+    all_results = []
+
+    for part in participants:
+        print(f"\n{'#' * 20} Participant ID: {part} {'#' * 20}")
+        try:
+            results = two_step_pipeline(
+                participant_id=part,
+                window_size=10,
+                seed=0,
+                remove_isolated=True,
+                neighbor_radius=1,
+                min_neighbors=1,
+                tau=tau_threshold
             )
 
-            print("\n--- Sample of Final Predicted DataFrame ---")
-            print(len(final_df[final_df["AILMENT_NUMBER"]!=-1])//len(final_df))
-            tumors_found_by_pipeline = test_df[test_df['AILMENT_NUMBER'] != -1]['AILMENT_NUMBER'].unique()
-            print(
-                f"Stage 2 after reconstruct found ailments:{len(tumors_found_by_pipeline)}/{total_unique_ailments_in_test}")
-            print(final_df.head())
-            pipeline_precision = final_df['target'].sum() / len(final_df) if len(
-                final_df) > 0 else 0
+            if results:
+                # Flatten dict to append to CSV rows
+                row = {'Participant': part}
+                if results['step1']:
+                    for k, v in results['step1'].items(): row[f'Step1_{k}'] = v
+                if results['step2']:
+                    for k, v in results['step2'].items(): row[f'Step2_Slice_{k}'] = v
+                if results['step3']:
+                    for k, v in results['step3'].items(): row[f'Step3_Grid_{k}'] = v
 
-            print("\n" + "=" * 60)
-            print("           PIPELINE PERFORMANCE")
-            print("=" * 60)
-            print(f"Total unique tumors found by pipeline: {tumors_found_by_pipeline}")
-            print(f"Tumor Coverage: {len(tumors_found_by_pipeline)/total_unique_ailments_in_test*100:.2f}%")
-            print(f"Precision of flagged slices: {pipeline_precision:.4f}")
-            print("=" * 60)
+                all_results.append(row)
 
-            total_unique_tumors = test_df[test_df['target'] == 1]['AILMENT_NUMBER'].nunique()
+        except Exception as e:
+            print(f"Error processing participant {part}: {e}")
 
-            # The total number of individual CT slices that show a tumor
-            # This is the workload for the "Before" (naive) approach.
-            baseline_rows_to_check = len(test_df)
-
-            print("\n" + "=" * 60)
-            print("           BASELINE (Examining all tumor slices)")
-            print("=" * 60)
-            print(f"Total unique tumors in test set: {total_unique_tumors}")
-            print(f"Total slices to review in baseline: {baseline_rows_to_check:,}")
-            print("=" * 60)
-
-    # quit(2)
-    #
-    # # Filter windows predicted as positive
-    # positive_indices = np.where(test_predictions == 1)[0]
-    # positive_windows = X_test[positive_indices]
-    # positive_metadata = [test_metadata[i] for i in positive_indices]
-    # positive_ailment_locations = test_ailment_locations[positive_indices]
-    #
-    # print(f"Step 1 predicted {len(positive_windows)} positive windows out of {len(X_test)} total")
-    #
-    # if len(positive_windows) == 0:
-    #     print("No positive windows predicted - cannot run Step 2")
-    #     step2_precision = step2_recall = step2_f1 = 0.0
-    #     final_ailments_found = set()
-    #     final_ailment_coverage = 0
-    # else:
-    #     # Filter for windows that actually have targets (for evaluation)
-    #     tp_eval_windows = []
-    #     tp_eval_metadata = []
-    #     eval_ailment_locations = []
-    #
-    #
-    #     fp_eval_windows = []
-    #     fp_eval_metadata = []
-    #     for i, meta in enumerate(positive_metadata):
-    #         if meta['has_target']:
-    #             tp_eval_windows.append(positive_windows[i])
-    #             tp_eval_metadata.append(meta)
-    #             eval_ailment_locations.append(positive_ailment_locations[i])
-    #         else:
-    #             fp_eval_windows.append(positive_windows[i])
-    #             fp_eval_metadata.append(meta)
-    #
-    #     print(f"Found {len(tp_eval_windows)} positive windows with ground truth targets for evaluation")
-    #
-    #     if len(tp_eval_windows) == 0:
-    #         print("No positive windows with ground truth targets - cannot evaluate Step 2")
-    #         step2_precision = step2_recall = step2_f1 = 0.0
-    #         final_ailments_found = step1_ailments_found  # Use Step 1 results
-    #         final_ailment_coverage = step1_ailment_coverage
-    #     else:
-    #         # Create tokenizer
-    #         tokenizer = EyeTrackingTokenizer()
-    #
-    #         # Use all positive windows for tokenizer fitting
-    #         all_windows_flat = positive_windows.reshape(-1, positive_windows.shape[-1])
-    #         tokenizer_df = pd.DataFrame(all_windows_flat, columns=feature_columns)
-    #         tokenizer.fit(tokenizer_df, feature_columns)
-    #
-    #         train_positive_indices = np.where(Y_train == 1)[0]
-    #         if len(train_positive_indices) > 0:
-    #             train_positive_windows = X_train[train_positive_indices[:min(50, len(train_positive_indices))]]
-    #             train_positive_metadata = [train_metadata[i] for i in
-    #                                        train_positive_indices[:min(50, len(train_positive_indices))]]
-    #
-    #             # Create target vectors for training
-    #             def create_target_vector(window_size, target_positions):
-    #                 target_vector = [0] * window_size
-    #                 for pos in target_positions:
-    #                     if 0 <= pos < window_size:
-    #                         target_vector[pos] = 1
-    #                 return target_vector
-    #
-    #             train_targets = [create_target_vector(window_size, meta['target_positions']) for meta in
-    #                              train_positive_metadata]
-    #
-    #             # Create transformer dataset
-    #             train_dataset_transformer = create_dataset(
-    #                 train_positive_windows,
-    #                 np.ones(len(train_positive_windows)),
-    #                 train_targets,
-    #                 tokenizer,
-    #                 feature_columns
-    #             )
-    #
-    #             # Create minimal validation set
-    #             val_size = min(10, len(train_positive_windows) // 4)
-    #             if val_size > 0:
-    #                 val_dataset_transformer = create_dataset(
-    #                     train_positive_windows[:val_size],
-    #                     np.ones(val_size),
-    #                     train_targets[:val_size],
-    #                     tokenizer,
-    #                     feature_columns
-    #                 )
-    #             else:
-    #                 val_dataset_transformer = train_dataset_transformer
-    #
-    #             # Create data loaders
-    #             train_loader_transformer = DataLoader(
-    #                 train_dataset_transformer, batch_size=16, shuffle=True, collate_fn=custom_collate
-    #             )
-    #             val_loader_transformer = DataLoader(
-    #                 val_dataset_transformer, batch_size=16, shuffle=False, collate_fn=custom_collate
-    #             )
-    #
-    #             # Create and train transformer
-    #             transformer_model = IntegratedEyeTrackingTransformer(
-    #                 vocab_size=tokenizer.vocab_size,
-    #                 n_features=len(feature_columns),
-    #                 d_model=256,
-    #                 max_len=window_size
-    #             )
-    #
-    #             # Try to load pretrained model
-    #             pretrained_path = f'results/self_supervised_from_cv_participant_{participant_id}_fold_{0}_window_size_{window_size}/model.pth'
-    #
-    #             if os.path.exists(pretrained_path):
-    #                 print(f"Loading pretrained weights from: {pretrained_path}")
-    #                 try:
-    #                     pretrained_state = torch.load(pretrained_path)['model_state_dict']
-    #                     model_state = transformer_model.state_dict()
-    #
-    #                     # Filter compatible weights
-    #                     filtered_state = {k: v for k, v in pretrained_state.items()
-    #                                       if k in model_state and model_state[k].shape == v.shape}
-    #                     model_state.update(filtered_state)
-    #                     transformer_model.load_state_dict(model_state)
-    #                     print(f"Loaded {len(filtered_state)} compatible layers from pretrained model")
-    #                 except Exception as e:
-    #                     print(f"Error loading pretrained model: {e}")
-    #                     print("Training from scratch")
-    #             else:
-    #                 print(f"Pretrained model not found at {pretrained_path}, training from scratch")
-    #
-    #             print("Training supervised transformer...")
-    #             train_multi_task(
-    #                 model=transformer_model,
-    #                 train_loader=train_loader_transformer,
-    #                 val_loader=val_loader_transformer,
-    #                 epochs=50,  # Reduced for speed
-    #                 learning_rate=1e-4,
-    #                 device=device,
-    #                 alpha=0.1,
-    #                 beta=0.1,
-    #                 gamma=15.0,
-    #                 patience=10
-    #             )
-    #
-    #             transformer_model = transformer_model.to(device)
-    #
-    #             # NOW call the modified evaluation function
-    #             stage2_results = modified_stage2_evaluation_with_ailment_tracking(
-    #                 transformer_model, tokenizer, feature_columns,
-    #                 tp_eval_windows, tp_eval_metadata, device
-    #             )
-    #             stage2_evaluation_for_fp_windows(
-    #                 transformer_model, tokenizer, feature_columns,
-    #                 fp_eval_windows, fp_eval_metadata, device
-    #             )                # Extract results
-    #             step2_metrics = stage2_results['target_metrics']
-    #             step2_ailment_metrics = stage2_results['ailment_metrics']
-    #
-    #             step2_precision = step2_metrics['precision']
-    #             step2_recall = step2_metrics['recall']
-    #             step2_f1 = step2_metrics['f1']
-    #
-    #             # Get Stage 2 ailments found
-    #             stage2_ailments_found = set(step2_ailment_metrics['found_ailments'])
-    #
-    #             print(f"Stage 2 Results:")
-    #             print(f"  Target - Precision: {step2_precision:.4f}, Recall: {step2_recall:.4f}, F1: {step2_f1:.4f}")
-    #             print(f"  Ailment Detection Rate: {step2_ailment_metrics['detection_rate']:.4f}")
-    #             print(f"  Ailments Found: {step2_ailment_metrics['found_ailments']}")
-    #             print(f"  Windows with successful ailment detection: {step2_ailment_metrics['successful_windows']}")
-    #             print(f"  Ailment position precision: {step2_ailment_metrics['ailment_position_precision']:.4f}")
-    #
-    #             # Calculate final ailment coverage
-    #             final_ailment_coverage = len(
-    #                 stage2_ailments_found) / total_unique_ailments_in_test if total_unique_ailments_in_test > 0 else 0
-    #
-    #         else:
-    #             step2_precision = step2_recall = step2_f1 = 0.0
-    #             stage2_ailments_found = set()
-    #             final_ailment_coverage = step1_ailment_coverage
-    #             print("No positive training windows available for Step 2")
-    #
-    #     # Calculate overall pipeline performance
-    #     overall_precision = step1_precision * step2_precision
-    #     overall_recall = step1_recall * step2_recall
-    #     if overall_precision + overall_recall > 0:
-    #         overall_f1 = 2 * (overall_precision * overall_recall) / (overall_precision + overall_recall)
-    #     else:
-    #         overall_f1 = 0.0
-    #
-    #     print(f"\n" + "=" * 60)
-    #     print(f"EFFICIENCY ANALYSIS: Rows Needed to Find Ailments")
-    #     print(f"=" * 60)
-    #
-    #     # Calculate baseline efficiency first (what would happen if we examined ALL test rows)
-    #     total_test_rows = len(test_df)
-    #     total_ailment_rows = len(test_df[test_df['AILMENT_NUMBER'] != -1])
-    #     baseline_efficiency = total_ailment_rows / total_test_rows if total_test_rows > 0 else 0
-    #
-    #     # Step 1: Count rows in predicted positive windows
-    #     step1_total_rows_examined = len(step1_positive_indices) * window_size
-    #     step1_rows_with_ailments = 0
-    #
-    #     for idx in step1_positive_indices:
-    #         if idx < len(test_metadata):
-    #             meta = test_metadata[idx]
-    #             step1_rows_with_ailments += len(meta.get('ailment_positions', []))
-    #
-    #     step1_efficiency = step1_rows_with_ailments / step1_total_rows_examined if step1_total_rows_examined > 0 else 0
-    #
-    #     print(f"STEP 1 EFFICIENCY:")
-    #     print(f"  Total rows examined: {step1_total_rows_examined:,}")
-    #     print(f"  Rows with ailments found: {step1_rows_with_ailments:,}")
-    #     print(f"  Efficiency (ailment rows / total examined): {step1_efficiency:.4f} ({step1_efficiency * 100:.2f}%)")
-    #     print(f"  Precision: {step1_rows_with_ailments}/{step1_total_rows_examined} = {step1_efficiency:.4f}")
-    #     print(f"\nROWS PER AILMENT TYPE:")
-    #     improvement_factor = step1_efficiency / baseline_efficiency if baseline_efficiency > 0 else 0
-    #     ailment_row_counts = {}
-    #     for idx in step1_positive_indices:
-    #         if idx < len(test_metadata):
-    #             meta = test_metadata[idx]
-    #             for detail in meta.get('ailment_details', []):
-    #                 ailment_num = detail['ailment_number']
-    #                 if ailment_num not in ailment_row_counts:
-    #                     ailment_row_counts[ailment_num] = 0
-    #                 ailment_row_counts[ailment_num] += 1
-    #
-    #     for ailment_num in sorted(ailment_row_counts.keys()):
-    #         count = ailment_row_counts[ailment_num]
-    #         print(f"  Ailment {ailment_num}: {count} rows found")
-    #
-    #     print(f"\nBASELINE (examining all test data):")
-    #     print(f"  Total test rows: {total_test_rows:,}")
-    #     print(f"  Rows with ailments: {total_ailment_rows:,}")
-    #     print(f"  Baseline efficiency: {baseline_efficiency:.4f} ({baseline_efficiency * 100:.2f}%)")
-    #
-    #     print(f"\nSTEP 1 IMPROVEMENT:")
-    #     print(f"  Efficiency improvement: {improvement_factor:.2f}x")
-    #     if improvement_factor > 1:
-    #         print(f"  ✓ Model is {improvement_factor:.2f}x more efficient than random scanning")
-    #     else:
-    #         print(f"  ⚠ Model is less efficient than random scanning")
-    #
-    #     # Initialize Step 2 efficiency variables (will be updated if Step 2 runs)
-    #     step2_total_targeted_rows = 0
-    #     step2_rows_with_ailments = 0
-    #     step2_efficiency = 0
-    #     step2_improvement_over_step1 = 0
-    #     end_to_end_efficiency = step1_efficiency
-    #     end_to_end_improvement = improvement_factor
-    #
-    #     print(f"=" * 60)
-    #     results = {
-    #         'participant_id': participant_id,
-    #         'window_size': window_size,
-    #         'seed': seed,
-    #         'step1': {
-    #             'accuracy': step1_accuracy,
-    #             'precision': step1_precision,
-    #             'recall': step1_recall,
-    #             'f1': step1_f1,
-    #             'confusion_matrix': step1_cm.tolist()
-    #         },
-    #         'step2': {
-    #             'precision': step2_precision,
-    #             'recall': step2_recall,
-    #             'f1': step2_f1
-    #         },
-    #         'overall': {
-    #             'precision': overall_precision,
-    #             'recall': overall_recall,
-    #             'f1': overall_f1
-    #         },
-    #         'degradation': {
-    #             'step1_to_step2': step1_f1 - step2_f1,
-    #             'step1_to_overall': step1_f1 - overall_f1
-    #         },
-    #         'ailment_tracking': {
-    #             'total_unique_ailments_in_test': total_unique_ailments_in_test,
-    #             'total_ailment_instances_in_test': total_ailment_instances_in_test,
-    #             'total_ailment_positions_in_windows': test_total_ailment_positions,
-    #             'test_ailments': sorted(test_ailments.tolist()),
-    #             'step1_ailments_found': sorted(list(step1_ailments_found)),
-    #             'step1_ailment_coverage': step1_ailment_coverage,
-    #             'final_ailments_found': sorted(list(stage2_ailments_found)),  # Will update this
-    #             'final_ailment_coverage': final_ailment_coverage,
-    #             'detection_rate': len(
-    #                 stage2_ailments_found) / total_unique_ailments_in_test if total_unique_ailments_in_test > 0 else 0
-    #         },
-    #         # We'll add efficiency_analysis later after those variables are calculated
-    #         'windows': {
-    #             'total_test_windows': len(test_metadata),
-    #             'test_windows_with_ailments': test_windows_with_ailments,
-    #             'step1_positive_windows': len(step1_positive_indices),
-    #             'step1_positive_with_ailments': step1_windows_with_ailments
-    #         }
-    #     }
-    #
-    #     # Calculate final metrics
-    #     ailments_found_ratio = len(
-    #         stage2_ailments_found) / total_unique_ailments_in_test if total_unique_ailments_in_test > 0 else 0
-    #
-    #     print(f"\nFinal Results - POST-PROCESSING Ailment Tracking:")
-    #     print(f"  Stage 1 ailments found: {len(step1_ailments_found)}/{total_unique_ailments_in_test}")
-    #     print(
-    #         f"  Stage 2 ailments confirmed: {len(stage2_ailments_found)}/{len(step1_ailments_found) if step1_ailments_found else 0}")
-    #     print(f"  Final ailment coverage: {final_ailment_coverage:.4f}")
-    #     print(f"  Found ailments: {sorted(list(stage2_ailments_found))}")
-    #
-    #     # Calculate overall pipeline performance
-    #     overall_ailment_results = calculate_overall_pipeline_ailment_detection(
-    #         step1_ailments_found, stage2_ailments_found, total_unique_ailments_in_test
-    #     )
-    #
-    #     # NOW add the new Stage 2 and overall results to the existing structure
-    #     results['stage2_ailment_tracking'] = {
-    #         'ailments_found': sorted(list(stage2_ailments_found)),
-    #         'detection_rate': len(
-    #             stage2_ailments_found) / total_unique_ailments_in_test if total_unique_ailments_in_test > 0 else 0,
-    #         'improvement_over_stage1': len(stage2_ailments_found) / len(
-    #             step1_ailments_found) if step1_ailments_found else 0,
-    #         'confirmation_rate': len(stage2_ailments_found) / len(step1_ailments_found) if step1_ailments_found else 0,
-    #     }
-    #
-    #     results['overall_pipeline_ailment_detection'] = overall_ailment_results
-    #
-    #     # Update the existing ailment_tracking section with Stage 2 results
-    #     results['ailment_tracking']['final_ailments_found'] = sorted(list(stage2_ailments_found))
-    #     results['ailment_tracking']['final_ailment_coverage'] = final_ailment_coverage
-    #     results['ailment_tracking']['detection_rate'] = ailments_found_ratio
-    #
-    #     # NOW add efficiency analysis after all variables are calculated
-    #     # (This should come after your existing efficiency analysis code in the original function)
-    #     results['efficiency_analysis'] = {
-    #         'step1_total_rows_examined': step1_total_rows_examined,
-    #         'step1_rows_with_ailments': step1_rows_with_ailments,
-    #         'step1_efficiency': step1_efficiency,
-    #         'step2_total_targeted_rows': step2_total_targeted_rows if 'step2_total_targeted_rows' in locals() else 0,
-    #         'step2_rows_with_ailments': step2_rows_with_ailments if 'step2_rows_with_ailments' in locals() else 0,
-    #         'step2_efficiency': step2_efficiency if 'step2_efficiency' in locals() else 0,
-    #         'step2_improvement_over_step1': step2_improvement_over_step1 if 'step2_improvement_over_step1' in locals() else 0,
-    #         'end_to_end_efficiency': end_to_end_efficiency if 'end_to_end_efficiency' in locals() else step1_efficiency,
-    #         'end_to_end_improvement': end_to_end_improvement if 'end_to_end_improvement' in locals() else improvement_factor if 'improvement_factor' in locals() else 0,
-    #         'total_test_rows': total_test_rows,
-    #         'total_ailment_rows': total_ailment_rows,
-    #         'baseline_efficiency': baseline_efficiency if 'baseline_efficiency' in locals() else 0,
-    #         'improvement_factor': improvement_factor if 'improvement_factor' in locals() else 0,
-    #         'ailment_row_counts': ailment_row_counts if 'ailment_row_counts' in locals() else {},
-    #         'data_reduction': {
-    #             'original_rows': total_test_rows,
-    #             'step1_rows': step1_total_rows_examined,
-    #             'step2_rows': step2_total_targeted_rows if 'step2_total_targeted_rows' in locals() else step1_total_rows_examined,
-    #             'total_reduction_ratio': (step2_total_targeted_rows / total_test_rows) if (
-    #                         'step2_total_targeted_rows' in locals() and total_test_rows > 0) else (
-    #                         step1_total_rows_examined / total_test_rows) if total_test_rows > 0 else 0,
-    #             'compression_ratio': (total_test_rows / step2_total_targeted_rows) if (
-    #                         'step2_total_targeted_rows' in locals() and step2_total_targeted_rows > 0) else (
-    #                         total_test_rows / step1_total_rows_examined) if step1_total_rows_examined > 0 else 0
-    #         }
-    #     }
-    #
-    #     print(f"\n" + "=" * 60)
-    #     print(f"KEY METRIC: STAGE 2 AILMENT DETECTION RATE")
-    #     print(f"=" * 60)
-    #     print(f"Stage 1 found: {len(step1_ailments_found)} ailments")
-    #     print(f"Stage 2 confirmed: {len(stage2_ailments_found)} ailments")
-    #     print(f"STAGE 2 DETECTION RATE: {ailments_found_ratio:.4f} ({ailments_found_ratio * 100:.2f}%)")
-    #     print(
-    #         f"STAGE 2 CONFIRMATION RATE: {len(stage2_ailments_found) / len(step1_ailments_found) if step1_ailments_found else 0:.4f}")
-    #     print(f"Ailments Stage 2 confirmed: {sorted(list(stage2_ailments_found))}")
-    #     if step1_ailments_found - stage2_ailments_found:
-    #         print(f"Ailments lost in Stage 2: {sorted(list(step1_ailments_found - stage2_ailments_found))}")
-    #     print(f"=" * 60)
-    #     print(results)
-    #
-    #     # Save detailed results
-    #     import json
-    #     with open(os.path.join(save_dir, 'ailment_tracking_results.json'), 'w') as f:
-    #         json.dump(results, f, indent=4)
-    #
-    #     print(f"\nDetailed results saved to: {save_dir}")
-    #     return results
-
-
-
-if __name__ == "__main__":
-    # Test with a single participant
-    window_size = 10
-    seed = 0
-
-    participant_id = 1
-    try:
-        two_step_pipeline(participant_id, window_size, seed)
-        print("\n" + "=" * 60)
-        print("SUCCESS - Pipeline completed with ailment tracking!")
-        print("=" * 60)
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-
-        traceback.print_exc()
-
-            #   Stage 2 ailment detection rate: 0.4545 (45.45%)
+    # Output master CSV report
+    if all_results:
+        summary_df = pd.DataFrame(all_results)
+        os.makedirs("new_res", exist_ok=True)
+        out_path = "new_res/master_participant_summary.csv"
+        summary_df.to_csv(out_path, index=False)
+        print(f"\n✅ All runs completed. Master summary saved to: {out_path}")
